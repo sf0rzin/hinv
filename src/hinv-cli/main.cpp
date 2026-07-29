@@ -7,12 +7,6 @@
 #include "../hinv-core/hinv_vmm.hpp"
 #include "../hinv-core/headless/hinv_headless.hpp"
 
-void PrintBanner() {
-    std::cout << "========================================================\n";
-    std::cout << "  hinv (Hyper Invisible) - Stealth Loader & Headless VMM \n";
-    std::cout << "========================================================\n\n";
-}
-
 void PrintUsage() {
     std::cout << "Usage:\n";
     std::cout << "  hinv.exe load <path_to_driver.sys>\n";
@@ -22,8 +16,6 @@ void PrintUsage() {
 }
 
 int main(int argc, char* argv[]) {
-    PrintBanner();
-
     if (argc < 2) {
         PrintUsage();
         return 1;
