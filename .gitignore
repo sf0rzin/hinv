@@ -1,0 +1,24 @@
+# Build output directories & executables
+/build/
+/out/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.tlog
+*.lastbuildstate
+
+# Temporary files
+*.txt
+*.log
+
+# IDE files
+.vs/
+.vscode/
+*.user
+*.suo
+
+# System files
+Desktop.ini
+Thumbs.db
