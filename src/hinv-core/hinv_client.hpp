@@ -12,6 +12,9 @@ public:
     explicit Client(const std::wstring& pipeName = L"\\\\.\\pipe\\hinv_headless")
         : m_pipeName(pipeName), m_hPipe(INVALID_HANDLE_VALUE) {}
 
+    Client(const Client&) = delete;
+    Client& operator=(const Client&) = delete;
+
     ~Client() { Disconnect(); }
 
     bool Connect() {
@@ -61,7 +64,9 @@ public:
     }
 
     bool SetupSplitTLB(uint64_t address, size_t size) {
-        return SendCommand("splittlb 0x" + std::to_string(address) + " " + std::to_string(size));
+        char buf[96];
+        snprintf(buf, sizeof(buf), "splittlb 0x%llx %zu", static_cast<unsigned long long>(address), size);
+        return SendCommand(buf);
     }
 
     bool CleanKernelTraces(const std::string& driverName) {

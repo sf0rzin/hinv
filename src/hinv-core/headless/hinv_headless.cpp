@@ -154,8 +154,12 @@ static void HandleClient(HANDLE hPipe) {
     CloseHandle(hPipe);
 }
 
+static HANDLE g_stopEvent = nullptr;
+
 static void StartIpcControlServer() {
     std::cout << "[hinv::headless] IPC server listening on " << "\\\\.\\pipe\\hinv_headless" << "\n";
+    g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_stopEvent) return;
 
     while (g_running) {
         HANDLE hPipe = CreateNamedPipeW(
@@ -175,7 +179,27 @@ static void StartIpcControlServer() {
             continue;
         }
 
-        BOOL connected = ConnectNamedPipe(hPipe, nullptr) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ov.hEvent) { CloseHandle(hPipe); continue; }
+
+        BOOL connected = ConnectNamedPipe(hPipe, &ov);
+        DWORD err = GetLastError();
+        if (!connected && err == ERROR_IO_PENDING) {
+            HANDLE handles[2] = { g_stopEvent, ov.hEvent };
+            DWORD wait = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+            if (wait == WAIT_OBJECT_0) {
+                CancelIo(hPipe);
+                CloseHandle(ov.hEvent);
+                CloseHandle(hPipe);
+                break;
+            }
+            connected = TRUE;
+        } else if (!connected && err == ERROR_PIPE_CONNECTED) {
+            connected = TRUE;
+        }
+        CloseHandle(ov.hEvent);
+
         if (connected && g_running) {
             std::thread clientThread(HandleClient, hPipe);
             clientThread.detach();
@@ -183,6 +207,8 @@ static void StartIpcControlServer() {
             CloseHandle(hPipe);
         }
     }
+    CloseHandle(g_stopEvent);
+    g_stopEvent = nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +247,7 @@ bool RunHeadlessSession(const HeadlessConfig& config) {
 
 void StopHeadlessSession() {
     g_running = false;
+    if (g_stopEvent) SetEvent(g_stopEvent);
 }
 
 } // namespace headless

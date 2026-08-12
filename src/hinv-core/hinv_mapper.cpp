@@ -72,25 +72,40 @@ static bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<ui
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(raw.data());
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
 
+    // Validate e_lfanew before dereferencing the NT header.
+    if (dos->e_lfanew < sizeof(IMAGE_DOS_HEADER) ||
+        dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > raw.size())
+        return false;
+
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(raw.data() + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
     if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
 
     uint32_t imageSize = nt->OptionalHeader.SizeOfImage;
     uint64_t preferredBase = nt->OptionalHeader.ImageBase;
+    if (imageSize == 0 || imageSize > 0x20000000) return false; // cap at 512 MB
+
+    uint32_t headersSize = nt->OptionalHeader.SizeOfHeaders;
+    if (headersSize == 0 || headersSize > imageSize || headersSize > raw.size()) return false;
+
     mapped.assign(imageSize, 0);
 
     // Copy headers.
-    std::memcpy(mapped.data(), raw.data(), nt->OptionalHeader.SizeOfHeaders);
+    std::memcpy(mapped.data(), raw.data(), headersSize);
 
-    // Copy sections.
+    // Copy sections with bounds checking.
     const auto* sec = IMAGE_FIRST_SECTION(nt);
     for (uint16_t i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
         if (sec[i].PointerToRawData == 0 || sec[i].SizeOfRawData == 0) continue;
+        if (sec[i].VirtualAddress >= imageSize) continue;
+
         size_t rawSize = sec[i].SizeOfRawData;
         if (sec[i].PointerToRawData >= raw.size()) continue;
         if (sec[i].PointerToRawData + rawSize > raw.size())
             rawSize = raw.size() - sec[i].PointerToRawData;
+        if (sec[i].VirtualAddress + rawSize > imageSize)
+            rawSize = imageSize - sec[i].VirtualAddress;
+
         std::memcpy(mapped.data() + sec[i].VirtualAddress,
                     raw.data() + sec[i].PointerToRawData,
                     rawSize);
@@ -99,17 +114,22 @@ static bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<ui
     // Fix base relocation table.
     const auto& relocDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
     if (relocDir.VirtualAddress != 0 && relocDir.Size != 0) {
+        if (relocDir.VirtualAddress + relocDir.Size > imageSize) return false;
         uint64_t delta = imageBase - preferredBase;
         uint32_t relocOffset = 0;
         while (relocOffset < relocDir.Size) {
             auto* block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(mapped.data() + relocDir.VirtualAddress + relocOffset);
             uint32_t pageRva = block->VirtualAddress;
             uint32_t blockSize = block->SizeOfBlock;
+            if (blockSize < sizeof(IMAGE_BASE_RELOCATION) || blockSize > relocDir.Size - relocOffset) break;
+            if (pageRva >= imageSize) break;
+
             uint32_t numEntries = (blockSize - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(uint16_t);
             auto* entries = reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(block) + sizeof(IMAGE_BASE_RELOCATION));
             for (uint32_t j = 0; j < numEntries; ++j) {
                 uint16_t type = (entries[j] >> 12) & 0xF;
                 uint16_t offset = entries[j] & 0xFFF;
+                if (pageRva + offset >= imageSize) break;
                 uint8_t* addr = mapped.data() + pageRva + offset;
                 switch (type) {
                     case IMAGE_REL_BASED_HIGHLOW:
@@ -125,7 +145,6 @@ static bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<ui
                         *reinterpret_cast<uint16_t*>(addr) += static_cast<uint16_t>(delta);
                         break;
                     default:
-                        // Ignore unsupported/placeholder types.
                         break;
                 }
             }
@@ -136,29 +155,41 @@ static bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<ui
     // Resolve imports.
     const auto& importDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (importDir.VirtualAddress != 0 && importDir.Size != 0) {
+        if (importDir.VirtualAddress >= imageSize) return false;
         auto* importDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(mapped.data() + importDir.VirtualAddress);
-        while (importDesc->Name != 0) {
+        size_t guard = 0;
+        while (importDesc->Name != 0 && guard++ < 4096) {
+            if (importDesc->Name >= imageSize) break;
             const char* dllName = reinterpret_cast<const char*>(mapped.data() + importDesc->Name);
+
             uint32_t lookupRva = importDesc->OriginalFirstThunk ? importDesc->OriginalFirstThunk : importDesc->FirstThunk;
+            if (lookupRva >= imageSize || importDesc->FirstThunk >= imageSize) break;
             auto* lookupThunk = reinterpret_cast<IMAGE_THUNK_DATA64*>(mapped.data() + lookupRva);
             auto* firstThunk = reinterpret_cast<IMAGE_THUNK_DATA64*>(mapped.data() + importDesc->FirstThunk);
 
+            size_t thunkGuard = 0;
             for (size_t idx = 0; ; ++idx) {
+                if (thunkGuard++ > 8192) break;
                 uint64_t thunkValue = lookupThunk[idx].u1.AddressOfData;
                 if (thunkValue == 0) break;
+                if (thunkValue >= imageSize) break;
 
                 bool byOrdinal = (thunkValue & IMAGE_ORDINAL_FLAG64) != 0;
                 uint16_t ordinal = byOrdinal ? static_cast<uint16_t>(thunkValue & 0xFFFF) : 0;
                 std::string procName;
                 if (!byOrdinal) {
                     const auto* importByName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(mapped.data() + thunkValue);
-                    procName = reinterpret_cast<const char*>(importByName->Name);
+                    // Ensure the name fits within the image before copying.
+                    size_t maxLen = imageSize - thunkValue - sizeof(uint16_t);
+                    const char* namePtr = reinterpret_cast<const char*>(importByName->Name);
+                    size_t nameLen = strnlen(namePtr, maxLen);
+                    procName.assign(namePtr, nameLen);
                 }
 
                 uint64_t resolved = ResolveImport(backend, dllName, procName, ordinal, byOrdinal);
                 if (resolved == 0) {
                     std::cerr << "[hinv::mapper] Unresolved import: " << dllName << "!" << procName << "\n";
-                    // Continue rather than abort; the driver may not use every import.
+                    return false;
                 }
                 firstThunk[idx].u1.Function = resolved;
             }
@@ -233,9 +264,34 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
     }
     std::cout << "[hinv::mapper] Hijacked \\Driver\\Null object at 0x" << std::hex << nullObject << std::dec << "\n";
 
+    // Patch \\Driver\\Null DriverObject so it describes the mapped image.
+    // DRIVER_OBJECT (x64): DriverStart @ 0x18, DriverSize @ 0x20.
+    constexpr uint64_t OFF_DRIVER_START = 0x18;
+    constexpr uint64_t OFF_DRIVER_SIZE = 0x20;
+    uint64_t origStart = 0;
+    uint32_t origSize = 0;
+    if (!kmem::ReadU64(backend, nullObject + OFF_DRIVER_START, origStart) ||
+        !kmem::ReadU32(backend, nullObject + OFF_DRIVER_SIZE, origSize)) {
+        result.error = "failed to read original DriverObject fields";
+        result.imageBase = kernelBase;
+        return result;
+    }
+    if (!kmem::WriteU64(backend, nullObject + OFF_DRIVER_START, kernelBase) ||
+        !kmem::WriteU32(backend, nullObject + OFF_DRIVER_SIZE, imageSize)) {
+        result.error = "failed to patch DriverObject fields";
+        result.imageBase = kernelBase;
+        return result;
+    }
+
     // Call DriverEntry(DriverObject, RegistryPath = NULL).
     uint32_t status = kmem::CallDriverEntry(backend, driverEntryVa, nullObject, 0);
     std::cout << "[hinv::mapper] DriverEntry returned 0x" << std::hex << status << std::dec << "\n";
+
+    // NOTE: restoring the original DriverStart/DriverSize keeps \\Driver\\Null consistent,
+    // but the mapped driver may see stale fields if it references the object after DriverEntry.
+    // A future improvement is to allocate a fake DRIVER_OBJECT instead of borrowing null.sys.
+    kmem::WriteU64(backend, nullObject + OFF_DRIVER_START, origStart);
+    kmem::WriteU32(backend, nullObject + OFF_DRIVER_SIZE, origSize);
 
     result.success = true;
     result.imageBase = kernelBase;

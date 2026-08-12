@@ -29,8 +29,9 @@ bool ApplySplitTLB(uint64_t targetVirtualAddress, size_t size) {
 
 bool RemoveSplitTLB(uint64_t targetVirtualAddress) {
     std::cout << "[hinv::ept] Removing EPT cloak for 0x" << std::hex << targetVirtualAddress << std::dec << "\n";
-    // HyperDbg event clearing: 'events' command then 'event clear N' or clear all.
-    return vmm::SendVmmCommand("events");
+    // HyperDbg event clearing requires knowing the event index from 'events'.
+    // As a pragmatic fallback, clear all events.
+    return vmm::SendVmmCommand("event clear all");
 }
 
 } // namespace ept

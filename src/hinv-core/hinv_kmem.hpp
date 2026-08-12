@@ -34,6 +34,7 @@ uint64_t FindHalDispatchTable(byovd::IByovdBackend* backend);
 inline bool ReadU64(byovd::IByovdBackend* b, uint64_t va, uint64_t& out) { return b->ReadKernelMemory(va, &out, sizeof(out)); }
 inline bool ReadU32(byovd::IByovdBackend* b, uint64_t va, uint32_t& out) { return b->ReadKernelMemory(va, &out, sizeof(out)); }
 inline bool WriteU64(byovd::IByovdBackend* b, uint64_t va, uint64_t in)   { return b->WriteKernelMemory(va, &in, sizeof(in)); }
+inline bool WriteU32(byovd::IByovdBackend* b, uint64_t va, uint32_t in)   { return b->WriteKernelMemory(va, &in, sizeof(in)); }
 
 // Execute a small kernel shellcode via HalDispatchTable[1] overwrite.
 //   shellcode  : bytes to execute in Ring 0

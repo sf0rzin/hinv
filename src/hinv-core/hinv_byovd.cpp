@@ -179,30 +179,44 @@ public:
     bool IsReady() const override { return hDevice_ != INVALID_HANDLE_VALUE; }
 
     bool ReadKernelMemory(uint64_t kernelVa, void* out, size_t size) override {
-        if (!IsReady() || size == 0 || size > 0x1000) return false;
-        std::vector<uint8_t> in(sizeof(DbUtilRwPacket) - 1, 0);
-        auto* req = reinterpret_cast<DbUtilRwPacket*>(in.data());
-        req->address = kernelVa;
-        req->size = static_cast<uint32_t>(size);
-        req->padding = 0;
+        if (!IsReady() || size == 0) return false;
+        constexpr size_t CHUNK = 0x1000;
+        auto* dst = static_cast<uint8_t*>(out);
+        for (size_t off = 0; off < size; off += CHUNK) {
+            size_t n = (off + CHUNK > size) ? (size - off) : CHUNK;
+            std::vector<uint8_t> in(sizeof(DbUtilRwPacket) - 1, 0);
+            auto* req = reinterpret_cast<DbUtilRwPacket*>(in.data());
+            req->address = kernelVa + off;
+            req->size = static_cast<uint32_t>(n);
+            req->padding = 0;
 
-        DWORD bytes = 0;
-        return DeviceIoControl(hDevice_, profile_.readIoc, in.data(), static_cast<DWORD>(in.size()),
-                               out, static_cast<DWORD>(size), &bytes, nullptr) == TRUE;
+            DWORD bytes = 0;
+            if (!DeviceIoControl(hDevice_, profile_.readIoc, in.data(), static_cast<DWORD>(in.size()),
+                                 dst + off, static_cast<DWORD>(n), &bytes, nullptr))
+                return false;
+        }
+        return true;
     }
 
     bool WriteKernelMemory(uint64_t kernelVa, const void* inBuf, size_t size) override {
-        if (!IsReady() || size == 0 || size > 0x1000) return false;
-        std::vector<uint8_t> buf(sizeof(DbUtilRwPacket) - 1 + size, 0);
-        auto* req = reinterpret_cast<DbUtilRwPacket*>(buf.data());
-        req->address = kernelVa;
-        req->size = static_cast<uint32_t>(size);
-        req->padding = 0;
-        std::memcpy(req->data, inBuf, size);
+        if (!IsReady() || size == 0) return false;
+        constexpr size_t CHUNK = 0x1000;
+        const auto* src = static_cast<const uint8_t*>(inBuf);
+        for (size_t off = 0; off < size; off += CHUNK) {
+            size_t n = (off + CHUNK > size) ? (size - off) : CHUNK;
+            std::vector<uint8_t> buf(sizeof(DbUtilRwPacket) - 1 + n, 0);
+            auto* req = reinterpret_cast<DbUtilRwPacket*>(buf.data());
+            req->address = kernelVa + off;
+            req->size = static_cast<uint32_t>(n);
+            req->padding = 0;
+            std::memcpy(req->data, src + off, n);
 
-        DWORD bytes = 0;
-        return DeviceIoControl(hDevice_, profile_.writeIoc, buf.data(), static_cast<DWORD>(buf.size()),
-                               nullptr, 0, &bytes, nullptr) == TRUE;
+            DWORD bytes = 0;
+            if (!DeviceIoControl(hDevice_, profile_.writeIoc, buf.data(), static_cast<DWORD>(buf.size()),
+                                 nullptr, 0, &bytes, nullptr))
+                return false;
+        }
+        return true;
     }
 };
 

