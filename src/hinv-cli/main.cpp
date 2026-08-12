@@ -1,18 +1,28 @@
 #include <windows.h>
 #include <iostream>
 #include <string>
+#include <vector>
 
+#include "../hinv-core/hinv_byovd.hpp"
 #include "../hinv-core/hinv_hijack.hpp"
-#include "../hinv-core/hinv_iat.hpp"
 #include "../hinv-core/hinv_vmm.hpp"
+#include "../hinv-core/hinv_ept_shadow.hpp"
+#include "../hinv-core/hinv_cleaner.hpp"
+#include "../hinv-core/hinv_mapper.hpp"
 #include "../hinv-core/headless/hinv_headless.hpp"
 
-void PrintUsage() {
-    std::cout << "Usage:\n";
-    std::cout << "  hinv.exe load <path_to_driver.sys>\n";
-    std::cout << "  hinv.exe headless [--script <script.txt>]\n";
-    std::cout << "  hinv.exe status\n";
-    std::cout << "  hinv.exe cloak <hex_address> <size>\n\n";
+static void PrintUsage() {
+    std::cout << "Usage:\n"
+              << "  hinv.exe load <driver.sys> --byovd <vulnerable.sys>\n"
+              << "  hinv.exe clean <drivername> --byovd <vulnerable.sys>\n"
+              << "  hinv.exe cloak <hex_address> <size>\n"
+              << "  hinv.exe headless --byovd <vulnerable.sys> [--script <script.txt>]\n"
+              << "  hinv.exe hypercmd <command>\n"
+              << "  hinv.exe status\n\n";
+}
+
+static std::wstring ToWstring(const std::string& s) {
+    return std::wstring(s.begin(), s.end());
 }
 
 int main(int argc, char* argv[]) {
@@ -23,43 +33,86 @@ int main(int argc, char* argv[]) {
 
     std::string command = argv[1];
 
-    if (command == "status") {
-        std::cout << "[*] Checking hinv & HyperDbg VMM status...\n";
-        uint64_t nullDriverBase = hinv::hijack::GetDriverObjectAddress(L"Null");
-        bool vmmActive = hinv::vmm::IsVmmDeviceActive();
+    // Parse common flags.
+    std::wstring byovdPath;
+    std::string scriptPath;
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--byovd" && i + 1 < argc) byovdPath = ToWstring(argv[++i]);
+        else if (arg == "--script" && i + 1 < argc) scriptPath = argv[++i];
+    }
 
-        std::cout << "[+] Native null.sys Driver Base : 0x" << std::hex << nullDriverBase << std::dec << "\n";
-        std::cout << "[+] HyperDbg VMM Device Active  : " << (vmmActive ? "YES (VT-x Active)" : "NO (Not Loaded)") << "\n";
+    if (command == "status") {
+        std::cout << "[*] HyperDbg device: " << (hinv::vmm::IsVmmDeviceActive() ? "ready" : "not loaded") << "\n";
+        std::cout << "[*] BYOVD backend: " << (byovdPath.empty() ? "not configured" : "configured") << "\n";
+        return 0;
+    }
+
+    if (command == "hypercmd" && argc >= 3) {
+        std::string cmd = argv[2];
+        for (int i = 3; i < argc; ++i) cmd += std::string(" ") + argv[i];
+        if (!hinv::vmm::SendVmmCommand(cmd)) {
+            std::cerr << "[-] HyperDbg command failed\n";
+            return 1;
+        }
+        std::cout << "[+] HyperDbg command sent\n";
+        return 0;
+    }
+
+    if (command == "cloak" && argc >= 4) {
+        uint64_t addr = std::strtoull(argv[2], nullptr, 0);
+        size_t size = std::strtoull(argv[3], nullptr, 0);
+        if (!hinv::ept::ApplySplitTLB(addr, size)) {
+            std::cerr << "[-] EPT cloak failed\n";
+            return 1;
+        }
+        std::cout << "[+] EPT cloak applied\n";
         return 0;
     }
 
     if (command == "headless") {
         hinv::headless::HeadlessConfig config;
-        for (int i = 2; i < argc; i++) {
-            std::string arg = argv[i];
-            if (arg == "--script" && i + 1 < argc) {
-                config.scriptPath = argv[++i];
-            }
-        }
+        config.byovdDriverPath = byovdPath;
+        config.scriptPath = scriptPath;
         hinv::headless::RunHeadlessSession(config);
         return 0;
     }
 
+    // Commands below require an active BYOVD backend.
+    if (byovdPath.empty()) {
+        std::cerr << "[-] This command requires --byovd <vulnerable.sys>\n";
+        return 1;
+    }
+
+    auto backend = hinv::byovd::LoadVulnerableDriver(byovdPath);
+    if (!backend) {
+        std::cerr << "[-] Failed to load BYOVD backend\n";
+        return 1;
+    }
+
     if (command == "load" && argc >= 3) {
-        std::string driverPath = argv[2];
-        std::cout << "[*] Loading driver via hinv manual mapper: " << driverPath << "\n";
+        std::wstring driverPath = ToWstring(argv[2]);
+        std::wcout << L"[*] Loading driver via hinv manual mapper: " << driverPath << L"\n";
 
-        // 1. Hijack DriverObject
-        uint64_t nullDriverBase = hinv::hijack::GetDriverObjectAddress(L"Null");
-        hinv::hijack::PrepareHijackedDriverObject(nullDriverBase, 0x10000);
+        auto result = hinv::mapper::MapDriver(backend.get(), driverPath);
+        if (!result.success) {
+            std::cerr << "[-] Manual mapping failed: " << result.error << "\n";
+            return 1;
+        }
 
-        // 2. Perform IAT dependency filtering
-        hinv::iat::IsUserModeModule("hyperlog.dll");
+        std::cout << "[+] Driver mapped at 0x" << std::hex << result.imageBase
+                  << ", DriverEntry returned 0x" << result.driverEntryStatus << std::dec << "\n";
+        return 0;
+    }
 
-        // 3. Apply EPT Memory Cloaking
-        hinv::vmm::CloakKernelMemory(0x10000, 4096);
-
-        std::cout << "[+] Driver " << driverPath << " processed cleanly by hinv loader.\n";
+    if (command == "clean" && argc >= 3) {
+        std::wstring driverName = ToWstring(argv[2]);
+        auto result = hinv::cleaner::CleanDriverTraces(backend.get(), driverName);
+        if (!result.mmUnloadedDrivers && !result.piDdbCache) {
+            std::wcerr << L"[-] Trace cleaning did not find matching entries: " << result.error << L"\n";
+            return 1;
+        }
+        std::wcout << L"[+] Traces sanitized for " << driverName << L"\n";
         return 0;
     }
 

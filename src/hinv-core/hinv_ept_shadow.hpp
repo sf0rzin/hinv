@@ -1,28 +1,28 @@
 #pragma once
 #include <windows.h>
-#include <iostream>
 #include <cstdint>
+#include <cstddef>
 
 namespace hinv {
-    namespace ept {
+namespace ept {
 
-        // Structure representing EPT Split TLB / Shadow Page entry configuration
-        struct ShadowPageConfig {
-            uint64_t guestVirtualAddress;
-            uint64_t readWritePhysicalPage;   // Dummy page returned on Read/Write
-            uint64_t executePhysicalPage;     // Actual page executed by CPU
-            size_t pageSize;
-            bool isCloaked;
-        };
+struct ShadowPageConfig {
+    uint64_t guestVirtualAddress;
+    uint64_t readWritePhysicalPage;
+    uint64_t executePhysicalPage;
+    size_t   pageSize;
+    bool     isCloaked;
+};
 
-        // Initializes Extended Page Table (EPT) shadow page splitting engine
-        bool InitializeEptShadowEngine();
+// Initialize the EPT shadow subsystem. Requires HyperDbg VMM to be loaded.
+bool InitializeEptShadowEngine();
 
-        // Configures Split TLB / Shadow Page for a target kernel memory region
-        bool ApplySplitTLB(uint64_t targetVirtualAddress, size_t size);
+// Apply EPT-based memory cloaking via HyperDbg !epthook2 / !monitor.
+// This is a user-mode control wrapper; the real split-TLB logic runs inside HyperDbg.
+bool ApplySplitTLB(uint64_t targetVirtualAddress, size_t size);
 
-        // Removes EPT cloaking and restores original page table entries
-        bool RemoveSplitTLB(uint64_t targetVirtualAddress);
+// Remove EPT cloaking. Delegates to HyperDbg event modification commands.
+bool RemoveSplitTLB(uint64_t targetVirtualAddress);
 
-    }
-}
+} // namespace ept
+} // namespace hinv

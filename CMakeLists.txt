@@ -9,11 +9,14 @@ include_directories(
 )
 
 set(HINV_CORE_SOURCES
+    src/hinv-core/hinv_byovd.cpp
+    src/hinv-core/hinv_kmem.cpp
     src/hinv-core/hinv_hijack.cpp
     src/hinv-core/hinv_iat.cpp
     src/hinv-core/hinv_vmm.cpp
     src/hinv-core/hinv_cleaner.cpp
     src/hinv-core/hinv_ept_shadow.cpp
+    src/hinv-core/hinv_mapper.cpp
     src/hinv-core/headless/hinv_headless.cpp
 )
 
@@ -23,4 +26,4 @@ set(HINV_CLI_SOURCES
 
 add_executable(hinv ${HINV_CORE_SOURCES} ${HINV_CLI_SOURCES})
 
-target_link_libraries(hinv PRIVATE psapi advapi32)
+target_link_libraries(hinv PRIVATE psapi advapi32 ntdll)

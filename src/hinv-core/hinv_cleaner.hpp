@@ -1,17 +1,26 @@
 #pragma once
 #include <windows.h>
-#include <iostream>
 #include <string>
+#include <cstdint>
+#include <vector>
+
+#include "hinv_byovd.hpp"
 
 namespace hinv {
-    namespace cleaner {
-        // Cleans driver entry traces from kernel structures (PiDDDB, MmUnloadedDrivers)
-        bool CleanDriverTraces(const std::wstring& driverName);
+namespace cleaner {
 
-        // Clears specific entry from MmUnloadedDrivers array
-        bool ClearUnloadedDriverEntry(const std::wstring& driverName);
+struct CleanResult {
+    bool mmUnloadedDrivers = false;
+    bool piDdbCache = false;
+    std::wstring error;
+};
 
-        // Clears entry from PiDDDBCacheTable
-        bool ClearPiDddbCache(const std::wstring& driverName);
-    }
-}
+// Remove traces of a loaded driver from kernel bookkeeping structures.
+CleanResult CleanDriverTraces(byovd::IByovdBackend* backend, const std::wstring& driverName);
+
+// Direct helpers exposed for scripting.
+bool ClearUnloadedDriverEntry(byovd::IByovdBackend* backend, const std::wstring& driverName);
+bool ClearPiDddbCache(byovd::IByovdBackend* backend, const std::wstring& driverName);
+
+} // namespace cleaner
+} // namespace hinv
