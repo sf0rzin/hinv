@@ -32,20 +32,7 @@ uint64_t ResolveImportProcedure(byovd::IByovdBackend* backend, const std::string
                                 const std::string& procedureName) {
     if (!backend || IsUserModeModule(moduleName)) return 0;
 
-    // Normalize module name to a known kernel module.
-    std::wstring modName(moduleName.begin(), moduleName.end());
-    std::transform(modName.begin(), modName.end(), modName.begin(), ::towlower);
-
-    size_t slash = modName.find_last_of(L"\\/");
-    if (slash != std::wstring::npos) modName = modName.substr(slash + 1);
-    size_t dot = modName.find(L'.');
-    if (dot != std::wstring::npos) modName = modName.substr(0, dot);
-
-    if (modName == L"ntoskrnl") modName = L"ntoskrnl.exe";
-    else if (modName == L"hal") modName = L"hal.dll";
-    else if (modName == L"fltmgr") modName = L"fltmgr.sys";
-    else modName += L".sys";
-
+    std::wstring modName = kmem::NormalizeModuleName(moduleName);
     return kmem::ResolveKernelExport(backend, modName.c_str(), procedureName.c_str());
 }
 

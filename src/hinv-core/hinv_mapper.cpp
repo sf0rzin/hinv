@@ -40,25 +40,12 @@ static uint64_t R64(const uint8_t* p) { return *reinterpret_cast<const uint64_t*
 
 static uint64_t ResolveImport(byovd::IByovdBackend* backend, const std::string& dllName,
                               const std::string& procName, uint16_t ordinal, bool byOrdinal) {
-    std::wstring modName = ToLower(ToWstring(dllName));
-    // Strip path and extension if present.
-    size_t slash = modName.find_last_of(L"\\/");
-    if (slash != std::wstring::npos) modName = modName.substr(slash + 1);
-    size_t dot = modName.find(L'.');
-    if (dot != std::wstring::npos) modName = modName.substr(0, dot);
-
-    // Append .exe/.sys/.dll based on common kernel module names.
-    if (modName == L"ntoskrnl") modName = L"ntoskrnl.exe";
-    else if (modName == L"hal") modName = L"hal.dll";
-    else if (modName == L"fltmgr") modName = L"fltmgr.sys";
-    else modName += L".sys";
-
     if (byOrdinal) {
-        // Resolve by ordinal is more involved; for now return 0 unless we enumerate all exports.
         (void)ordinal;
         return 0;
     }
 
+    std::wstring modName = kmem::NormalizeModuleName(dllName);
     return kmem::ResolveKernelExport(backend, modName.c_str(), procName.c_str());
 }
 
@@ -236,6 +223,7 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
     std::vector<uint8_t> mapped;
     if (!BuildMappedImage(backend, rawImage, kernelBase, mapped)) {
         result.error = "failed to build mapped image";
+        kmem::FreeKernelMemory(backend, kernelBase);
         return result;
     }
 
@@ -246,6 +234,7 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
         if (!backend->WriteKernelMemory(kernelBase + off, mapped.data() + off, sz)) {
             result.error = "kernel write failed at offset " + std::to_string(off);
             result.imageBase = kernelBase;
+            kmem::FreeKernelMemory(backend, kernelBase);
             return result;
         }
     }
@@ -260,6 +249,7 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
     if (!nullObject) {
         result.error = "failed to obtain \\Driver\\Null object";
         result.imageBase = kernelBase;
+        kmem::FreeKernelMemory(backend, kernelBase);
         return result;
     }
     std::cout << "[hinv::mapper] Hijacked \\Driver\\Null object at 0x" << std::hex << nullObject << std::dec << "\n";

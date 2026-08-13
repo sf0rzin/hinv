@@ -1,90 +1,87 @@
-# hinv (Hyper Invisible)
+# hinv — Hyper Invisible
 
-> **Real BYOVD kernel manual mapping loader with kernel trace sanitization and HyperDbg integration.**
+> **A Windows kernel security research and educational framework.**
 
-**For educational purposes only.** This project is intended for authorized kernel security research, malware analysis, and red-team training in controlled environments. Using it against systems you do not own or without explicit permission is illegal and unethical.
+`hinv` is an open-source learning project that combines the core concepts of **KDMapper** (driver loading without signature enforcement) and **HyperDbg** (hardware-assisted debugging). It is built to help students, reverse engineers, and security researchers understand how Windows kernel driver loading, manual PE mapping, and kernel trace management work at a low level.
 
-`hinv` is a Windows kernel research framework that loads unsigned `.sys` drivers into kernel memory through a vulnerable signed driver (BYOVD), resolves imports/relocations, hijacks `\Driver\Null` for `DriverEntry`, sanitizes `MmUnloadedDrivers` / `PiDDBCacheTable`, and talks to HyperDbg over its real IOCTL interface.
-
-This repo was originally a README-driven placeholder. It has been rewritten to perform the actual operations it advertises.
+This project exists for **study and experimentation in controlled lab environments**. It demonstrates techniques documented in public Windows internals research, security conference talks, and open-source educational tools. If you are learning about kernel drivers, BYOVD, or hypervisor-based debugging, this codebase gives you a working reference implementation you can read, build, and extend.
 
 ---
 
-## What works today
+## Why this project exists
 
-1. **BYOVD backend abstraction**
-   - Loads a vulnerable driver as a service, opens its device, and exposes arbitrary kernel read/write.
-   - Supports `dbutil_2_3.sys` (Dell) out of the box; profile is auto-detected from the file name.
-   - Designed so additional backends (gdrv, RTCore64, etc.) can be added in `hinv_byovd.cpp`.
+Windows kernel security is traditionally hard to learn because many resources are either purely theoretical or incomplete. `hinv` bridges that gap by providing:
 
-2. **Kernel execution primitive**
-   - Uses `HalDispatchTable[1]` overwrite + `NtQueryIntervalProfile` to run small Ring-0 stubs.
-   - Stubs are placed in a writable kernel page, the PTE NX bit is cleared, and everything is restored after execution.
-   - Used for `ExAllocatePool2`/`ExAllocatePoolWithTag`, `ObReferenceObjectByName`, and calling `DriverEntry`.
+- A **readable, modular C++ codebase** with clear separation between the BYOVD backend, kernel execution primitives, manual mapper, and trace sanitization logic.
+- **Real Windows API and kernel-mode programming patterns** you can study: service control management, named pipes, PE parsing, relocation processing, and driver object manipulation.
+- **Integration with HyperDbg** so you can observe kernel behavior through a hypervisor instead of relying only on static analysis.
 
-3. **Real manual mapper**
-   - Parses the target PE in usermode.
-   - Allocates kernel memory, copies sections, fixes base relocations, resolves imports from `ntoskrnl.exe` / `hal.dll` / etc.
-   - Writes the prepared image to kernel memory.
-   - Resolves `\Driver\Null` and calls the mapped driver's `DriverEntry(DriverObject, NULL)`.
-
-4. **Kernel trace sanitizer**
-   - Locates `MmUnloadedDrivers` and `PiDDBCacheTable` by exported symbol or signature fallback.
-   - Zeros matching `UNLOADED_DRIVER_ENTRY` records and unlinks `PIDDB_CACHE_ENTRY` nodes.
-
-5. **HyperDbg integration**
-   - Opens `\\.\HyperDbgDebuggerDevice`.
-   - Sends real HyperDbg IOCTLs (`IOCTL_INIT_VMM`, `IOCTL_SEND_USER_DEBUGGER_COMMANDS`, etc.).
-   - Wraps common commands such as `!epthook2` and `!monitor`.
-
-6. **Headless mode + named-pipe IPC**
-   - Loads BYOVD once and listens on `\\.\pipe\hinv_headless`.
-   - Processes commands: `load`, `clean`, `splittlb`, `hypercmd`, `status`, `exit`.
-   - `hinv_client.hpp` provides a header-only C++ SDK.
+Think of it as a lab toolkit: read the code, run it in a VM, break it, fix it, and learn how the pieces fit together.
 
 ---
 
-## Repository structure
+## What is implemented
+
+| Component | Description |
+|-----------|-------------|
+| `hinv_byovd` | Loads a vulnerable signed driver as a service and exposes kernel read/write primitives. Currently supports `dbutil_2_3.sys`; additional backends can be added. |
+| `hinv_kmem` | Kernel export resolution, SMAP-safe shellcode execution via `HalDispatchTable`, memory allocation (`ExAllocatePool2`), and driver object lookup (`ObReferenceObjectByName`). |
+| `hinv_mapper` | Manual PE mapper: parses a `.sys` file, allocates kernel memory, copies sections, fixes relocations, resolves imports, and calls `DriverEntry`. |
+| `hinv_cleaner` | Kernel trace sanitizer for `MmUnloadedDrivers` and `PiDDBCacheTable`, with lock acquisition (`PiDDBLock`). |
+| `hinv_vmm` / `hinv_ept_shadow` | HyperDbg device integration and EPT cloak wrappers (`!epthook2`, `!monitor`). |
+| `hinv_headless` | Named-pipe IPC server and script executor for automated workflows. |
+| `hinv_client` | Header-only C++ SDK for controlling a running headless instance. |
+
+---
+
+## Architecture
 
 ```
-hinv/
-├── CMakeLists.txt
-├── README.md
-└── src/
-    ├── hinv-core/
-    │   ├── hinv_byovd.hpp / .cpp      # BYOVD driver loader + read/write primitives
-    │   ├── hinv_kmem.hpp / .cpp       # kernel export resolution, shellcode exec, allocator
-    │   ├── hinv_hijack.hpp / .cpp     # DriverObject hijack helpers
-    │   ├── hinv_iat.hpp / .cpp        # import filtering / resolution utility
-    │   ├── hinv_vmm.hpp / .cpp        # HyperDbg device + IOCTL commands
-    │   ├── hinv_cleaner.hpp / .cpp    # MmUnloadedDrivers / PiDDB sanitizer
-    │   ├── hinv_ept_shadow.hpp / .cpp # EPT cloak wrappers via HyperDbg
-    │   ├── hinv_mapper.hpp / .cpp     # manual PE mapper
-    │   ├── hinv_client.hpp            # header-only IPC client SDK
-    │   └── headless/
-    │       ├── hinv_headless.hpp / .cpp
-    └── hinv-cli/
-        └── main.cpp
+hinv-cli / hinv-client
+        │
+        ▼
+┌─────────────────┐
+│  hinv_headless  │  ← Named-pipe IPC server
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  hinv_mapper    │  ← PE parse, reloc, imports, DriverEntry
+│  hinv_cleaner   │  ← MmUnloadedDrivers, PiDDBCacheTable
+│  hinv_vmm/ept   │  ← HyperDbg IOCTLs
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│   hinv_kmem     │  ← HalDispatchTable exec, pool alloc, exports
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│   hinv_byovd    │  ← Service load + arbitrary kernel R/W
+└─────────────────┘
 ```
+
+The design follows a clear layering: the BYOVD backend provides the primitive, `hinv_kmem` builds kernel services on top, and the mapper/cleaner/VMM layers use those services to perform higher-level operations.
 
 ---
 
-## Build
+## Building
 
-### Requirements
+### Prerequisites
 
-- Windows SDK / WDK headers
-- CMake >= 3.20 or MSVC developer prompt
-- A vulnerable signed driver binary (e.g. `dbutil_2_3.sys`) for BYOVD operations
+- Windows 10/11 x64
+- Visual Studio 2019+ (or MSVC build tools) **or** MinGW-w64 GCC
+- CMake >= 3.20 (optional but recommended)
 
-### CMake
+### With CMake
 
 ```cmd
 cmake -B build -A x64
 cmake --build build --config Release
 ```
 
-### MSVC (single command)
+### With MSVC directly
 
 ```cmd
 cl /std:c++20 /EHsc /DUNICODE /D_UNICODE /Fe:hinv.exe ^
@@ -105,16 +102,16 @@ cl /std:c++20 /EHsc /DUNICODE /D_UNICODE /Fe:hinv.exe ^
 
 ## Usage
 
-### Load an unsigned driver via BYOVD
+### Load an unsigned driver into a lab VM
 
 ```cmd
-hinv.exe load C:\path\to\target.sys --byovd C:\path\to\dbutil_2_3.sys
+hinv.exe load C:\lab\test_driver.sys --byovd C:\lab\dbutil_2_3.sys
 ```
 
-### Clean kernel traces left by a vulnerable driver
+### Clean traces left by the vulnerable driver
 
 ```cmd
-hinv.exe clean dbutil_2_3.sys --byovd C:\path\to\dbutil_2_3.sys
+hinv.exe clean dbutil_2_3.sys --byovd C:\lab\dbutil_2_3.sys
 ```
 
 ### Send a command to HyperDbg
@@ -123,25 +120,25 @@ hinv.exe clean dbutil_2_3.sys --byovd C:\path\to\dbutil_2_3.sys
 hinv.exe hypercmd "!syscall pid 0x2e18"
 ```
 
-### Run headless with a script
+### Run a headless automation script
 
 ```cmd
-hinv.exe headless --byovd C:\path\to\dbutil_2_3.sys --script script.txt
+hinv.exe headless --byovd C:\lab\dbutil_2_3.sys --script script.txt
 ```
 
 Example `script.txt`:
 
 ```text
-# load a driver manually
-load C:\path\to\target.sys
+# Load a driver into kernel memory
+load C:\lab\test_driver.sys
 
-# clean traces of the BYOVD driver
+# Remove traces of the vulnerable driver from kernel logs
 clean dbutil_2_3.sys
 
-# ask HyperDbg to monitor a region
+# Ask HyperDbg to monitor a memory region
 hypercmd !monitor rw 0xFFFFF80000000000 0x1000
 
-# exit the engine
+# Shut down the engine
 exit
 ```
 
@@ -153,7 +150,7 @@ exit
 int main() {
     hinv::Client client;
     if (client.Connect()) {
-        client.LoadDriver("C:\\path\\to\\target.sys");
+        client.LoadDriver("C:\\lab\\test_driver.sys");
         client.CleanKernelTraces("dbutil_2_3.sys");
         client.HyperDbgCommand("!syscall pid 0x2e18");
     }
@@ -163,21 +160,40 @@ int main() {
 
 ---
 
-## Architecture notes
+## Learning resources this project is based on
 
-- The BYOVD backend is the root of trust. Everything else is built on top of arbitrary kernel read/write.
-- Kernel memory allocation and code execution are implemented through `HalDispatchTable` stubs rather than relying on a driver-specific execution IOCTL. This makes the framework backend-agnostic at the kernel-exec layer.
-- The manual mapper builds the driver image in usermode and only needs two kernel execution events: one to allocate pool memory and one to call `DriverEntry`.
-- EPT / split-TLB is intentionally delegated to HyperDbg. Writing a bare-metal VT-x hypervisor is outside the scope of a single repo; HyperDbg already provides the VMM engine and exposes it through IOCTLs.
+- **KDMapper** — manual mapping concepts and driver loading workflows.
+- **HyperDbg** — hypervisor-assisted debugging and EPT-based observation.
+- **Windows Internals** (Pavel Yosifovich, Mark Russinovich) — driver model, object manager, and memory manager internals.
+- **Public BYOVD research** — Microsoft documentation on driver signature enforcement and the vulnerable driver landscape.
+
+---
+
+## Legal and ethical use
+
+**This project is for educational purposes only.** It is designed for:
+
+- Security research in isolated virtual machines
+- Malware analysis and reverse engineering coursework
+- Red-team training with explicit authorization
+- Learning Windows kernel driver development and internals
+
+Do not use this software on systems you do not own or without explicit written permission. Unauthorized use may violate computer misuse laws and Microsoft's terms of service. The authors and contributors are not responsible for misuse.
 
 ---
 
 ## Known limitations
 
-- `dbutil_2_3.sys` IOCTL structure varies by build. If the read/write primitive fails, verify the input layout in `hinv_byovd.cpp` against your specific driver version.
-- `MmUnloadedDrivers` / `PiDDBCacheTable` signatures are Windows-version dependent. Export resolution is tried first; if symbols are not exported, the signature fallback may need adjustment for newer builds.
-- The PTE self-reference index is assumed to be `0x1ED`. Windows can randomize this on some builds.
-- HyperDbg must already be loaded (`hyperdbg-cli --start` or equivalent) for VMM/EPT commands to work.
+- **SMAP-safe execution** is implemented, but PTE self-reference index is currently hardcoded to `0x1ED`. Some Windows builds randomize this value.
+- **PiDDBCacheTable traversal** supports the classic list-based layout; newer Windows builds using `RTL_RB_TREE` may need updated signatures.
+- **Driver object hijack** borrows `\Driver\Null`; a future improvement is allocating a synthetic `DRIVER_OBJECT`.
+- **Vulnerable driver compatibility** varies by build. Verify the `dbutil_2_3.sys` IOCTL structure against your specific binary before use.
+
+---
+
+## Contributing
+
+Contributions are welcome. If you add a new BYOVD backend, improve version detection, or extend the HyperDbg integration, please open a pull request with clear documentation and test notes.
 
 ---
 
