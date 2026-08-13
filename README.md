@@ -1,10 +1,10 @@
 # hinv — Hyper Invisible
 
-> **A Windows kernel security research and educational framework.**
+> **Experimental Windows kernel security research and educational framework.**
 
-`hinv` is an open-source learning project that combines the core concepts of **KDMapper** (driver loading without signature enforcement) and **HyperDbg** (hardware-assisted debugging). It is built to help students, reverse engineers, and security researchers understand how Windows kernel driver loading, manual PE mapping, and kernel trace management work at a low level.
+`hinv` is an **open-source learning project** that combines the core concepts of **KDMapper** (driver loading without signature enforcement) and **HyperDbg** (hardware-assisted debugging). It is built to help students, reverse engineers, and security researchers understand how Windows kernel driver loading, manual PE mapping, and kernel trace management work at a low level.
 
-This project exists for **study and experimentation in controlled lab environments**. It demonstrates techniques documented in public Windows internals research, security conference talks, and open-source educational tools. If you are learning about kernel drivers, BYOVD, or hypervisor-based debugging, this codebase gives you a working reference implementation you can read, build, and extend.
+**⚠️ This is an experimental prototype.** It is intended for **study and experimentation in isolated, disposable virtual machines only**. It demonstrates techniques documented in public Windows internals research, security conference talks, and open-source educational tools. It is not production-ready, not stable across Windows builds, and not safe to run on real systems. If you are learning about kernel drivers, BYOVD, or hypervisor-based debugging, this codebase gives you a working reference implementation you can read, build, and extend.
 
 ---
 

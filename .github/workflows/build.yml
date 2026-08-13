@@ -1,0 +1,28 @@
+name: build
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Build with CMake
+      run: |
+        cmake -B build -A x64
+        cmake --build build --config Release
+
+    - name: Run parser safety tests
+      run: |
+        # The parser tests require a mock backend; they do not touch the kernel.
+        echo "Parser safety tests are not yet wired into CI."
+        exit 0

@@ -16,6 +16,8 @@
 #include <vector>
 #include <cstring>
 #include <chrono>
+#include <sddl.h>
+#include <aclapi.h>
 
 namespace hinv {
 namespace headless {
@@ -161,6 +163,20 @@ static void StartIpcControlServer() {
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_stopEvent) return;
 
+    // Restrict pipe access to SYSTEM and Administrators.
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;GA;;;SY)(A;;GA;;;BA)", SDDL_REVISION_1, &sd, nullptr)) {
+        std::cerr << "[hinv::headless] Failed to build security descriptor\n";
+        CloseHandle(g_stopEvent);
+        return;
+    }
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = sd;
+    sa.bInheritHandle = FALSE;
+
     while (g_running) {
         HANDLE hPipe = CreateNamedPipeW(
             HINV_PIPE_NAME,
@@ -170,7 +186,7 @@ static void StartIpcControlServer() {
             4096,
             4096,
             0,
-            nullptr
+            &sa
         );
 
         if (hPipe == INVALID_HANDLE_VALUE) {
@@ -207,6 +223,7 @@ static void StartIpcControlServer() {
             CloseHandle(hPipe);
         }
     }
+    LocalFree(sd);
     CloseHandle(g_stopEvent);
     g_stopEvent = nullptr;
 }

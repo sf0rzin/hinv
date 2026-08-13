@@ -283,10 +283,13 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
     kmem::WriteU64(backend, nullObject + OFF_DRIVER_START, origStart);
     kmem::WriteU32(backend, nullObject + OFF_DRIVER_SIZE, origSize);
 
-    result.success = true;
+    result.success = (status == 0); // STATUS_SUCCESS
     result.imageBase = kernelBase;
     result.driverObject = nullObject;
     result.driverEntryStatus = status;
+    if (!result.success) {
+        result.error = "DriverEntry returned failure";
+    }
     return result;
 }
 
