@@ -89,8 +89,11 @@ bool AllocateKernelMemory(byovd::IByovdBackend* backend, size_t size, uint64_t& 
 bool FreeKernelMemory(byovd::IByovdBackend* backend, uint64_t kernelVa);
 
 // Resolve a kernel DriverObject by name (e.g. L"\\Driver\\Null") using ObReferenceObjectByName.
-// Returns the object pointer (kernel VA) or 0.
+// Returns the object pointer (kernel VA) or 0. Caller must call DereferenceObject when done.
 uint64_t GetDriverObject(byovd::IByovdBackend* backend, const wchar_t* driverName);
+
+// Decrement the reference count on a kernel object obtained by GetDriverObject.
+bool DereferenceObject(byovd::IByovdBackend* backend, uint64_t objectAddress);
 
 // Call a driver entry point from Ring 0. Returns the NTSTATUS produced by DriverEntry.
 uint32_t CallDriverEntry(byovd::IByovdBackend* backend, uint64_t driverEntryVa,

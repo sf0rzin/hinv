@@ -6,6 +6,7 @@
 #include <vector>
 #include <iostream>
 #include <cassert>
+#include <cstring>
 
 #include "../src/hinv-core/hinv_mapper.hpp"
 
@@ -62,9 +63,12 @@ int main() {
     assert(!result.success && result.error == "invalid arguments");
     std::cout << "[TEST] Empty input: rejected\n";
 
-    // Test 3: too small input must fail safely.
-    result = hinv::mapper::MapDriverBytes(&backend, { 0x4D, 0x5A });
-    assert(!result.success && result.error == "invalid DOS signature");
+    // Test 3: too small input must fail safely (less than IMAGE_DOS_HEADER).
+    std::vector<uint8_t> tiny(32, 0);
+    tiny[0] = 'M';
+    tiny[1] = 'Z';
+    result = hinv::mapper::MapDriverBytes(&backend, tiny);
+    assert(!result.success && result.error == "invalid arguments");
     std::cout << "[TEST] Tiny input: rejected\n";
 
     // Test 4: bad e_lfanew must fail safely.

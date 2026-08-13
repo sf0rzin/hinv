@@ -184,10 +184,16 @@ Do not use this software on systems you do not own or without explicit written p
 
 ## Known limitations
 
-- **SMAP-safe execution** is implemented, but PTE self-reference index is currently hardcoded to `0x1ED`. Some Windows builds randomize this value.
-- **PiDDBCacheTable traversal** supports the classic list-based layout; newer Windows builds using `RTL_RB_TREE` may need updated signatures.
+This is an **experimental prototype**. The following areas are incomplete or unstable:
+
+- **PTE self-reference index** is hardcoded to `0x1ED`. Some Windows builds randomize this value.
+- **PiDDBCacheTable traversal** only supports the classic `LIST_ENTRY` layout (Windows 7–10 21H2). Newer builds using `RTL_RB_TREE` require a dedicated traversal that is not yet implemented.
 - **Driver object hijack** borrows `\Driver\Null`; a future improvement is allocating a synthetic `DRIVER_OBJECT`.
 - **Vulnerable driver compatibility** varies by build. Verify the `dbutil_2_3.sys` IOCTL structure against your specific binary before use.
+- **HyperDbg integration** uses structured packets for read/edit/VA2PA, but arbitrary script commands (`!syscall`, `!monitor`, etc.) require the full `libhyperdbg` script engine and are not yet supported.
+- **EPT / split-TLB cloaking** is not implemented. The relevant functions return `false` to indicate the operation did not occur.
+- **Named pipe security** uses a basic SYSTEM/Administrators ACL but does not validate client tokens.
+- **No automated test suite** is wired into the build yet; the parser safety tests exist but are not executed in CI.
 
 ---
 

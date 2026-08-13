@@ -159,23 +159,19 @@ bool CloakKernelMemory(uint64_t virtualAddress, size_t size) {
         return false;
     }
 
-    // HyperDbg does not expose a single "split TLB" IOCTL. EPT cloaking is
-    // implemented through event registration (EPT hook + monitor). For a
-    // read/write/execute trap we register an EPT event on the target range.
-    //
-    // NOTE: The full EPT hook registration requires a DEBUGGER_EVENT and
-    // action buffer. This is a placeholder that prepares the memory for
-    // observation but does not register the hook itself.
+    // EPT cloaking requires registering a DEBUGGER_EVENT with an action
+    // buffer. That path is not yet implemented. This function returns false
+    // so callers do not assume the operation succeeded.
+    (void)virtualAddress;
     (void)size;
-    std::cout << "[hinv::vmm] EPT cloak prepared for " << ToHex(virtualAddress) << "\n";
-    return true;
+    std::cerr << "[hinv::vmm] EPT cloaking not yet implemented; requires DEBUGGER_EVENT registration\n";
+    return false;
 }
 
 bool SetEptHiddenHook(uint64_t targetAddress) {
-    // Same caveat as CloakKernelMemory: full event registration requires
-    // building DEBUGGER_EVENT and action packets.
-    std::cout << "[hinv::vmm] EPT hidden hook prepared for " << ToHex(targetAddress) << "\n";
-    return true;
+    (void)targetAddress;
+    std::cerr << "[hinv::vmm] EPT hidden hook not yet implemented\n";
+    return false;
 }
 
 bool MonitorMemory(uint64_t virtualAddress, size_t size, bool read, bool write, bool execute) {
@@ -184,9 +180,8 @@ bool MonitorMemory(uint64_t virtualAddress, size_t size, bool read, bool write, 
     (void)read;
     (void)write;
     (void)execute;
-    // Memory monitoring requires event registration with a buffer.
-    std::cout << "[hinv::vmm] Memory monitor prepared\n";
-    return true;
+    std::cerr << "[hinv::vmm] Memory monitoring not yet implemented\n";
+    return false;
 }
 
 bool SendVmmCommand(const std::string& command) {

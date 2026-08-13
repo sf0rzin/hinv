@@ -10,18 +10,19 @@ namespace vmm {
 constexpr const wchar_t* HYPERDBG_DEVICE_NAME = L"\\\\.\\HyperDbgDebuggerDevice";
 
 // HyperDbg SDK IOCTL codes (computed from HyperDbg include/SDK/headers/Ioctls.h)
+// IOCTL_START_CODE = 0x800, IOCTL_VMM_IOCTL = 0x800 + 0x200 = 0xA00
 // CTL_CODE(0x22, function, METHOD_BUFFERED, FILE_ANY_ACCESS) = 0x220000 | (function << 2)
 constexpr DWORD IOCTL_HYPERDBG_INIT_VMM                = 0x222004; // 0x801
-constexpr DWORD IOCTL_HYPERDBG_READ_MEMORY             = 0x222408; // 0x902
-constexpr DWORD IOCTL_HYPERDBG_READ_OR_WRITE_MSR       = 0x22240C; // 0x903
-constexpr DWORD IOCTL_HYPERDBG_REGISTER_EVENT          = 0x222414; // 0x905
-constexpr DWORD IOCTL_HYPERDBG_ADD_ACTION_TO_EVENT     = 0x222418; // 0x906
-constexpr DWORD IOCTL_HYPERDBG_VA2PA_AND_PA2VA         = 0x222420; // 0x908
-constexpr DWORD IOCTL_HYPERDBG_EDIT_MEMORY             = 0x222424; // 0x909
-constexpr DWORD IOCTL_HYPERDBG_SEARCH_MEMORY           = 0x222428; // 0x90a
-constexpr DWORD IOCTL_HYPERDBG_MODIFY_EVENTS           = 0x22242C; // 0x90b
-constexpr DWORD IOCTL_HYPERDBG_ATTACH_DETACH_PROCESS   = 0x222434; // 0x90d
-constexpr DWORD IOCTL_HYPERDBG_SEND_USER_COMMANDS      = 0x222458; // 0x916
+constexpr DWORD IOCTL_HYPERDBG_READ_MEMORY             = 0x222808; // 0xA02
+constexpr DWORD IOCTL_HYPERDBG_READ_OR_WRITE_MSR       = 0x22280C; // 0xA03
+constexpr DWORD IOCTL_HYPERDBG_REGISTER_EVENT          = 0x222814; // 0xA05
+constexpr DWORD IOCTL_HYPERDBG_ADD_ACTION_TO_EVENT     = 0x222818; // 0xA06
+constexpr DWORD IOCTL_HYPERDBG_VA2PA_AND_PA2VA         = 0x222820; // 0xA08
+constexpr DWORD IOCTL_HYPERDBG_EDIT_MEMORY             = 0x222824; // 0xA09
+constexpr DWORD IOCTL_HYPERDBG_SEARCH_MEMORY           = 0x222828; // 0xA0a
+constexpr DWORD IOCTL_HYPERDBG_MODIFY_EVENTS           = 0x22282C; // 0xA0b
+constexpr DWORD IOCTL_HYPERDBG_ATTACH_DETACH_PROCESS   = 0x222834; // 0xA0d
+constexpr DWORD IOCTL_HYPERDBG_SEND_USER_COMMANDS      = 0x222858; // 0xA16
 
 // HyperDbg structured packet types.
 enum class ReadMemoryType : uint32_t {
@@ -39,7 +40,6 @@ enum class ReadingType : uint32_t {
     VmxRoot = 1
 };
 
-#pragma pack(push, 1)
 struct DebugerReadMemoryPacket {
     uint32_t Pid;
     uint64_t Address;
@@ -63,7 +63,6 @@ struct DebugerEditMemoryPacket {
     uint32_t FinalStructureSize;
     // data follows
 };
-#pragma pack(pop)
 
 // Open/close the HyperDbg device handle.
 bool IsVmmDeviceActive();

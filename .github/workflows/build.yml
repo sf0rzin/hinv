@@ -23,6 +23,5 @@ jobs:
 
     - name: Run parser safety tests
       run: |
-        # The parser tests require a mock backend; they do not touch the kernel.
-        echo "Parser safety tests are not yet wired into CI."
-        exit 0
+        cmake --build build --config Release --target hinv_tests
+        ctest --test-dir build -C Release --output-on-failure

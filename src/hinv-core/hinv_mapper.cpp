@@ -159,14 +159,13 @@ static bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<ui
                 if (thunkGuard++ > 8192) break;
                 uint64_t thunkValue = lookupThunk[idx].u1.AddressOfData;
                 if (thunkValue == 0) break;
-                if (thunkValue >= imageSize) break;
 
                 bool byOrdinal = (thunkValue & IMAGE_ORDINAL_FLAG64) != 0;
                 uint16_t ordinal = byOrdinal ? static_cast<uint16_t>(thunkValue & 0xFFFF) : 0;
                 std::string procName;
                 if (!byOrdinal) {
+                    if (thunkValue >= imageSize) break;
                     const auto* importByName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(mapped.data() + thunkValue);
-                    // Ensure the name fits within the image before copying.
                     size_t maxLen = imageSize - thunkValue - sizeof(uint16_t);
                     const char* namePtr = reinterpret_cast<const char*>(importByName->Name);
                     size_t nameLen = strnlen(namePtr, maxLen);
@@ -193,7 +192,7 @@ static bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<ui
 
 MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<uint8_t>& rawImage) {
     MappingResult result{};
-    if (!backend || rawImage.empty()) {
+    if (!backend || rawImage.size() < sizeof(IMAGE_DOS_HEADER)) {
         result.error = "invalid arguments";
         return result;
     }
@@ -203,9 +202,18 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
         result.error = "invalid DOS signature";
         return result;
     }
+    if (dos->e_lfanew < sizeof(IMAGE_DOS_HEADER) ||
+        dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > rawImage.size()) {
+        result.error = "invalid e_lfanew";
+        return result;
+    }
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(rawImage.data() + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) {
         result.error = "invalid NT signature";
+        return result;
+    }
+    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        result.error = "not a PE32+ image";
         return result;
     }
 
@@ -266,10 +274,23 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
         result.imageBase = kernelBase;
         return result;
     }
-    if (!kmem::WriteU64(backend, nullObject + OFF_DRIVER_START, kernelBase) ||
-        !kmem::WriteU32(backend, nullObject + OFF_DRIVER_SIZE, imageSize)) {
+    bool startWritten = false;
+    bool sizeWritten = false;
+    if (kmem::WriteU64(backend, nullObject + OFF_DRIVER_START, kernelBase)) {
+        startWritten = true;
+    }
+    if (kmem::WriteU32(backend, nullObject + OFF_DRIVER_SIZE, imageSize)) {
+        sizeWritten = true;
+    }
+
+    if (!startWritten || !sizeWritten) {
         result.error = "failed to patch DriverObject fields";
         result.imageBase = kernelBase;
+        // Best-effort restore whatever was written.
+        if (startWritten) kmem::WriteU64(backend, nullObject + OFF_DRIVER_START, origStart);
+        if (sizeWritten) kmem::WriteU32(backend, nullObject + OFF_DRIVER_SIZE, origSize);
+        kmem::DereferenceObject(backend, nullObject);
+        kmem::FreeKernelMemory(backend, kernelBase);
         return result;
     }
 
@@ -277,11 +298,13 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
     uint32_t status = kmem::CallDriverEntry(backend, driverEntryVa, nullObject, 0);
     std::cout << "[hinv::mapper] DriverEntry returned 0x" << std::hex << status << std::dec << "\n";
 
-    // NOTE: restoring the original DriverStart/DriverSize keeps \\Driver\\Null consistent,
-    // but the mapped driver may see stale fields if it references the object after DriverEntry.
-    // A future improvement is to allocate a fake DRIVER_OBJECT instead of borrowing null.sys.
+    // Restore original fields to keep \\Driver\\Null consistent.
+    // Ignore restore failures; the driver object will be dereferenced below.
     kmem::WriteU64(backend, nullObject + OFF_DRIVER_START, origStart);
     kmem::WriteU32(backend, nullObject + OFF_DRIVER_SIZE, origSize);
+
+    // Drop the reference we took with ObReferenceObjectByName.
+    kmem::DereferenceObject(backend, nullObject);
 
     result.success = (status == 0); // STATUS_SUCCESS
     result.imageBase = kernelBase;
@@ -289,6 +312,9 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
     result.driverEntryStatus = status;
     if (!result.success) {
         result.error = "DriverEntry returned failure";
+        // On failure, free the mapped image to avoid leaking pool memory.
+        kmem::FreeKernelMemory(backend, kernelBase);
+        result.imageBase = 0;
     }
     return result;
 }

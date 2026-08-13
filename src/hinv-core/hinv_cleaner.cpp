@@ -227,19 +227,21 @@ bool ClearPiDddbCache(byovd::IByovdBackend* backend, const std::wstring& driverN
     }
 
     uint64_t lockVa = FindPiDDBLock(backend);
-    bool lockHeld = false;
-    if (lockVa) {
-        lockHeld = kmem::AcquireKernelLock(backend, lockVa, 0); // ExAcquireResourceExclusiveLite
-        if (!lockHeld) {
-            std::wcerr << L"[hinv::cleaner] Failed to acquire PiDDBLock\n";
-        }
+    if (!lockVa) {
+        std::wcerr << L"[hinv::cleaner] PiDDBLock not located; cannot safely modify cache\n";
+        return false;
     }
 
-    // PiDDBCacheTable is RTL_AVL_TABLE on Windows 7-10 21H2 and RTL_RB_TREE on newer.
-    // We first try a list walk, then an AVL in-order walk if the list walk finds nothing.
+    if (!kmem::AcquireKernelLock(backend, lockVa, 0)) {
+        std::wcerr << L"[hinv::cleaner] Failed to acquire PiDDBLock\n";
+        return false;
+    }
+
+    // PiDDBCacheTable uses LIST_ENTRY on Windows 7-10 21H2 and RTL_RB_TREE on newer.
+    // This walker only supports the LIST_ENTRY layout. For RB_TREE builds a
+    // dedicated in-order traversal is required; that is not yet implemented.
     bool found = false;
 
-    // List-based walk (older Windows).
     LIST_ENTRY tableList{};
     if (backend->ReadKernelMemory(tableVa, &tableList, sizeof(tableList))) {
         uint64_t headFlink = reinterpret_cast<uint64_t>(tableList.Flink);
@@ -268,9 +270,7 @@ bool ClearPiDddbCache(byovd::IByovdBackend* backend, const std::wstring& driverN
         }
     }
 
-    if (lockHeld && lockVa) {
-        kmem::ReleaseKernelLock(backend, lockVa, 0);
-    }
+    kmem::ReleaseKernelLock(backend, lockVa, 0);
     return found;
 }
 

@@ -25,6 +25,7 @@ namespace headless {
 static std::unique_ptr<byovd::IByovdBackend> g_backend;
 static std::mutex g_backendMutex;
 static std::atomic<bool> g_running{ false };
+static HANDLE g_stopEvent = nullptr;
 
 byovd::IByovdBackend* GetActiveBackend() {
     std::lock_guard<std::mutex> lock(g_backendMutex);
@@ -97,6 +98,7 @@ std::string ProcessCommand(const std::string& command) {
 
     if (cmd == "exit") {
         g_running = false;
+        if (g_stopEvent) SetEvent(g_stopEvent);
         return "OK bye";
     }
 
@@ -156,8 +158,6 @@ static void HandleClient(HANDLE hPipe) {
     CloseHandle(hPipe);
 }
 
-static HANDLE g_stopEvent = nullptr;
-
 static void StartIpcControlServer() {
     std::cout << "[hinv::headless] IPC server listening on " << "\\\\.\\pipe\\hinv_headless" << "\n";
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -180,7 +180,7 @@ static void StartIpcControlServer() {
     while (g_running) {
         HANDLE hPipe = CreateNamedPipeW(
             HINV_PIPE_NAME,
-            PIPE_ACCESS_DUPLEX,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
             PIPE_UNLIMITED_INSTANCES,
             4096,

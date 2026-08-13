@@ -19,19 +19,19 @@ bool ApplySplitTLB(uint64_t targetVirtualAddress, size_t size) {
     std::cout << "[hinv::ept] Applying EPT split-TLB cloak for 0x" << std::hex
               << targetVirtualAddress << std::dec << " (" << size << " bytes)\n";
 
-    // HyperDbg does not expose raw EPT PTE editing to user-mode. We use !monitor
-    // to trap read/write and !epthook2 to trap execute on the same range.
-    bool ok = true;
-    ok &= vmm::MonitorMemory(targetVirtualAddress, size, true, true, false);
-    ok &= vmm::SetEptHiddenHook(targetVirtualAddress);
-    return ok;
+    // EPT operations require HyperDbg event registration, which is not yet
+    // implemented. Return failure so callers do not assume success.
+    (void)targetVirtualAddress;
+    (void)size;
+    std::cerr << "[hinv::ept] EPT split-TLB not yet implemented\n";
+    return false;
 }
 
 bool RemoveSplitTLB(uint64_t targetVirtualAddress) {
     std::cout << "[hinv::ept] Removing EPT cloak for 0x" << std::hex << targetVirtualAddress << std::dec << "\n";
-    // HyperDbg event clearing requires knowing the event index from 'events'.
-    // As a pragmatic fallback, clear all events.
-    return vmm::SendVmmCommand("event clear all");
+    (void)targetVirtualAddress;
+    std::cerr << "[hinv::ept] EPT removal not yet implemented\n";
+    return false;
 }
 
 } // namespace ept
