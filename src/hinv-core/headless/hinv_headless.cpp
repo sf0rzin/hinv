@@ -134,21 +134,49 @@ bool ExecuteScriptFile(const std::string& scriptPath) {
 static void HandleClient(HANDLE hPipe) {
     constexpr size_t BUF_SIZE = 4096;
     char buffer[BUF_SIZE]{};
-    DWORD bytesRead = 0;
 
     while (g_running) {
-        BOOL ok = ReadFile(hPipe, buffer, BUF_SIZE - 1, &bytesRead, nullptr);
+        OVERLAPPED ovRead{};
+        ovRead.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ovRead.hEvent) break;
+
+        DWORD bytesRead = 0;
+        BOOL ok = ReadFile(hPipe, buffer, BUF_SIZE - 1, &bytesRead, &ovRead);
+        if (!ok && GetLastError() == ERROR_IO_PENDING) {
+            HANDLE handles[2] = { g_stopEvent, ovRead.hEvent };
+            DWORD wait = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+            if (wait == WAIT_OBJECT_0) {
+                CancelIo(hPipe);
+                CloseHandle(ovRead.hEvent);
+                break;
+            }
+            if (wait != WAIT_OBJECT_0 + 1) {
+                CloseHandle(ovRead.hEvent);
+                break;
+            }
+            ok = GetOverlappedResult(hPipe, &ovRead, &bytesRead, TRUE);
+        }
+        CloseHandle(ovRead.hEvent);
+
         if (!ok || bytesRead == 0) break;
         buffer[bytesRead] = '\0';
 
         std::string request(buffer);
-        // Trim trailing newline / CR
         while (!request.empty() && (request.back() == '\n' || request.back() == '\r'))
             request.pop_back();
 
         std::string response = ProcessCommand(request) + "\n";
+
+        OVERLAPPED ovWrite{};
+        ovWrite.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ovWrite.hEvent) break;
+
         DWORD written = 0;
-        WriteFile(hPipe, response.c_str(), static_cast<DWORD>(response.size()), &written, nullptr);
+        ok = WriteFile(hPipe, response.c_str(), static_cast<DWORD>(response.size()), &written, &ovWrite);
+        if (!ok && GetLastError() == ERROR_IO_PENDING) {
+            ok = GetOverlappedResult(hPipe, &ovWrite, &written, TRUE);
+        }
+        CloseHandle(ovWrite.hEvent);
 
         if (request == "exit") break;
     }

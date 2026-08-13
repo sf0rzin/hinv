@@ -82,6 +82,10 @@ static bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<ui
 
     // Copy sections with bounds checking.
     const auto* sec = IMAGE_FIRST_SECTION(nt);
+    uint64_t sectionTableEnd = dos->e_lfanew + 4 + sizeof(IMAGE_FILE_HEADER) + nt->FileHeader.SizeOfOptionalHeader
+                               + nt->FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER);
+    if (sectionTableEnd > raw.size()) return false;
+
     for (uint16_t i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
         if (sec[i].PointerToRawData == 0 || sec[i].SizeOfRawData == 0) continue;
         if (sec[i].VirtualAddress >= imageSize) continue;
@@ -105,6 +109,7 @@ static bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<ui
         uint64_t delta = imageBase - preferredBase;
         uint32_t relocOffset = 0;
         while (relocOffset < relocDir.Size) {
+            if (relocDir.VirtualAddress + relocOffset + sizeof(IMAGE_BASE_RELOCATION) > imageSize) break;
             auto* block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(mapped.data() + relocDir.VirtualAddress + relocOffset);
             uint32_t pageRva = block->VirtualAddress;
             uint32_t blockSize = block->SizeOfBlock;
@@ -120,15 +125,19 @@ static bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<ui
                 uint8_t* addr = mapped.data() + pageRva + offset;
                 switch (type) {
                     case IMAGE_REL_BASED_HIGHLOW:
+                        if (pageRva + offset + sizeof(uint32_t) > imageSize) break;
                         *reinterpret_cast<uint32_t*>(addr) += static_cast<uint32_t>(delta);
                         break;
                     case IMAGE_REL_BASED_DIR64:
+                        if (pageRva + offset + sizeof(uint64_t) > imageSize) break;
                         *reinterpret_cast<uint64_t*>(addr) += delta;
                         break;
                     case IMAGE_REL_BASED_HIGH:
+                        if (pageRva + offset + sizeof(uint16_t) > imageSize) break;
                         *reinterpret_cast<uint16_t*>(addr) += static_cast<uint16_t>(delta >> 16);
                         break;
                     case IMAGE_REL_BASED_LOW:
+                        if (pageRva + offset + sizeof(uint16_t) > imageSize) break;
                         *reinterpret_cast<uint16_t*>(addr) += static_cast<uint16_t>(delta);
                         break;
                     default:
@@ -143,6 +152,7 @@ static bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<ui
     const auto& importDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (importDir.VirtualAddress != 0 && importDir.Size != 0) {
         if (importDir.VirtualAddress >= imageSize) return false;
+        if (importDir.VirtualAddress + sizeof(IMAGE_IMPORT_DESCRIPTOR) > imageSize) return false;
         auto* importDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(mapped.data() + importDir.VirtualAddress);
         size_t guard = 0;
         while (importDesc->Name != 0 && guard++ < 4096) {
@@ -157,6 +167,8 @@ static bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<ui
             size_t thunkGuard = 0;
             for (size_t idx = 0; ; ++idx) {
                 if (thunkGuard++ > 8192) break;
+                if (lookupRva + idx * sizeof(IMAGE_THUNK_DATA64) >= imageSize) break;
+                if (importDesc->FirstThunk + idx * sizeof(IMAGE_THUNK_DATA64) >= imageSize) break;
                 uint64_t thunkValue = lookupThunk[idx].u1.AddressOfData;
                 if (thunkValue == 0) break;
 
@@ -165,8 +177,9 @@ static bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<ui
                 std::string procName;
                 if (!byOrdinal) {
                     if (thunkValue >= imageSize) break;
-                    const auto* importByName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(mapped.data() + thunkValue);
+                    if (imageSize - thunkValue < sizeof(uint16_t) + 1) break;
                     size_t maxLen = imageSize - thunkValue - sizeof(uint16_t);
+                    const auto* importByName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(mapped.data() + thunkValue);
                     const char* namePtr = reinterpret_cast<const char*>(importByName->Name);
                     size_t nameLen = strnlen(namePtr, maxLen);
                     procName.assign(namePtr, nameLen);
@@ -218,6 +231,14 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
     }
 
     uint32_t imageSize = nt->OptionalHeader.SizeOfImage;
+    if (imageSize == 0 || imageSize > 0x20000000) {
+        result.error = "invalid SizeOfImage";
+        return result;
+    }
+    if (nt->OptionalHeader.AddressOfEntryPoint >= imageSize) {
+        result.error = "AddressOfEntryPoint out of bounds";
+        return result;
+    }
     std::cout << "[hinv::mapper] Image size: " << imageSize << " bytes, preferred base: 0x"
               << std::hex << nt->OptionalHeader.ImageBase << std::dec << "\n";
 
@@ -272,6 +293,8 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
         !kmem::ReadU32(backend, nullObject + OFF_DRIVER_SIZE, origSize)) {
         result.error = "failed to read original DriverObject fields";
         result.imageBase = kernelBase;
+        kmem::DereferenceObject(backend, nullObject);
+        kmem::FreeKernelMemory(backend, kernelBase);
         return result;
     }
     bool startWritten = false;

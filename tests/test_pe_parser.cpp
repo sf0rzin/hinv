@@ -50,41 +50,55 @@ static std::vector<uint8_t> MakeValidPe() {
     return pe;
 }
 
+static int failures = 0;
+
+static void Check(bool condition, const char* testName) {
+    if (condition) {
+        std::cout << "[PASS] " << testName << "\n";
+    } else {
+        std::cout << "[FAIL] " << testName << "\n";
+        ++failures;
+    }
+}
+
 int main() {
     MockBackend backend;
 
     // Test 1: valid PE should be accepted by MapDriverBytes (will fail at allocation, but not at parsing).
     auto validPe = MakeValidPe();
     auto result = hinv::mapper::MapDriverBytes(&backend, validPe);
-    std::cout << "[TEST] Valid PE: error=" << result.error << "\n";
+    Check(!result.success, "valid PE rejected at allocation (expected with mock backend)");
 
     // Test 2: empty input must fail safely.
     result = hinv::mapper::MapDriverBytes(&backend, {});
-    assert(!result.success && result.error == "invalid arguments");
-    std::cout << "[TEST] Empty input: rejected\n";
+    Check(!result.success && result.error == "invalid arguments", "empty input rejected");
 
     // Test 3: too small input must fail safely (less than IMAGE_DOS_HEADER).
     std::vector<uint8_t> tiny(32, 0);
     tiny[0] = 'M';
     tiny[1] = 'Z';
     result = hinv::mapper::MapDriverBytes(&backend, tiny);
-    assert(!result.success && result.error == "invalid arguments");
-    std::cout << "[TEST] Tiny input: rejected\n";
+    Check(!result.success && result.error == "invalid arguments", "tiny input rejected");
 
     // Test 4: bad e_lfanew must fail safely.
     auto badPe = MakeValidPe();
     *reinterpret_cast<uint32_t*>(badPe.data() + 0x3C) = 0x1000; // out of bounds
     result = hinv::mapper::MapDriverBytes(&backend, badPe);
-    assert(!result.success);
-    std::cout << "[TEST] Bad e_lfanew: rejected\n";
+    Check(!result.success && result.error == "invalid e_lfanew", "bad e_lfanew rejected");
 
     // Test 5: bad NT signature must fail safely.
     badPe = MakeValidPe();
     *reinterpret_cast<uint32_t*>(badPe.data() + 0x80) = 0xDEADBEEF;
     result = hinv::mapper::MapDriverBytes(&backend, badPe);
-    assert(!result.success && result.error == "invalid NT signature");
-    std::cout << "[TEST] Bad NT signature: rejected\n";
+    Check(!result.success && result.error == "invalid NT signature", "bad NT signature rejected");
 
-    std::cout << "[TEST] All parser safety tests passed\n";
-    return 0;
+    // Test 6: wrong PE magic must fail safely.
+    badPe = MakeValidPe();
+    badPe[0] = 'X';
+    badPe[1] = 'X';
+    result = hinv::mapper::MapDriverBytes(&backend, badPe);
+    Check(!result.success && result.error == "invalid DOS signature", "bad DOS signature rejected");
+
+    std::cout << "[TEST] " << (failures == 0 ? "All tests passed" : "Some tests failed") << "\n";
+    return failures == 0 ? 0 : 1;
 }

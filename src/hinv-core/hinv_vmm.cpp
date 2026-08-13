@@ -94,6 +94,15 @@ bool ReadKernelMemoryHyperDbg(uint64_t address, void* out, size_t size) {
         return false;
     }
 
+    if (hdr->KernelStatus != 0) {
+        std::cerr << "[hinv::vmm] ReadMemory kernel status: 0x" << std::hex << hdr->KernelStatus << std::dec << "\n";
+        return false;
+    }
+    if (hdr->ReturnLength < size) {
+        std::cerr << "[hinv::vmm] ReadMemory returned " << hdr->ReturnLength << " bytes, expected " << size << "\n";
+        return false;
+    }
+
     std::memcpy(out, packet.data() + sizeof(DebugerReadMemoryPacket), size);
     return true;
 }
@@ -102,26 +111,38 @@ bool EditKernelMemoryHyperDbg(uint64_t address, const void* in, size_t size) {
     if (!in || size == 0 || size > 0x10000) return false;
 
     uint32_t byteSizeCode;
-    if (size == 1) byteSizeCode = 0;
-    else if (size == 4) byteSizeCode = 1;
-    else if (size == 8) byteSizeCode = 2;
-    else byteSizeCode = 2; // default to qword chunks
+    size_t paddedSize = size;
+    if (size == 1) { byteSizeCode = 0; paddedSize = 1; }
+    else if (size == 4) { byteSizeCode = 1; paddedSize = 4; }
+    else if (size == 8) { byteSizeCode = 2; paddedSize = 8; }
+    else {
+        byteSizeCode = 2;
+        paddedSize = ((size + 7) / 8) * 8; // pad to qword boundary
+    }
 
-    std::vector<uint8_t> packet(sizeof(DebugerEditMemoryPacket) + size, 0);
+    std::vector<uint8_t> packet(sizeof(DebugerEditMemoryPacket) + paddedSize, 0);
     auto* hdr = reinterpret_cast<DebugerEditMemoryPacket*>(packet.data());
     hdr->Result = 0;
     hdr->Address = address;
     hdr->ProcessId = 0;
     hdr->MemoryType = 0; // virtual
     hdr->ByteSize = byteSizeCode;
-    hdr->CountOf64Chunks = static_cast<uint32_t>((size + 7) / 8);
-    hdr->FinalStructureSize = static_cast<uint32_t>(sizeof(DebugerEditMemoryPacket) + size);
+    hdr->CountOf64Chunks = static_cast<uint32_t>(paddedSize / 8);
+    hdr->FinalStructureSize = static_cast<uint32_t>(sizeof(DebugerEditMemoryPacket) + paddedSize);
 
     std::memcpy(packet.data() + sizeof(DebugerEditMemoryPacket), in, size);
 
     DWORD bytes = 0;
-    return SendVmmIoctl(IOCTL_HYPERDBG_EDIT_MEMORY, packet.data(), static_cast<DWORD>(packet.size()),
-                        packet.data(), static_cast<DWORD>(packet.size()), &bytes);
+    if (!SendVmmIoctl(IOCTL_HYPERDBG_EDIT_MEMORY, packet.data(), static_cast<DWORD>(packet.size()),
+                      packet.data(), static_cast<DWORD>(packet.size()), &bytes)) {
+        return false;
+    }
+
+    if (hdr->Result != 0) {
+        std::cerr << "[hinv::vmm] EditMemory result: 0x" << std::hex << hdr->Result << std::dec << "\n";
+        return false;
+    }
+    return true;
 }
 
 bool VirtualToPhysicalHyperDbg(uint64_t virtualAddress, uint64_t& outPhysical) {
@@ -143,6 +164,11 @@ bool VirtualToPhysicalHyperDbg(uint64_t virtualAddress, uint64_t& outPhysical) {
     DWORD bytes = 0;
     if (!SendVmmIoctl(IOCTL_HYPERDBG_VA2PA_AND_PA2VA, &packet, sizeof(packet),
                       &packet, sizeof(packet), &bytes)) {
+        return false;
+    }
+
+    if (packet.KernelStatus != 0) {
+        std::cerr << "[hinv::vmm] VA2PA kernel status: 0x" << std::hex << packet.KernelStatus << std::dec << "\n";
         return false;
     }
     outPhysical = packet.PhysicalAddress;

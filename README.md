@@ -114,12 +114,6 @@ hinv.exe load C:\lab\test_driver.sys --byovd C:\lab\dbutil_2_3.sys
 hinv.exe clean dbutil_2_3.sys --byovd C:\lab\dbutil_2_3.sys
 ```
 
-### Send a command to HyperDbg
-
-```cmd
-hinv.exe hypercmd "!syscall pid 0x2e18"
-```
-
 ### Run a headless automation script
 
 ```cmd
@@ -135,9 +129,6 @@ load C:\lab\test_driver.sys
 # Remove traces of the vulnerable driver from kernel logs
 clean dbutil_2_3.sys
 
-# Ask HyperDbg to monitor a memory region
-hypercmd !monitor rw 0xFFFFF80000000000 0x1000
-
 # Shut down the engine
 exit
 ```
@@ -152,10 +143,27 @@ int main() {
     if (client.Connect()) {
         client.LoadDriver("C:\\lab\\test_driver.sys");
         client.CleanKernelTraces("dbutil_2_3.sys");
-        client.HyperDbgCommand("!syscall pid 0x2e18");
     }
     return 0;
 }
+```
+
+### HyperDbg structured operations
+
+HyperDbg text commands are not supported over raw IOCTL. Use the structured packet APIs:
+
+```cpp
+// Read kernel memory via HyperDbg
+uint8_t buffer[256];
+hinv::vmm::ReadKernelMemoryHyperDbg(0xFFFFF80000000000, buffer, sizeof(buffer));
+
+// Edit kernel memory via HyperDbg
+uint64_t value = 0xDEADBEEF;
+hinv::vmm::EditKernelMemoryHyperDbg(0xFFFFF80000000000, &value, sizeof(value));
+
+// Virtual to physical translation
+uint64_t physical = 0;
+hinv::vmm::VirtualToPhysicalHyperDbg(0xFFFFF80000000000, physical);
 ```
 
 ---
@@ -193,7 +201,7 @@ This is an **experimental prototype**. The following areas are incomplete or uns
 - **HyperDbg integration** uses structured packets for read/edit/VA2PA, but arbitrary script commands (`!syscall`, `!monitor`, etc.) require the full `libhyperdbg` script engine and are not yet supported.
 - **EPT / split-TLB cloaking** is not implemented. The relevant functions return `false` to indicate the operation did not occur.
 - **Named pipe security** uses a basic SYSTEM/Administrators ACL but does not validate client tokens.
-- **No automated test suite** is wired into the build yet; the parser safety tests exist but are not executed in CI.
+- **Automated tests** cover PE parser safety; kernel-mode behavior is not automatically tested.
 
 ---
 
