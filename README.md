@@ -25,7 +25,7 @@ Think of it as a lab toolkit: read the code, run it in a VM, break it, fix it, a
 | Component | Description |
 |-----------|-------------|
 | `hinv_byovd` | Loads a vulnerable signed driver as a service and exposes kernel read/write primitives. Supports `dbutil_2_3.sys` (default fallback) and `iqvw64e.sys` (Intel, kdmapper-compatible `CopyMemory` IOCTL); additional backends can be added. |
-| `hinv_kmem` | Kernel export resolution, SMAP-safe shellcode execution via `HalDispatchTable`, memory allocation (`ExAllocatePool2`), and driver object lookup (`ObReferenceObjectByName`). |
+| `hinv_kmem` | Kernel export resolution, arbitrary kernel function calls via a temporary `ntoskrnl!NtAddAtom` prologue hook (kdmapper-style), pool allocation (`ExAllocatePoolWithTag`), and page protection changes (`MmSetPageProtection`). |
 | `hinv_mapper` | Manual PE mapper: parses a `.sys` file, allocates kernel memory, copies sections, fixes relocations, resolves imports, and calls `DriverEntry`. |
 | `hinv_cleaner` | Kernel trace sanitizer for `MmUnloadedDrivers` and `PiDDBCacheTable`. Both paths are currently **fail-closed (disabled)** pending per-build layout verification — see Known limitations. |
 | `hinv_vmm` / `hinv_ept_shadow` | HyperDbg device integration and EPT cloak wrappers (`!epthook2`, `!monitor`). |
@@ -53,7 +53,7 @@ hinv-cli / hinv-client
          │
          ▼
 ┌─────────────────┐
-│   hinv_kmem     │  ← HalDispatchTable exec, pool alloc, exports
+│   hinv_kmem     │  ← NtAddAtom hook calls, pool alloc, exports
 └────────┬────────┘
          │
          ▼
@@ -217,11 +217,11 @@ Do not use this software on systems you do not own or without explicit written p
 
 This is an **experimental prototype**. The following areas are incomplete or unstable:
 
-- **PTE self-reference index** is hardcoded to `0x1ED`. Some Windows builds randomize this value.
+- **Kernel execution primitive** no longer uses shellcode, `HalDispatchTable`, or the (randomized-per-boot) PTE self-reference index. Kernel functions are called through a temporary `ntoskrnl!NtAddAtom` hook written via the Intel backend's physical-mapping IOCTLs (`0x25`/`0x19`/`0x1A`), kdmapper-style. This requires a backend with `WriteReadOnlyMemory` support — currently only `iqvw64e.sys`; the DbUtil backend can only read/write plain kernel memory.
 - **MmUnloadedDrivers cleaner is DISABLED (fail-closed).** Its layout (array of pointers vs. inline array of records) is build-dependent; the previous heuristic could zero the global itself. It stays off until the layout is resolved per build/symbols. `ClearUnloadedDriverEntry` logs and returns `false`.
 - **PiDDBCacheTable cleaner is DISABLED (fail-closed).** The table is an `RTL_AVL_TABLE` on current builds, not a `LIST_ENTRY` head, and `PiDDBLock` is not exported. Safe removal requires an `RtlEnumerateGenericTableAvl`-style traversal plus a per-build lock location; until then `ClearPiDddbCache` logs and returns `false`.
-- **Driver object hijack** borrows `\Driver\Null`; a future improvement is allocating a synthetic `DRIVER_OBJECT`. If restoring the original `DriverStart`/`DriverSize` fails, the mapper reports failure honestly and deliberately leaves the mapped pool allocated rather than leaving `\Driver\Null` pointing at freed memory.
-- **Vulnerable driver compatibility** varies by build. Two backends are implemented: `dbutil_2_3.sys` (default fallback for unrecognized file names) and `iqvw64e.sys` (kdmapper-compatible, `\\.\Nal` device, single `CopyMemory` IOCTL `0x80862007`; reference binary is the public LOLDrivers sample, SHA256 `4429f32db1cc70567919d7d47b844a91cf1329a6cd116f582305f3b7b60cd60b`). Verify the IOCTL structures against your specific binary before use. The Intel backend supplies read/write only; kernel allocation goes through the existing `hinv_kmem` shellcode path, and kdmapper's physical-memory mapping helpers are not ported.
+- **Driver object** is a minimal synthetic `DRIVER_OBJECT` allocated in kernel pool (no `\Driver\Null` hijack): only `DriverStart`/`DriverSize` are populated, which is enough for drivers that don't touch their object deeply — same approach as kdmapper.
+- **Vulnerable driver compatibility** varies by build. Two backends are implemented: `dbutil_2_3.sys` (default fallback for unrecognized file names) and `iqvw64e.sys` (kdmapper-compatible, `\\.\Nal` device, single `CopyMemory` IOCTL `0x80862007`; reference binary is the public LOLDrivers sample, SHA256 `4429f32db1cc70567919d7d47b844a91cf1329a6cd116f582305f3b7b60cd60b`). Verify the IOCTL structures against your specific binary before use. The Intel backend supplies read/write plus the kdmapper physical-mapping helpers (`GetPhysicalAddress`/`MapIoSpace`/`UnmapIoSpace`), which power read-only memory writes for the `NtAddAtom` hook.
 - **HyperDbg integration** uses structured packets for read/edit/VA2PA, honoring HyperDbg's `DEBUGGER_OPERATION_WAS_SUCCESSFUL` (`0xFFFFFFFF`) status convention and per-value 8-byte-slot edit layout. Arbitrary script commands (`!syscall`, `!monitor`, etc.) require the full `libhyperdbg` script engine and are not supported.
 - **EPT / split-TLB cloaking** is not implemented. The relevant functions return `false` to indicate the operation did not occur.
 - **Named pipe security** uses a basic SYSTEM/Administrators ACL but does not validate client tokens.

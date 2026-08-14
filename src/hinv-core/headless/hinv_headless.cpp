@@ -1,5 +1,4 @@
 #include "hinv_headless.hpp"
-#include "../hinv_hijack.hpp"
 #include "../hinv_iat.hpp"
 #include "../hinv_vmm.hpp"
 #include "../hinv_ept_shadow.hpp"

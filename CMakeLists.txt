@@ -11,7 +11,6 @@ include_directories(
 set(HINV_CORE_SOURCES
     src/hinv-core/hinv_byovd.cpp
     src/hinv-core/hinv_kmem.cpp
-    src/hinv-core/hinv_hijack.cpp
     src/hinv-core/hinv_iat.cpp
     src/hinv-core/hinv_vmm.cpp
     src/hinv-core/hinv_cleaner.cpp

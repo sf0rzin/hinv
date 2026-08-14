@@ -5,7 +5,7 @@
 #include <cstdlib>
 
 #include "../hinv-core/hinv_byovd.hpp"
-#include "../hinv-core/hinv_hijack.hpp"
+#include "../hinv-core/hinv_kmem.hpp"
 #include "../hinv-core/hinv_vmm.hpp"
 #include "../hinv-core/hinv_ept_shadow.hpp"
 #include "../hinv-core/hinv_cleaner.hpp"
@@ -85,11 +85,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    hinv::kmem::Trace("cli: backend load begin");
     auto backend = hinv::byovd::LoadVulnerableDriver(byovdPath);
     if (!backend) {
         std::cerr << "[-] Failed to load BYOVD backend\n";
+        hinv::kmem::Trace("cli: backend load failed");
         return 1;
     }
+    hinv::kmem::Trace("cli: backend ready");
 
     if (command == "load" && argc >= 3) {
         // Positional arguments are input modules; flags are skipped. Multiple
