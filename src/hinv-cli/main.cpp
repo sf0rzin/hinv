@@ -130,8 +130,9 @@ int main(int argc, char* argv[]) {
 
     if (command == "clean" && argc >= 3) {
         std::wstring driverName = ToWstring(argv[2]);
-        auto result = hinv::cleaner::CleanDriverTraces(backend.get(), driverName);
-        if (!result.mmUnloadedDrivers && !result.piDdbCache) {
+        uint32_t timestamp = hinv::cleaner::GetDriverFileTimestamp(byovdPath);
+        auto result = hinv::cleaner::CleanDriverTraces(backend.get(), driverName, timestamp);
+        if (!result.piDdbCache && !result.hashBucketList && !result.wdFilter) {
             std::wcerr << L"[-] Trace cleaning did not find matching entries: " << result.error << L"\n";
             return 1;
         }

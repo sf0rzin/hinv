@@ -26,6 +26,7 @@ static std::unique_ptr<byovd::IByovdBackend> g_backend;
 static std::mutex g_backendMutex;
 static std::atomic<bool> g_running{ false };
 static HANDLE g_stopEvent = nullptr;
+static std::wstring g_byovdPath; // used by 'clean' for the driver file timestamp
 struct ClientSlot {
     std::atomic<bool> done{ false };
     std::thread thread;
@@ -87,9 +88,10 @@ std::string ProcessCommand(const std::string& command) {
         std::wstring name(tokens[1].begin(), tokens[1].end());
         std::lock_guard<std::mutex> lock(g_backendMutex);
         if (!g_backend) return "ERR no BYOVD backend loaded";
-        auto result = cleaner::CleanDriverTraces(g_backend.get(), name);
-        if (!result.mmUnloadedDrivers && !result.piDdbCache)
-            return "WARN " + std::string(result.error.begin(), result.error.end());
+        uint32_t timestamp = cleaner::GetDriverFileTimestamp(g_byovdPath);
+        auto result = cleaner::CleanDriverTraces(g_backend.get(), name, timestamp);
+        if (!result.piDdbCache && !result.hashBucketList && !result.wdFilter)
+            return "ERR " + std::string(result.error.begin(), result.error.end());
         return "OK";
     }
 
@@ -321,6 +323,7 @@ bool RunHeadlessSession(const HeadlessConfig& config) {
             g_running = false;
             return false;
         }
+        g_byovdPath = config.byovdDriverPath;
         std::wcout << L"[hinv::headless] BYOVD backend loaded: " << config.byovdDriverPath << L"\n";
     }
 

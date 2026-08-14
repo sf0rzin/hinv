@@ -1,5 +1,6 @@
 #include "hinv_byovd.hpp"
 #include "hinv_kmem.hpp"
+#include "hinv_cleaner.hpp"
 #include <iostream>
 #include <cwctype>
 #include <algorithm>
@@ -177,6 +178,9 @@ public:
 
     void Shutdown() override {
         if (hDevice_ != INVALID_HANDLE_VALUE) {
+            // Zero our own KLDR name so MiRememberUnloadedDriver skips us when
+            // the service stops below (kdmapper's MmUnloadedDrivers trick).
+            cleaner::PreventUnloadedDriverTrace(this, hDevice_);
             CloseHandle(hDevice_);
             hDevice_ = INVALID_HANDLE_VALUE;
         }
@@ -345,6 +349,9 @@ public:
 
     void Shutdown() override {
         if (hDevice_ != INVALID_HANDLE_VALUE) {
+            // Zero our own KLDR name so MiRememberUnloadedDriver skips us when
+            // the service stops below (kdmapper's MmUnloadedDrivers trick).
+            cleaner::PreventUnloadedDriverTrace(this, hDevice_);
             CloseHandle(hDevice_);
             hDevice_ = INVALID_HANDLE_VALUE;
         }
