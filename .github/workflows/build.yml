@@ -25,3 +25,9 @@ jobs:
       run: |
         cmake --build build --config Release --target hinv_tests
         ctest --test-dir build -C Release --output-on-failure
+
+    - name: Upload binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: hinv-windows-x64
+        path: build/Release/hinv.exe

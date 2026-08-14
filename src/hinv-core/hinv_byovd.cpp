@@ -288,6 +288,13 @@ struct Iqvw64eUnmapIoSpaceInfo { // case 0x1A: unmap physical memory
     uint32_t number_of_bytes;
 };
 
+// Wire layouts mirror kdmapper's reference structs (all-u64 leading fields,
+// trailing u32 padded) — lock them against accidental edits.
+static_assert(sizeof(Iqvw64eCopyMemoryInfo) == 40, "iqvw64e CopyMemory layout drifted");
+static_assert(sizeof(Iqvw64eGetPhysInfo) == 32, "iqvw64e GetPhysAddress layout drifted");
+static_assert(sizeof(Iqvw64eMapIoSpaceInfo) == 48, "iqvw64e MapIoSpace layout drifted");
+static_assert(sizeof(Iqvw64eUnmapIoSpaceInfo) == 48, "iqvw64e UnmapIoSpace layout drifted");
+
 class IntelBackend : public IByovdBackend {
 public:
     DriverProfile profile_;

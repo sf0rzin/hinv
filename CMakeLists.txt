@@ -29,6 +29,9 @@ if (MSVC)
     target_compile_options(hinv PRIVATE /W4)
 else()
     target_compile_options(hinv PRIVATE -Wall -Wextra)
+    # Static-link the C++ runtime: a mismatched libstdc++-6.dll earlier in
+    # PATH (e.g. Git for Windows' mingw64) ABI-crashes fstream at runtime.
+    target_link_options(hinv PRIVATE -static-libgcc -static-libstdc++)
 endif()
 
 target_link_libraries(hinv PRIVATE psapi advapi32 ntdll)
@@ -47,6 +50,7 @@ if (MSVC)
     target_compile_options(hinv_tests PRIVATE /W4)
 else()
     target_compile_options(hinv_tests PRIVATE -Wall -Wextra)
+    target_link_options(hinv_tests PRIVATE -static-libgcc -static-libstdc++)
 endif()
 target_link_libraries(hinv_tests PRIVATE psapi advapi32 ntdll)
 

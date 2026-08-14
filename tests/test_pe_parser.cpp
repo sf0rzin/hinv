@@ -9,9 +9,13 @@
 #include <iostream>
 #include <cstring>
 #include <string>
+#include <cstdio>
+#include <fstream>
 
 #include "../src/hinv-core/hinv_mapper.hpp"
 #include "../src/hinv-core/hinv_kmem.hpp"
+#include "../src/hinv-core/hinv_byovd.hpp"
+#include "../src/hinv-core/hinv_cleaner.hpp"
 
 // A mock backend that does nothing; used to test PE parsing logic without kernel access.
 class MockBackend : public hinv::byovd::IByovdBackend {
@@ -426,6 +430,54 @@ int main() {
         addr = hinv::kmem::ResolveKernelExport(&fb, L"fakekd.dll", "NoSuchExport");
         Check(addr == 0, "missing export in mapped module returns 0");
     }
+
+    // --- New primitives: normalization, backend detection, timestamps -------
+
+    {
+        // PiDDB lookup key: TimeDateStamp must come from the file on disk.
+        // (C stdio for the fixture's own file I/O; the project links the C++
+        // runtime statically because a foreign libstdc++-6.dll earlier in PATH
+        // — e.g. Git for Windows' — ABI-crashes fstream at runtime)
+        auto pe = MakePe(0x2000, 0x400);
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(pe.data() + E_LFANEW);
+        nt->FileHeader.TimeDateStamp = 0xDEADBEEF;
+        const char* tmpA = "hinv_test_timestamp.sys";
+        if (FILE* f = std::fopen(tmpA, "wb")) {
+            std::fwrite(pe.data(), 1, pe.size(), f);
+            std::fclose(f);
+        }
+        uint32_t ts = hinv::cleaner::GetDriverFileTimestamp(L"hinv_test_timestamp.sys");
+        Check(ts == 0xDEADBEEF, "driver timestamp read from disk");
+        std::remove(tmpA);
+        Check(hinv::cleaner::GetDriverFileTimestamp(L"no_such_file.sys") == 0,
+              "missing file timestamp is 0");
+    }
+
+    Check(hinv::kmem::NormalizeModuleName(L"ntoskrnl") == L"ntoskrnl.exe",
+          "normalize: ntoskrnl alias");
+    Check(hinv::kmem::NormalizeModuleName(L"C:\\Windows\\System32\\drivers\\iqvw64e.sys") == L"iqvw64e.sys",
+          "normalize: path stripped, extension kept");
+    Check(hinv::kmem::NormalizeModuleName(L"hyperhv") == L"hyperhv.sys",
+          "normalize: bare name gets .sys");
+    Check(hinv::kmem::NormalizeModuleName(L"HAL") == L"hal.dll",
+          "normalize: hal alias lowercased");
+    Check(hinv::kmem::NormalizeModuleName(L"CI.dll") == L"ci.dll",
+          "normalize: ci.dll lowercased");
+    Check(hinv::kmem::NormalizeModuleName(L"kdcom.dll") == L"kdcom.dll",
+          "normalize: kdcom alias");
+
+    {
+        auto intel = hinv::byovd::DetectProfile(L"iqvw64e.sys");
+        Check(intel.type == hinv::byovd::BackendType::Intel && intel.devicePath == L"\\\\.\\Nal",
+              "detect: intel backend + Nal device");
+        auto dell = hinv::byovd::DetectProfile(L"dbutil_2_3.sys");
+        Check(dell.type == hinv::byovd::BackendType::DbUtil && dell.readIoc == 0x9B0C1EC4,
+              "detect: dbutil backend + IOCTLs");
+        auto fallback = hinv::byovd::DetectProfile(L"unknown_driver.sys");
+        Check(fallback.type == hinv::byovd::BackendType::DbUtil,
+              "detect: unknown name falls back to dbutil");
+    }
+
 
     std::cout << "[TEST] " << (failures == 0 ? "All tests passed" : "Some tests failed") << "\n";
     return failures == 0 ? 0 : 1;

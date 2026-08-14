@@ -257,8 +257,8 @@ bool PreventUnloadedDriverTrace(byovd::IByovdBackend* backend, HANDLE deviceHand
         return false;
     }
 
-    auto NtQuerySystemInformation = reinterpret_cast<NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG, PULONG)>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
+    auto NtQuerySystemInformation = reinterpret_cast<NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG, PULONG)>(reinterpret_cast<void*>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation")));
     if (!NtQuerySystemInformation) { kmem::Trace("cleaner: prevent bail (resolve)"); return false; }
 
     // Find our own device handle's kernel object via the extended handle table.

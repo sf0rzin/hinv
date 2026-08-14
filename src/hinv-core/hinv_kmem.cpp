@@ -95,8 +95,8 @@ using NtQuerySystemInformationFn = NTSTATUS(NTAPI*)(
 
 std::vector<KernelModule> EnumKernelModules() {
     std::vector<KernelModule> result;
-    auto NtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformationFn>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
+    auto NtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformationFn>(reinterpret_cast<void*>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation")));
     if (!NtQuerySystemInformation) return result;
 
     ULONG size = 0;
@@ -229,8 +229,8 @@ uint64_t ResolveKernelExport(byovd::IByovdBackend* backend, const wchar_t* modul
 OsVersionInfo GetOsVersion() {
     OsVersionInfo info{};
     using RtlGetVersionFn = NTSTATUS(NTAPI*)(PRTL_OSVERSIONINFOW);
-    auto RtlGetVersion = reinterpret_cast<RtlGetVersionFn>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
+    auto RtlGetVersion = reinterpret_cast<RtlGetVersionFn>(reinterpret_cast<void*>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion")));
     if (RtlGetVersion) {
         RTL_OSVERSIONINFOW os{};
         os.dwOSVersionInfoSize = sizeof(os);

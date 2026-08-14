@@ -211,6 +211,31 @@ Do not use this software on systems you do not own or without explicit written p
 
 ---
 
+## Lab validation
+
+The full pipeline is exercised on real machines during development. To reproduce (a disposable VM is still the recommended environment):
+
+1. Obtain `iqvw64e.sys` — the public [LOLDrivers sample](https://www.loldrivers.io/drivers/1d2cdef1-de44-4849-80e5-e2fa288df681/) (SHA256 `4429f32db1cc70567919d7d47b844a91cf1329a6cd116f582305f3b7b60cd60b`).
+2. Build or pick any test `.sys` (a no-op `DriverEntry` returning `STATUS_SUCCESS` is enough).
+3. From an elevated prompt:
+
+```cmd
+hinv.exe load C:\lab\test_driver.sys --byovd C:\lab\iqvw64e.sys
+hinv.exe clean iqvw64e.sys --byovd C:\lab\iqvw64e.sys
+hinv.exe headless --byovd C:\lab\iqvw64e.sys --script script.txt
+```
+
+- Set `HINV_TRACE=C:\lab\trace.log` for per-stage telemetry that survives a bugcheck (every line is flushed by close). When a run fails, the trace shows the last completed stage; when the machine bugchecks, Event ID 1001 in the `System` log carries the bugcheck code and the faulting address.
+- Success looks like `DriverEntry returned 0x0` / `[+] Mapped at 0x...`. A clean pass logs `PiDDBCacheTable cleaned`, `g_KernelHashBucketList cleaned`, and `WdFilterDriverList cleaned` (skipped when WdFilter is not loaded).
+
+Hard-won rules, baked in after live-fire debugging on Windows 11 26200:
+
+- Never read a candidate/unmapped kernel VA through the backend "to see if it exists" — a BYOVD read of an unmapped address faults inside the vulnerable driver (bugcheck `0x50`). Resolve addresses from in-image code/data only.
+- Any address derived from a pattern scan is validated against the owning module's image range before being used or called.
+- MinGW builds link the C++ runtime statically: a foreign `libstdc++-6.dll` earlier in `PATH` (e.g. Git for Windows') ABI-crashes `std::fstream` at runtime.
+
+---
+
 ## Known limitations
 
 This is an **experimental prototype**. The following areas are incomplete or unstable:
