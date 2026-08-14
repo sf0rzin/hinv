@@ -11,6 +11,7 @@
 #include <string>
 
 #include "../src/hinv-core/hinv_mapper.hpp"
+#include "../src/hinv-core/hinv_kmem.hpp"
 
 // A mock backend that does nothing; used to test PE parsing logic without kernel access.
 class MockBackend : public hinv::byovd::IByovdBackend {
@@ -20,6 +21,20 @@ public:
     bool IsReady() const override { return true; }
     bool ReadKernelMemory(uint64_t, void*, size_t) override { return false; }
     bool WriteKernelMemory(uint64_t, const void*, size_t) override { return false; }
+};
+
+// A mock backend that serves reads from a local buffer, standing in for a
+// manually mapped module living in "kernel memory" at a fake base.
+class FakeKernelMemoryBackend : public MockBackend {
+public:
+    uint64_t base = 0;
+    std::vector<uint8_t> mem;
+
+    bool ReadKernelMemory(uint64_t va, void* out, size_t size) override {
+        if (va < base || va - base + size > mem.size()) return false;
+        std::memcpy(out, mem.data() + (va - base), size);
+        return true;
+    }
 };
 
 namespace {
@@ -231,6 +246,42 @@ int main() {
         std::memcpy(pe.data() + RvaToOff(0x1100), "a.dll", 6);
         Check(!hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped),
               "truncated thunk rejected");
+    }
+
+    // --- Mapped-module registry ---------------------------------------------
+
+    {
+        // Emulate a module that was manually mapped into kernel memory: it is
+        // not in EnumKernelModules, but its PE headers live at its base, so
+        // ResolveKernelExport must find it through the registry.
+        FakeKernelMemoryBackend fb;
+        fb.base = 0xFFFFF80012340000ULL;
+        fb.mem.assign(0x400, 0);
+        auto& m = fb.mem;
+        m[0] = 'M';
+        m[1] = 'Z';
+        W32(m, 0x3C, E_LFANEW);
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(m.data() + E_LFANEW);
+        nt->Signature = IMAGE_NT_SIGNATURE;
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress = 0x200;
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = 0x100;
+        W32(m, 0x214, 1);      // NumberOfFunctions
+        W32(m, 0x218, 1);      // NumberOfNames
+        W32(m, 0x21C, 0x250);  // AddressOfFunctions
+        W32(m, 0x220, 0x240);  // AddressOfNames
+        W32(m, 0x224, 0x248);  // AddressOfNameOrdinals
+        W32(m, 0x240, 0x260);  // name RVA
+        W16(m, 0x248, 0);      // name ordinal
+        W32(m, 0x250, 0x2000); // function RVA
+        std::memcpy(m.data() + 0x260, "TestExport", 11);
+
+        hinv::kmem::RegisterMappedModule(L"FakeKd.DLL", fb.base, static_cast<uint32_t>(fb.mem.size()));
+        uint64_t addr = hinv::kmem::ResolveKernelExport(&fb, L"fakekd.dll", "TestExport");
+        Check(addr == fb.base + 0x2000,
+              "export resolved from registered mapped module (case-insensitive)");
+
+        addr = hinv::kmem::ResolveKernelExport(&fb, L"fakekd.dll", "NoSuchExport");
+        Check(addr == 0, "missing export in mapped module returns 0");
     }
 
     std::cout << "[TEST] " << (failures == 0 ? "All tests passed" : "Some tests failed") << "\n";

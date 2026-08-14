@@ -13,7 +13,7 @@
 
 static void PrintUsage() {
     std::cout << "Usage:\n"
-              << "  hinv.exe load <driver.sys> --byovd <vulnerable.sys>\n"
+              << "  hinv.exe load <driver.sys> [more modules...] --byovd <vulnerable.sys>\n"
               << "  hinv.exe clean <drivername> --byovd <vulnerable.sys>\n"
               << "  hinv.exe cloak <hex_address> <size>\n"
               << "  hinv.exe headless --byovd <vulnerable.sys> [--script <script.txt>]\n"
@@ -91,17 +91,36 @@ int main(int argc, char* argv[]) {
     }
 
     if (command == "load" && argc >= 3) {
-        std::wstring driverPath = ToWstring(argv[2]);
-        std::wcout << L"[*] Loading driver via hinv manual mapper: " << driverPath << L"\n";
-
-        auto result = hinv::mapper::MapDriver(backend.get(), driverPath);
-        if (!result.success) {
-            std::cerr << "[-] Manual mapping failed: " << result.error << "\n";
+        // Positional arguments are input modules; flags are skipped. Multiple
+        // modules are mapped in order within this process so later modules
+        // can resolve imports from earlier ones (mapped-module registry).
+        std::vector<std::wstring> paths;
+        for (int i = 2; i < argc; ++i) {
+            std::string arg = argv[i];
+            if ((arg == "--byovd" || arg == "--script") && i + 1 < argc) { ++i; continue; }
+            paths.push_back(ToWstring(arg));
+        }
+        if (paths.empty()) {
+            std::cerr << "[-] No input files given\n";
             return 1;
         }
+        if (paths.size() > 1) {
+            std::cout << "[*] Chain-mapping " << paths.size() << " modules in order\n";
+        }
 
-        std::cout << "[+] Driver mapped at 0x" << std::hex << result.imageBase
-                  << ", DriverEntry returned 0x" << result.driverEntryStatus << std::dec << "\n";
+        for (const auto& driverPath : paths) {
+            std::wcout << L"[*] Loading driver via hinv manual mapper: " << driverPath << L"\n";
+
+            auto result = hinv::mapper::MapDriver(backend.get(), driverPath);
+            if (!result.success) {
+                std::wcerr << L"[-] Manual mapping failed for " << driverPath << L"\n";
+                std::cerr << "    " << result.error << "\n";
+                return 1;
+            }
+
+            std::cout << "[+] Mapped at 0x" << std::hex << result.imageBase
+                      << ", DriverEntry returned 0x" << result.driverEntryStatus << std::dec << "\n";
+        }
         return 0;
     }
 

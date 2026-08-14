@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 
 // MinGW does not expose these in winternl.h by default.
 #ifndef SystemModuleInformation
@@ -179,9 +180,52 @@ uint64_t GetKernelExport(byovd::IByovdBackend* backend, uint64_t moduleBase, con
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Process-local registry of manually mapped modules
+// ---------------------------------------------------------------------------
+
+static std::mutex g_mappedModulesMutex;
+static std::vector<MappedModule> g_mappedModules;
+
+void RegisterMappedModule(const std::wstring& moduleName, uint64_t base, uint32_t size) {
+    if (moduleName.empty() || !base || !size) return;
+
+    std::wstring name = ToLower(moduleName);
+    size_t slash = name.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) name = name.substr(slash + 1);
+
+    std::lock_guard<std::mutex> lock(g_mappedModulesMutex);
+    for (auto& m : g_mappedModules) {
+        if (m.name == name) {
+            m.base = base;
+            m.size = size;
+            return;
+        }
+    }
+    g_mappedModules.push_back({ name, base, size });
+}
+
+// Returns the base of a registered mapped module, or 0. lowerName must
+// already be lowercase file stem + extension (e.g. L"hyperhv.dll").
+static uint64_t FindMappedModule(const std::wstring& lowerName) {
+    std::lock_guard<std::mutex> lock(g_mappedModulesMutex);
+    for (const auto& m : g_mappedModules) {
+        if (m.name == lowerName) return m.base;
+    }
+    return 0;
+}
+
 uint64_t ResolveKernelExport(byovd::IByovdBackend* backend, const wchar_t* moduleName, const char* exportName) {
-    auto mods = EnumKernelModules();
     std::wstring target = ToLower(moduleName);
+
+    // Manually mapped modules never appear in PsLoadedModuleList; check the
+    // process-local registry first. GetKernelExport parses the export table
+    // from kernel memory through the backend, which works because the mapped
+    // image retains its PE headers.
+    uint64_t mappedBase = FindMappedModule(target);
+    if (mappedBase) return GetKernelExport(backend, mappedBase, exportName);
+
+    auto mods = EnumKernelModules();
     for (const auto& m : mods) {
         if (ToLower(m.name) == target) {
             return GetKernelExport(backend, m.base, exportName);

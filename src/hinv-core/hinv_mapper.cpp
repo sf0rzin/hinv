@@ -358,6 +358,7 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
     result.imageBase = kernelBase;
     result.driverObject = nullObject;
     result.driverEntryStatus = status;
+    result.imageSize = imageSize;
 
     if (!restored) {
         result.success = false;
@@ -382,7 +383,17 @@ MappingResult MapDriver(byovd::IByovdBackend* backend, const std::wstring& drive
         r.error = "failed to read driver file";
         return r;
     }
-    return MapDriverBytes(backend, raw);
+    auto result = MapDriverBytes(backend, raw);
+    if (result.success) {
+        // Register the mapped module so later chain-mapped modules can resolve
+        // imports from it (it is invisible to EnumKernelModules).
+        size_t pos = driverPath.find_last_of(L"\\/");
+        std::wstring fileName = (pos == std::wstring::npos) ? driverPath : driverPath.substr(pos + 1);
+        kmem::RegisterMappedModule(fileName, result.imageBase, result.imageSize);
+        std::wcout << L"[hinv::mapper] Registered mapped module " << fileName << L" at 0x"
+                   << std::hex << result.imageBase << std::dec << L"\n";
+    }
+    return result;
 }
 
 } // namespace mapper

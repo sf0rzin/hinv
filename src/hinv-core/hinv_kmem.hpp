@@ -25,6 +25,21 @@ std::wstring NormalizeModuleName(const std::wstring& moduleName);
 // Enumerate loaded kernel modules using NtQuerySystemInformation(SystemModuleInformation).
 std::vector<KernelModule> EnumKernelModules();
 
+// Process-local registry of modules manually mapped by hinv::mapper. Such
+// modules never appear in EnumKernelModules (PsLoadedModuleList), so import
+// resolution for chain-mapped modules (e.g. HyperDbg's companion DLLs)
+// consults this registry first. The mapped image keeps its PE headers in
+// kernel memory, so export parsing works through the backend read primitive.
+struct MappedModule {
+    std::wstring name;  // lowercase file name with extension, e.g. L"hyperhv.dll"
+    uint64_t     base = 0;
+    uint32_t     size = 0;
+};
+
+// Register (or update) a manually mapped module. Name is lowercased and
+// stripped of any path. No-op for empty names or zero base/size.
+void RegisterMappedModule(const std::wstring& moduleName, uint64_t base, uint32_t size);
+
 // Resolve kernel export RVA using in-memory PE parsing via backend read.
 // Returns 0 on failure.
 uint64_t GetKernelExport(byovd::IByovdBackend* backend, uint64_t moduleBase, const char* exportName);

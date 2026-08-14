@@ -174,6 +174,23 @@ hinv::vmm::VirtualToPhysicalHyperDbg(0xFFFFF80000000000, physical);
 
 ---
 
+## Loading HyperDbg via hinv (lab/VM only)
+
+`hyperkd.sys` (HyperDbg's kernel debugger) imports not only from `ntoskrnl.exe` but also from its companion kernel-mode DLLs (`hyperhv.dll`, `hyperlog.dll`, `hypertrace.dll`, `kdserial.dll`). Because manually mapped modules are invisible to the loaded-module list, hinv keeps a **process-local registry of mapped modules**: after each successful `load`, the module's file name and base address are registered, and import resolution checks this registry before falling back to normally loaded modules. This makes chain-mapping possible in a single invocation — companions first, `hyperkd.sys` last:
+
+```cmd
+hinv.exe load drivers\hyperhv.dll drivers\hyperlog.dll drivers\hypertrace.dll drivers\kdserial.dll drivers\hyperkd.sys --byovd drivers\iqvw64e.sys
+```
+
+Prerequisites:
+
+- A **disposable VM** (this is an educational prototype; expect instability).
+- **Secure Boot off** and the **vulnerable-driver blocklist disabled** (or `iqvw64e.sys` will be blocked).
+- **VT-x / EPT enabled** in the VM firmware for HyperDbg to run.
+- The HyperDbg v0.23 binaries and `iqvw64e.sys` are **not** part of this repository; obtain them yourself. The reference `iqvw64e.sys` used during development is the public LOLDrivers sample with SHA256 `4429f32db1cc70567919d7d47b844a91cf1329a6cd116f582305f3b7b60cd60b`.
+
+---
+
 ## Learning resources this project is based on
 
 - **KDMapper** — manual mapping concepts and driver loading workflows.
@@ -204,7 +221,7 @@ This is an **experimental prototype**. The following areas are incomplete or uns
 - **MmUnloadedDrivers cleaner is DISABLED (fail-closed).** Its layout (array of pointers vs. inline array of records) is build-dependent; the previous heuristic could zero the global itself. It stays off until the layout is resolved per build/symbols. `ClearUnloadedDriverEntry` logs and returns `false`.
 - **PiDDBCacheTable cleaner is DISABLED (fail-closed).** The table is an `RTL_AVL_TABLE` on current builds, not a `LIST_ENTRY` head, and `PiDDBLock` is not exported. Safe removal requires an `RtlEnumerateGenericTableAvl`-style traversal plus a per-build lock location; until then `ClearPiDddbCache` logs and returns `false`.
 - **Driver object hijack** borrows `\Driver\Null`; a future improvement is allocating a synthetic `DRIVER_OBJECT`. If restoring the original `DriverStart`/`DriverSize` fails, the mapper reports failure honestly and deliberately leaves the mapped pool allocated rather than leaving `\Driver\Null` pointing at freed memory.
-- **Vulnerable driver compatibility** varies by build. Two backends are implemented: `dbutil_2_3.sys` (default fallback for unrecognized file names) and `iqvw64e.sys` (kdmapper-compatible, `\\.\Nal` device, single `CopyMemory` IOCTL `0x80862007`). Verify the IOCTL structures against your specific binary before use. The Intel backend supplies read/write only; kernel allocation goes through the existing `hinv_kmem` shellcode path, and kdmapper's physical-memory mapping helpers are not ported.
+- **Vulnerable driver compatibility** varies by build. Two backends are implemented: `dbutil_2_3.sys` (default fallback for unrecognized file names) and `iqvw64e.sys` (kdmapper-compatible, `\\.\Nal` device, single `CopyMemory` IOCTL `0x80862007`; reference binary is the public LOLDrivers sample, SHA256 `4429f32db1cc70567919d7d47b844a91cf1329a6cd116f582305f3b7b60cd60b`). Verify the IOCTL structures against your specific binary before use. The Intel backend supplies read/write only; kernel allocation goes through the existing `hinv_kmem` shellcode path, and kdmapper's physical-memory mapping helpers are not ported.
 - **HyperDbg integration** uses structured packets for read/edit/VA2PA, honoring HyperDbg's `DEBUGGER_OPERATION_WAS_SUCCESSFUL` (`0xFFFFFFFF`) status convention and per-value 8-byte-slot edit layout. Arbitrary script commands (`!syscall`, `!monitor`, etc.) require the full `libhyperdbg` script engine and are not supported.
 - **EPT / split-TLB cloaking** is not implemented. The relevant functions return `false` to indicate the operation did not occur.
 - **Named pipe security** uses a basic SYSTEM/Administrators ACL but does not validate client tokens.

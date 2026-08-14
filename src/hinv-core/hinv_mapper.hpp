@@ -15,6 +15,7 @@ struct MappingResult {
     uint64_t imageBase = 0;
     uint64_t driverObject = 0;
     uint32_t driverEntryStatus = 0;
+    uint32_t imageSize = 0;
     std::string error;
 };
 

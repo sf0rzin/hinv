@@ -19,6 +19,10 @@
 *.user
 *.suo
 
+# Local vulnerable-driver / HyperDbg binaries (never commit)
+/drivers/
+*.zip
+
 # System files
 Desktop.ini
 Thumbs.db
