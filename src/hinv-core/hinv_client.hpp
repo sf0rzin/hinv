@@ -3,7 +3,6 @@
 #include <string>
 #include <cstdint>
 #include <vector>
-#include <cstdio>
 
 namespace hinv {
 
@@ -64,12 +63,6 @@ public:
         return true;
     }
 
-    bool SetupSplitTLB(uint64_t address, size_t size) {
-        char buf[96];
-        snprintf(buf, sizeof(buf), "splittlb 0x%llx %zu", static_cast<unsigned long long>(address), size);
-        return SendAndCheck(buf);
-    }
-
     bool CleanKernelTraces(const std::string& driverName) {
         return SendAndCheck("clean " + driverName);
     }
@@ -78,12 +71,8 @@ public:
         return SendAndCheck("load " + driverPath);
     }
 
-    bool HyperDbgCommand(const std::string& cmd) {
-        return SendAndCheck("hypercmd " + cmd);
-    }
-
-    bool CloakMemoryRegion(uint64_t address, size_t size) {
-        return SetupSplitTLB(address, size);
+    bool Status(std::string* outResponse = nullptr) {
+        return SendCommand("status", outResponse);
     }
 
 private:

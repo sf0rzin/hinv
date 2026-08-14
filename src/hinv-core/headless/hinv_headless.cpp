@@ -1,7 +1,6 @@
 #include "hinv_headless.hpp"
 #include "../hinv_iat.hpp"
 #include "../hinv_vmm.hpp"
-#include "../hinv_ept_shadow.hpp"
 #include "../hinv_cleaner.hpp"
 #include "../hinv_mapper.hpp"
 #include "../hinv_kmem.hpp"
@@ -93,19 +92,6 @@ std::string ProcessCommand(const std::string& command) {
         if (!result.piDdbCache && !result.hashBucketList && !result.wdFilter)
             return "ERR " + std::string(result.error.begin(), result.error.end());
         return "OK";
-    }
-
-    if (cmd == "splittlb" && tokens.size() >= 3) {
-        uint64_t addr = std::strtoull(tokens[1].c_str(), nullptr, 0);
-        size_t size = std::strtoull(tokens[2].c_str(), nullptr, 0);
-        if (ept::ApplySplitTLB(addr, size)) return "OK";
-        return "ERR EPT cloak failed";
-    }
-
-    if (cmd == "hypercmd" && tokens.size() >= 2) {
-        std::string sub = command.substr(command.find_first_of(" \t") + 1);
-        if (vmm::SendVmmCommand(sub)) return "OK";
-        return "ERR HyperDbg command failed";
     }
 
     if (cmd == "status") {

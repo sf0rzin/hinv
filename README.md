@@ -28,7 +28,7 @@ Think of it as a lab toolkit: read the code, run it in a VM, break it, fix it, a
 | `hinv_kmem` | Kernel export resolution, arbitrary kernel function calls via a temporary `ntoskrnl!NtAddAtom` prologue hook (kdmapper-style), pool allocation (`ExAllocatePoolWithTag`), and page protection changes (`MmSetPageProtection`). |
 | `hinv_mapper` | Manual PE mapper: parses a `.sys` file, allocates kernel memory, copies sections, fixes relocations, resolves imports, and calls `DriverEntry`. |
 | `hinv_cleaner` | Kernel trace sanitizer: `PiDDBCacheTable` (AVL), `g_KernelHashBucketList` (ci.dll), `WdFilter` runtime driver list, and `MmUnloadedDrivers` prevention at unload time. Patterns ported from kdmapper, validated on Windows 11 26200. |
-| `hinv_vmm` / `hinv_ept_shadow` | HyperDbg device integration and EPT cloak wrappers (`!epthook2`, `!monitor`). |
+| `hinv_vmm` | HyperDbg device integration via structured IOCTL packets (read/edit memory, VA→PA, VMM init). |
 | `hinv_headless` | Named-pipe IPC server and script executor for automated workflows. |
 | `hinv_client` | Header-only C++ SDK for controlling a running headless instance. |
 
@@ -48,7 +48,7 @@ hinv-cli / hinv-client
 ┌─────────────────┐
 │  hinv_mapper    │  ← PE parse, reloc, imports, DriverEntry
 │  hinv_cleaner   │  ← MmUnloadedDrivers, PiDDBCacheTable
-│  hinv_vmm/ept   │  ← HyperDbg IOCTLs
+│  hinv_vmm       │  ← HyperDbg IOCTLs
 └────────┬────────┘
          │
          ▼
@@ -88,11 +88,9 @@ cl /std:c++20 /EHsc /DUNICODE /D_UNICODE /Fe:hinv.exe ^
   src/hinv-cli/main.cpp ^
   src/hinv-core/hinv_byovd.cpp ^
   src/hinv-core/hinv_kmem.cpp ^
-  src/hinv-core/hinv_hijack.cpp ^
   src/hinv-core/hinv_iat.cpp ^
   src/hinv-core/hinv_vmm.cpp ^
   src/hinv-core/hinv_cleaner.cpp ^
-  src/hinv-core/hinv_ept_shadow.cpp ^
   src/hinv-core/hinv_mapper.cpp ^
   src/hinv-core/headless/hinv_headless.cpp ^
   psapi.lib advapi32.lib ntdll.lib
@@ -223,7 +221,7 @@ This is an **experimental prototype**. The following areas are incomplete or uns
 - **Driver object** is a minimal synthetic `DRIVER_OBJECT` allocated in kernel pool (no `\Driver\Null` hijack): only `DriverStart`/`DriverSize` are populated, which is enough for drivers that don't touch their object deeply — same approach as kdmapper.
 - **Vulnerable driver compatibility** varies by build. Two backends are implemented: `dbutil_2_3.sys` (default fallback for unrecognized file names) and `iqvw64e.sys` (kdmapper-compatible, `\\.\Nal` device, single `CopyMemory` IOCTL `0x80862007`; reference binary is the public LOLDrivers sample, SHA256 `4429f32db1cc70567919d7d47b844a91cf1329a6cd116f582305f3b7b60cd60b`). Verify the IOCTL structures against your specific binary before use. The Intel backend supplies read/write plus the kdmapper physical-mapping helpers (`GetPhysicalAddress`/`MapIoSpace`/`UnmapIoSpace`), which power read-only memory writes for the `NtAddAtom` hook.
 - **HyperDbg integration** uses structured packets for read/edit/VA2PA, honoring HyperDbg's `DEBUGGER_OPERATION_WAS_SUCCESSFUL` (`0xFFFFFFFF`) status convention and per-value 8-byte-slot edit layout. Arbitrary script commands (`!syscall`, `!monitor`, etc.) require the full `libhyperdbg` script engine and are not supported.
-- **EPT / split-TLB cloaking** is not implemented. The relevant functions return `false` to indicate the operation did not occur.
+- **EPT cloaking and text commands** (`!epthook2`, `!monitor`, …) were removed rather than kept as stubs that always fail; they require HyperDbg's `DEBUGGER_EVENT` machinery / script engine. Only the structured packet operations (`hinv_vmm`) remain.
 - **Named pipe security** uses a basic SYSTEM/Administrators ACL but does not validate client tokens.
 - **Automated tests** cover PE parser safety (section/import/relocation bounds and malformed inputs are rejected fail-closed); kernel-mode behavior is not automatically tested.
 

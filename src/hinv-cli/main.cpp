@@ -7,7 +7,6 @@
 #include "../hinv-core/hinv_byovd.hpp"
 #include "../hinv-core/hinv_kmem.hpp"
 #include "../hinv-core/hinv_vmm.hpp"
-#include "../hinv-core/hinv_ept_shadow.hpp"
 #include "../hinv-core/hinv_cleaner.hpp"
 #include "../hinv-core/hinv_mapper.hpp"
 #include "../hinv-core/headless/hinv_headless.hpp"
@@ -16,9 +15,7 @@ static void PrintUsage() {
     std::cout << "Usage:\n"
               << "  hinv.exe load <driver.sys> [more modules...] --byovd <vulnerable.sys>\n"
               << "  hinv.exe clean <drivername> --byovd <vulnerable.sys>\n"
-              << "  hinv.exe cloak <hex_address> <size>\n"
               << "  hinv.exe headless --byovd <vulnerable.sys> [--script <script.txt>]\n"
-              << "  hinv.exe hypercmd <command>\n"
               << "  hinv.exe status\n\n";
 }
 
@@ -46,28 +43,6 @@ int main(int argc, char* argv[]) {
     if (command == "status") {
         std::cout << "[*] HyperDbg device: " << (hinv::vmm::IsVmmDeviceActive() ? "ready" : "not loaded") << "\n";
         std::cout << "[*] BYOVD backend: " << (byovdPath.empty() ? "not configured" : "configured") << "\n";
-        return 0;
-    }
-
-    if (command == "hypercmd" && argc >= 3) {
-        std::string cmd = argv[2];
-        for (int i = 3; i < argc; ++i) cmd += std::string(" ") + argv[i];
-        if (!hinv::vmm::SendVmmCommand(cmd)) {
-            std::cerr << "[-] HyperDbg command failed\n";
-            return 1;
-        }
-        std::cout << "[+] HyperDbg command sent\n";
-        return 0;
-    }
-
-    if (command == "cloak" && argc >= 4) {
-        uint64_t addr = std::strtoull(argv[2], nullptr, 0);
-        size_t size = std::strtoull(argv[3], nullptr, 0);
-        if (!hinv::ept::ApplySplitTLB(addr, size)) {
-            std::cerr << "[-] EPT cloak failed\n";
-            return 1;
-        }
-        std::cout << "[+] EPT cloak applied\n";
         return 0;
     }
 

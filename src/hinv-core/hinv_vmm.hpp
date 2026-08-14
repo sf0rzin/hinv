@@ -84,17 +84,9 @@ bool ReadKernelMemoryHyperDbg(uint64_t address, void* out, size_t size);
 bool EditKernelMemoryHyperDbg(uint64_t address, const void* in, size_t size);
 bool VirtualToPhysicalHyperDbg(uint64_t virtualAddress, uint64_t& outPhysical);
 
-// Convenience wrappers for EPT / memory cloaking.
-// These use structured HyperDbg packets, not text commands.
-bool CloakKernelMemory(uint64_t virtualAddress, size_t size);
-bool SetEptHiddenHook(uint64_t targetAddress);
-bool MonitorMemory(uint64_t virtualAddress, size_t size, bool read, bool write, bool execute);
-
-// Deprecated text-command compatibility shim.
-// HyperDbg does not accept raw text over this IOCTL; use structured packets.
-// This function is kept for CLI compatibility and will return false for
-// commands that require a full script-engine round-trip.
-bool SendVmmCommand(const std::string& command);
+// EPT cloaking and arbitrary text commands (!epthook2, !monitor, !syscall)
+// require HyperDbg's full DEBUGGER_EVENT machinery / script engine and are
+// intentionally out of scope for this project.
 
 } // namespace vmm
 } // namespace hinv

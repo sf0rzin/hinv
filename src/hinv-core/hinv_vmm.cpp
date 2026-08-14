@@ -7,6 +7,13 @@
 namespace hinv {
 namespace vmm {
 
+// Wire format: HyperDbg compiles both user-mode and kernel sides with default
+// (natural) alignment, so padding is part of the protocol and matches on both
+// ends. These asserts lock the expected layouts (audited against HyperDbg's
+// SDK RequestStructures.h field order).
+static_assert(sizeof(DebugerReadMemoryPacket) == 48, "DEBUGGER_READ_MEMORY wire size drifted");
+static_assert(sizeof(DebugerEditMemoryPacket) == 40, "DEBUGGER_EDIT_MEMORY wire size drifted");
+
 bool IsVmmDeviceActive() {
     HANDLE hDevice = OpenVmmDevice();
     if (hDevice != INVALID_HANDLE_VALUE) {
@@ -157,6 +164,9 @@ bool VirtualToPhysicalHyperDbg(uint64_t virtualAddress, uint64_t& outPhysical) {
         uint8_t  IsVirtual2Physical;
         uint32_t KernelStatus;
     };
+    // Matches HyperDbg's DEBUGGER_VA2PA_AND_PA2VA_COMMANDS under natural
+    // alignment (the protocol is compiled with default packing on both ends).
+    static_assert(sizeof(Va2PaPacket) == 32, "VA2PA wire size drifted");
 
     Va2PaPacket packet{};
     packet.VirtualAddress = virtualAddress;
@@ -177,59 +187,6 @@ bool VirtualToPhysicalHyperDbg(uint64_t virtualAddress, uint64_t& outPhysical) {
     }
     outPhysical = packet.PhysicalAddress;
     return true;
-}
-
-// ---------------------------------------------------------------------------
-// EPT / cloaking wrappers (structured packets)
-// ---------------------------------------------------------------------------
-
-bool CloakKernelMemory(uint64_t virtualAddress, size_t size) {
-    if (!IsVmmDeviceActive()) {
-        std::cerr << "[hinv::vmm] HyperDbg device not active; cannot cloak memory\n";
-        return false;
-    }
-
-    // EPT cloaking requires registering a DEBUGGER_EVENT with an action
-    // buffer. That path is not yet implemented. This function returns false
-    // so callers do not assume the operation succeeded.
-    (void)virtualAddress;
-    (void)size;
-    std::cerr << "[hinv::vmm] EPT cloaking not yet implemented; requires DEBUGGER_EVENT registration\n";
-    return false;
-}
-
-bool SetEptHiddenHook(uint64_t targetAddress) {
-    (void)targetAddress;
-    std::cerr << "[hinv::vmm] EPT hidden hook not yet implemented\n";
-    return false;
-}
-
-bool MonitorMemory(uint64_t virtualAddress, size_t size, bool read, bool write, bool execute) {
-    (void)virtualAddress;
-    (void)size;
-    (void)read;
-    (void)write;
-    (void)execute;
-    std::cerr << "[hinv::vmm] Memory monitoring not yet implemented\n";
-    return false;
-}
-
-bool SendVmmCommand(const std::string& command) {
-    // HyperDbg does not accept raw text commands over IOCTL. This shim maps
-    // a small subset of common commands to structured packets. Arbitrary
-    // script commands require libhyperdbg.
-    if (command.empty()) return false;
-
-    if (command.rfind("!syscall", 0) == 0 ||
-        command.rfind("!epthook", 0) == 0 ||
-        command.rfind("!monitor", 0) == 0) {
-        std::cerr << "[hinv::vmm] Text command '" << command
-                  << "' requires libhyperdbg script engine; structured packet not implemented\n";
-        return false;
-    }
-
-    std::cerr << "[hinv::vmm] Unsupported text command: " << command << "\n";
-    return false;
 }
 
 } // namespace vmm
