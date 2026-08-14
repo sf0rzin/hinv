@@ -12,11 +12,8 @@ namespace headless {
 constexpr const wchar_t* HINV_PIPE_NAME = L"\\\\.\\pipe\\hinv_headless";
 
 struct HeadlessConfig {
-    bool        silentMode = true;
-    bool        autoCloakDriver = true;
     std::string scriptPath = "";
-    std::string logFilePath = "hinv_events.log";
-    std::wstring byovdDriverPath = L""; // e.g. C:\\path\\to\\dbutil_2_3.sys
+    std::wstring byovdDriverPath = L""; // e.g. C:\\path\\to\\iqvw64e.sys
 };
 
 // Run the headless engine. Blocks until StopHeadlessSession is called or 'exit' received.

@@ -20,7 +20,19 @@ static void PrintUsage() {
 }
 
 static std::wstring ToWstring(const std::string& s) {
-    return std::wstring(s.begin(), s.end());
+    if (s.empty()) return {};
+    // argv arrives in the ANSI/UTF-8 codepage of the console; decode properly
+    // instead of byte-widening (which corrupts any character above 0x7F).
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    UINT cp = CP_UTF8;
+    if (len <= 0) { // not valid UTF-8: fall back to the ANSI codepage
+        cp = CP_ACP;
+        len = MultiByteToWideChar(cp, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+        if (len <= 0) return std::wstring(s.begin(), s.end());
+    }
+    std::wstring out(len, L'\0');
+    MultiByteToWideChar(cp, 0, s.data(), static_cast<int>(s.size()), out.data(), len);
+    return out;
 }
 
 int main(int argc, char* argv[]) {
@@ -50,8 +62,7 @@ int main(int argc, char* argv[]) {
         hinv::headless::HeadlessConfig config;
         config.byovdDriverPath = byovdPath;
         config.scriptPath = scriptPath;
-        hinv::headless::RunHeadlessSession(config);
-        return 0;
+        return hinv::headless::RunHeadlessSession(config) ? 0 : 1;
     }
 
     // Commands below require an active BYOVD backend.

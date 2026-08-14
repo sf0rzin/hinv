@@ -472,9 +472,7 @@ static DriverProfile DbUtilProfile(const std::wstring& driverFileName) {
         L"\\\\.\\DBUtil_2_3",
         driverFileName,
         0x9B0C1EC4,
-        0x9B0C1EC8,
-        0,
-        0
+        0x9B0C1EC8
     };
 }
 
@@ -482,8 +480,6 @@ static const wchar_t* BackendName(BackendType type) {
     switch (type) {
         case BackendType::DbUtil:   return L"Dell dbutil_2_3.sys";
         case BackendType::Intel:    return L"Intel iqvw64e.sys (kdmapper-compatible)";
-        case BackendType::GDrv:     return L"Gigabyte gdrv.sys";
-        case BackendType::RTCore64: return L"MSI RTCore64.sys";
         default:                    return L"unknown";
     }
 }
@@ -502,41 +498,14 @@ DriverProfile DetectProfile(const std::wstring& driverFileName) {
             L"\\\\.\\Nal", // kdmapper intel_driver.cpp: device is always \\.\Nal
             driverFileName,
             IOCTL_IQVW64E_COPY_MEMORY,
-            IOCTL_IQVW64E_COPY_MEMORY,
-            0,
-            0
-        };
-    }
-
-    if (lower.find(L"gdrv") != std::wstring::npos) {
-        return {
-            BackendType::GDrv,
-            L"hinv_byovd_gdrv",
-            L"\\\\.\\GDrvDriver",
-            driverFileName,
-            0x222010, // virtual read (research-backed placeholder)
-            0x22200C, // virtual write
-            0x222004,
-            0x222008
-        };
-    }
-
-    if (lower.find(L"rtcore") != std::wstring::npos) {
-        return {
-            BackendType::RTCore64,
-            L"hinv_byovd_rtcore",
-            L"\\\\.\\RTCore64",
-            driverFileName,
-            0x80002048,
-            0x8000204C,
-            0x80002040,
-            0x80002044
+            IOCTL_IQVW64E_COPY_MEMORY
         };
     }
 
     // Default fallback: assume the dbutil layout.
     std::wcout << L"[hinv::byovd] Unrecognized driver name '" << driverFileName
-               << L"'; falling back to dbutil backend\n";
+               << L"'; falling back to dbutil backend (note: kernel function calls, "
+                  L"mapping and cleaning require the Intel iqvw64e backend)\n";
     return DbUtilProfile(driverFileName);
 }
 

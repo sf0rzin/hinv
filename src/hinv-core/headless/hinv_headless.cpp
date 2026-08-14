@@ -150,32 +150,50 @@ static void HandleClient(HANDLE hPipe) {
     char buffer[BUF_SIZE]{};
 
     while (g_running) {
-        OVERLAPPED ovRead{};
-        ovRead.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!ovRead.hEvent) break;
+        // Read one complete message. In message mode an oversized message
+        // arrives as ERROR_MORE_DATA chunks — accumulate instead of dropping
+        // the connection (the previous behavior closed the pipe on any client
+        // sending more than 4095 bytes).
+        constexpr size_t MAX_MESSAGE = 65536;
+        std::string request;
+        bool fatal = false;
+        for (;;) {
+            OVERLAPPED ovRead{};
+            ovRead.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!ovRead.hEvent) { fatal = true; break; }
 
-        DWORD bytesRead = 0;
-        BOOL ok = ReadFile(hPipe, buffer, BUF_SIZE - 1, &bytesRead, &ovRead);
-        if (!ok && GetLastError() == ERROR_IO_PENDING) {
-            HANDLE handles[2] = { g_stopEvent, ovRead.hEvent };
-            DWORD wait = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
-            if (wait != WAIT_OBJECT_0 + 1) {
-                // Stop requested or wait failed: cancel and WAIT for the I/O to
-                // complete. The OVERLAPPED must stay valid until the operation
-                // finishes, so it cannot go out of scope while still pending.
-                CancelIo(hPipe);
-                GetOverlappedResult(hPipe, &ovRead, &bytesRead, TRUE);
-                CloseHandle(ovRead.hEvent);
-                break;
+            DWORD bytesRead = 0;
+            BOOL ok = ReadFile(hPipe, buffer, BUF_SIZE - 1, &bytesRead, &ovRead);
+            DWORD err = GetLastError();
+            if (!ok && err == ERROR_IO_PENDING) {
+                HANDLE handles[2] = { g_stopEvent, ovRead.hEvent };
+                DWORD wait = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+                if (wait != WAIT_OBJECT_0 + 1) {
+                    // Stop requested or wait failed: cancel and WAIT for the I/O to
+                    // complete. The OVERLAPPED must stay valid until the operation
+                    // finishes, so it cannot go out of scope while still pending.
+                    CancelIo(hPipe);
+                    GetOverlappedResult(hPipe, &ovRead, &bytesRead, TRUE);
+                    CloseHandle(ovRead.hEvent);
+                    fatal = true;
+                    break;
+                }
+                ok = GetOverlappedResult(hPipe, &ovRead, &bytesRead, TRUE);
+                err = GetLastError();
             }
-            ok = GetOverlappedResult(hPipe, &ovRead, &bytesRead, TRUE);
+            CloseHandle(ovRead.hEvent);
+
+            if (!ok && err == ERROR_MORE_DATA && bytesRead > 0) {
+                request.append(buffer, bytesRead);
+                if (request.size() > MAX_MESSAGE) { fatal = true; break; }
+                continue;
+            }
+            if (!ok || bytesRead == 0) { fatal = true; break; }
+            request.append(buffer, bytesRead);
+            break;
         }
-        CloseHandle(ovRead.hEvent);
+        if (fatal || request.empty()) break;
 
-        if (!ok || bytesRead == 0) break;
-        buffer[bytesRead] = '\0';
-
-        std::string request(buffer);
         while (!request.empty() && (request.back() == '\n' || request.back() == '\r'))
             request.pop_back();
 
@@ -186,7 +204,7 @@ static void HandleClient(HANDLE hPipe) {
         if (!ovWrite.hEvent) break;
 
         DWORD written = 0;
-        ok = WriteFile(hPipe, response.c_str(), static_cast<DWORD>(response.size()), &written, &ovWrite);
+        BOOL ok = WriteFile(hPipe, response.c_str(), static_cast<DWORD>(response.size()), &written, &ovWrite);
         if (!ok && GetLastError() == ERROR_IO_PENDING) {
             ok = GetOverlappedResult(hPipe, &ovWrite, &written, TRUE);
         }

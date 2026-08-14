@@ -11,22 +11,17 @@ namespace byovd {
 // Supported vulnerable-driver backends. Add more here as you integrate them.
 enum class BackendType {
     Unknown = 0,
-    GDrv,       // Gigabyte GDRV (gdrv.sys)  - arbitrary kernel virt read/write
-    RTCore64,   // MSI Afterburner RTCore64  - physical map/read/write
-    WinIo64,    // WinIo / RWEverything style
     DbUtil,     // Dell dbutil_2_3.sys       - arbitrary kernel virt read/write
-    Intel,      // Intel iqvw64e.sys         - kernel<->user CopyMemory (kdmapper-style)
+    Intel,      // Intel iqvw64e.sys         - CopyMemory + physical map (kdmapper-style)
 };
 
 struct DriverProfile {
     BackendType type;
     std::wstring serviceName;
-    std::wstring devicePath;          // e.g. L"\\\\.\\GDrvDriver"
-    std::wstring driverFileName;      // e.g. L"gdrv.sys"
+    std::wstring devicePath;          // e.g. L"\\\\.\\Nal"
+    std::wstring driverFileName;      // e.g. L"iqvw64e.sys"
     DWORD        readIoc;
     DWORD        writeIoc;
-    DWORD        mapIoc;
-    DWORD        unmapIoc;
 };
 
 // Generic kernel read/write primitive. Implemented per backend.
