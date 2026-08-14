@@ -26,21 +26,28 @@ static bool SetPrivilege(HANDLE hToken, LPCWSTR privilegeName) {
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Luid = luid;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    return AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr) == TRUE;
+    if (AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr) != TRUE)
+        return false;
+    // AdjustTokenPrivileges returns TRUE even when the privilege was not
+    // assigned; ERROR_NOT_ALL_ASSIGNED means the token does not hold it.
+    return GetLastError() != ERROR_NOT_ALL_ASSIGNED;
 }
 
 static bool EnableRequiredPrivileges() {
     HANDLE hToken = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
         return false;
-    SetPrivilege(hToken, SE_LOAD_DRIVER_NAME);
-    SetPrivilege(hToken, SE_DEBUG_NAME);
+    bool ok = SetPrivilege(hToken, SE_LOAD_DRIVER_NAME) &&
+              SetPrivilege(hToken, SE_DEBUG_NAME);
     CloseHandle(hToken);
-    return true;
+    return ok;
 }
 
 bool InstallDriverService(const std::wstring& serviceName, const std::wstring& driverPath) {
-    EnableRequiredPrivileges();
+    if (!EnableRequiredPrivileges()) {
+        std::wcerr << L"[hinv::byovd] Missing required privileges (SeLoadDriverPrivilege/SeDebugPrivilege)\n";
+        return false;
+    }
     SC_HANDLE hScm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
     if (!hScm) return false;
 

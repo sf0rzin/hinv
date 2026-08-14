@@ -137,6 +137,59 @@ int main() {
     result = hinv::mapper::MapDriverBytes(&backend, badPe);
     Check(!result.success && result.error == "invalid DOS signature", "bad DOS signature rejected");
 
+    // Negative e_lfanew must not wrap past validation: e_lfanew is a signed
+    // LONG, and promoting it to size_t used to bypass both bounds checks.
+    badPe = MakePe(0x2000, 0x400);
+    W32(badPe, 0x3C, 0xFFFFFF80); // e_lfanew = -128 as signed LONG
+    result = hinv::mapper::MapDriverBytes(&backend, badPe);
+    Check(!result.success && result.error == "invalid e_lfanew", "negative e_lfanew rejected");
+
+    // --- BuildMappedImage: signed e_lfanew, strict sections, reloc types ----
+
+    {
+        auto pe = MakePe(0x2000, 0x400);
+        W32(pe, 0x3C, 0xFFFFFF80); // negative e_lfanew
+        Check(!hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped),
+              "negative e_lfanew rejected by BuildMappedImage");
+    }
+
+    {
+        auto pe = MakePe(0x2000, 0x400);
+        auto* sec = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+            pe.data() + E_LFANEW + 4 + sizeof(IMAGE_FILE_HEADER) + sizeof(IMAGE_OPTIONAL_HEADER64));
+        sec->VirtualAddress = 0x2000; // == SizeOfImage
+        Check(!hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped),
+              "section RVA beyond image rejected");
+    }
+
+    {
+        auto pe = MakePe(0x2000, 0x400);
+        auto* sec = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+            pe.data() + E_LFANEW + 4 + sizeof(IMAGE_FILE_HEADER) + sizeof(IMAGE_OPTIONAL_HEADER64));
+        sec->PointerToRawData = 0x800; // beyond end of file
+        Check(!hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped),
+              "section raw pointer beyond EOF rejected");
+    }
+
+    {
+        auto pe = MakePe(0x2000, 0x400);
+        auto* sec = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+            pe.data() + E_LFANEW + 4 + sizeof(IMAGE_FILE_HEADER) + sizeof(IMAGE_OPTIONAL_HEADER64));
+        sec->SizeOfRawData = 0x800; // raw data overruns the file
+        Check(!hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped),
+              "section raw data overrun rejected");
+    }
+
+    {
+        auto pe = MakePe(0x2000, 0x400);
+        SetDataDirectory(pe, IMAGE_DIRECTORY_ENTRY_BASERELOC, 0x1080, 0x0C);
+        W32(pe, RvaToOff(0x1080), 0x1000);
+        W32(pe, RvaToOff(0x1084), 0x0C);
+        W16(pe, RvaToOff(0x1088), 0x7000); // relocation type 7: unknown on AMD64
+        Check(!hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped),
+              "unknown relocation type rejected");
+    }
+
     // --- BuildMappedImage: sections -----------------------------------------
 
     {

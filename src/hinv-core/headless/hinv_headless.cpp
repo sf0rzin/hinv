@@ -15,6 +15,7 @@
 #include <atomic>
 #include <vector>
 #include <cstring>
+#include <cstdlib>
 #include <chrono>
 #include <sddl.h>
 #include <aclapi.h>
@@ -26,6 +27,8 @@ static std::unique_ptr<byovd::IByovdBackend> g_backend;
 static std::mutex g_backendMutex;
 static std::atomic<bool> g_running{ false };
 static HANDLE g_stopEvent = nullptr;
+static std::mutex g_clientThreadsMutex;
+static std::vector<std::thread> g_clientThreads;
 
 byovd::IByovdBackend* GetActiveBackend() {
     std::lock_guard<std::mutex> lock(g_backendMutex);
@@ -86,8 +89,13 @@ std::string ProcessCommand(const std::string& command) {
     }
 
     if (cmd == "status") {
+        std::string backendState;
+        {
+            std::lock_guard<std::mutex> lock(g_backendMutex);
+            backendState = g_backend ? "ready" : "none";
+        }
         std::ostringstream ss;
-        ss << "OK backend=" << (g_backend ? "ready" : "none")
+        ss << "OK backend=" << backendState
            << " hyperdbg=" << (vmm::IsVmmDeviceActive() ? "ready" : "none");
         return ss.str();
     }
@@ -197,6 +205,7 @@ static void StartIpcControlServer() {
             L"D:P(A;;GA;;;SY)(A;;GA;;;BA)", SDDL_REVISION_1, &sd, nullptr)) {
         std::cerr << "[hinv::headless] Failed to build security descriptor\n";
         CloseHandle(g_stopEvent);
+        g_stopEvent = nullptr; // ownership stays consistent: RunHeadlessSession closes it otherwise
         return;
     }
 
@@ -256,15 +265,17 @@ static void StartIpcControlServer() {
         CloseHandle(ov.hEvent);
 
         if (connected && g_running) {
-            std::thread clientThread(HandleClient, hPipe);
-            clientThread.detach();
+            // Track client threads so the session can join them on shutdown;
+            // a detached thread could outlive the BYOVD backend it uses.
+            std::lock_guard<std::mutex> lock(g_clientThreadsMutex);
+            g_clientThreads.emplace_back(HandleClient, hPipe);
         } else {
             CloseHandle(hPipe);
         }
     }
     LocalFree(sd);
-    CloseHandle(g_stopEvent);
-    g_stopEvent = nullptr;
+    // g_stopEvent is closed by RunHeadlessSession only after every client
+    // thread has been joined, so a handler never waits on a closed handle.
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +302,21 @@ bool RunHeadlessSession(const HeadlessConfig& config) {
 
     std::thread ipcThread(StartIpcControlServer);
     ipcThread.join(); // blocks until exit
+
+    // Join every client handler before tearing down the backend: a thread
+    // could still be inside ProcessCommand using g_backend.
+    {
+        std::lock_guard<std::mutex> lock(g_clientThreadsMutex);
+        for (auto& t : g_clientThreads) {
+            if (t.joinable()) t.join();
+        }
+        g_clientThreads.clear();
+    }
+
+    if (g_stopEvent) {
+        CloseHandle(g_stopEvent);
+        g_stopEvent = nullptr;
+    }
 
     {
         std::lock_guard<std::mutex> lock(g_backendMutex);

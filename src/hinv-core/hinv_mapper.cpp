@@ -14,12 +14,6 @@ static std::wstring ToLower(std::wstring s) {
     return s;
 }
 
-static std::wstring ToWstring(const std::string& s) {
-    std::wstring out(s.size(), L' ');
-    std::copy(s.begin(), s.end(), out.begin());
-    return out;
-}
-
 static bool ReadFileBytes(const std::wstring& path, std::vector<uint8_t>& out) {
     std::ifstream file(path.c_str(), std::ios::binary | std::ios::ate);
     if (!file.is_open()) return false;
@@ -60,9 +54,12 @@ bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<uint8_t>&
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(raw.data());
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
 
-    // Validate e_lfanew before dereferencing the NT header.
-    if (dos->e_lfanew < sizeof(IMAGE_DOS_HEADER) ||
-        dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > raw.size())
+    // Validate e_lfanew before dereferencing the NT header. e_lfanew is a
+    // signed LONG: compare in the signed 64-bit domain so a negative value
+    // cannot wrap past the bounds checks into a read before the buffer.
+    const int64_t ntHeaderOffset = static_cast<int64_t>(dos->e_lfanew);
+    if (ntHeaderOffset < static_cast<int64_t>(sizeof(IMAGE_DOS_HEADER)) ||
+        ntHeaderOffset + static_cast<int64_t>(sizeof(IMAGE_NT_HEADERS64)) > static_cast<int64_t>(raw.size()))
         return false;
 
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(raw.data() + dos->e_lfanew);
@@ -89,14 +86,14 @@ bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<uint8_t>&
 
     for (uint16_t i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
         if (sec[i].PointerToRawData == 0 || sec[i].SizeOfRawData == 0) continue;
-        if (sec[i].VirtualAddress >= imageSize) continue;
 
+        // Fail-closed: a section claiming data outside the file or the image
+        // is malformed — reject it instead of skipping or truncating.
+        if (sec[i].VirtualAddress >= imageSize) return false;
+        if (sec[i].PointerToRawData >= raw.size()) return false;
         size_t rawSize = sec[i].SizeOfRawData;
-        if (sec[i].PointerToRawData >= raw.size()) continue;
-        if (sec[i].PointerToRawData + rawSize > raw.size())
-            rawSize = raw.size() - sec[i].PointerToRawData;
-        if (sec[i].VirtualAddress + rawSize > imageSize)
-            rawSize = imageSize - sec[i].VirtualAddress;
+        if (static_cast<uint64_t>(sec[i].PointerToRawData) + rawSize > raw.size()) return false;
+        if (static_cast<uint64_t>(sec[i].VirtualAddress) + rawSize > imageSize) return false;
 
         std::memcpy(mapped.data() + sec[i].VirtualAddress,
                     raw.data() + sec[i].PointerToRawData,
@@ -147,7 +144,7 @@ bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<uint8_t>&
                         *reinterpret_cast<uint16_t*>(addr) += static_cast<uint16_t>(delta);
                         break;
                     default:
-                        break; // unknown type: value untouched
+                        return false; // unknown relocation type: reject fail-closed
                 }
             }
             relocOffset += blockSize;
@@ -233,8 +230,11 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
         result.error = "invalid DOS signature";
         return result;
     }
-    if (dos->e_lfanew < sizeof(IMAGE_DOS_HEADER) ||
-        dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > rawImage.size()) {
+    // e_lfanew is a signed LONG; validate in the signed 64-bit domain (as in
+    // BuildMappedImage) so a negative value cannot wrap past the checks.
+    const int64_t ntHeaderOffset = static_cast<int64_t>(dos->e_lfanew);
+    if (ntHeaderOffset < static_cast<int64_t>(sizeof(IMAGE_DOS_HEADER)) ||
+        ntHeaderOffset + static_cast<int64_t>(sizeof(IMAGE_NT_HEADERS64)) > static_cast<int64_t>(rawImage.size())) {
         result.error = "invalid e_lfanew";
         return result;
     }

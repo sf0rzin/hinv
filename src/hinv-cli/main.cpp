@@ -2,6 +2,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <cstdlib>
 
 #include "../hinv-core/hinv_byovd.hpp"
 #include "../hinv-core/hinv_hijack.hpp"
