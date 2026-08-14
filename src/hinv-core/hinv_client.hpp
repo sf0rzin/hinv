@@ -66,19 +66,19 @@ public:
     bool SetupSplitTLB(uint64_t address, size_t size) {
         char buf[96];
         snprintf(buf, sizeof(buf), "splittlb 0x%llx %zu", static_cast<unsigned long long>(address), size);
-        return SendCommand(buf);
+        return SendAndCheck(buf);
     }
 
     bool CleanKernelTraces(const std::string& driverName) {
-        return SendCommand("clean " + driverName);
+        return SendAndCheck("clean " + driverName);
     }
 
     bool LoadDriver(const std::string& driverPath) {
-        return SendCommand("load " + driverPath);
+        return SendAndCheck("load " + driverPath);
     }
 
     bool HyperDbgCommand(const std::string& cmd) {
-        return SendCommand("hypercmd " + cmd);
+        return SendAndCheck("hypercmd " + cmd);
     }
 
     bool CloakMemoryRegion(uint64_t address, size_t size) {
@@ -86,6 +86,13 @@ public:
     }
 
 private:
+    // Send a command, consume its response, and treat responses starting with
+    // "ERR" as failure. Keeps the pipe free of stale responses.
+    bool SendAndCheck(const std::string& command) {
+        std::string response;
+        if (!SendCommand(command, &response)) return false;
+        return response.rfind("ERR", 0) != 0;
+    }
     std::wstring m_pipeName;
     HANDLE       m_hPipe;
 };

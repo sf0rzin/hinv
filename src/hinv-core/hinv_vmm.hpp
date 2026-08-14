@@ -9,6 +9,10 @@ namespace vmm {
 
 constexpr const wchar_t* HYPERDBG_DEVICE_NAME = L"\\\\.\\HyperDbgDebuggerDevice";
 
+// HyperDbg reports a successful kernel-side operation with this status value
+// (NOT zero). See DEBUGGER_OPERATION_WAS_SUCCESSFUL in HyperDbg's SDK.
+constexpr uint32_t DEBUGGER_OPERATION_WAS_SUCCESSFUL = 0xFFFFFFFF;
+
 // HyperDbg SDK IOCTL codes (computed from HyperDbg include/SDK/headers/Ioctls.h)
 // IOCTL_START_CODE = 0x800, IOCTL_VMM_IOCTL = 0x800 + 0x200 = 0xA00
 // CTL_CODE(0x22, function, METHOD_BUFFERED, FILE_ANY_ACCESS) = 0x220000 | (function << 2)

@@ -94,12 +94,16 @@ bool ReadKernelMemoryHyperDbg(uint64_t address, void* out, size_t size) {
         return false;
     }
 
-    if (hdr->KernelStatus != 0) {
+    if (hdr->KernelStatus != DEBUGGER_OPERATION_WAS_SUCCESSFUL) {
         std::cerr << "[hinv::vmm] ReadMemory kernel status: 0x" << std::hex << hdr->KernelStatus << std::dec << "\n";
         return false;
     }
-    if (hdr->ReturnLength < size) {
-        std::cerr << "[hinv::vmm] ReadMemory returned " << hdr->ReturnLength << " bytes, expected " << size << "\n";
+    // Payload size is derived from bytes actually returned, like the official
+    // library does (bytesReturned - header size); ReturnLength is advisory.
+    size_t payloadSize = (bytes >= sizeof(DebugerReadMemoryPacket))
+                         ? (bytes - sizeof(DebugerReadMemoryPacket)) : 0;
+    if (payloadSize < size) {
+        std::cerr << "[hinv::vmm] ReadMemory returned " << payloadSize << " bytes, expected " << size << "\n";
         return false;
     }
 
@@ -110,27 +114,33 @@ bool ReadKernelMemoryHyperDbg(uint64_t address, void* out, size_t size) {
 bool EditKernelMemoryHyperDbg(uint64_t address, const void* in, size_t size) {
     if (!in || size == 0 || size > 0x10000) return false;
 
-    uint32_t byteSizeCode;
-    size_t paddedSize = size;
-    if (size == 1) { byteSizeCode = 0; paddedSize = 1; }
-    else if (size == 4) { byteSizeCode = 1; paddedSize = 4; }
-    else if (size == 8) { byteSizeCode = 2; paddedSize = 8; }
-    else {
-        byteSizeCode = 2;
-        paddedSize = ((size + 7) / 8) * 8; // pad to qword boundary
-    }
+    // Official HyperDbg semantics: CountOf64Chunks is the number of VALUES,
+    // each stored in its own 8-byte slot; the kernel writes ByteSize bytes
+    // from each slot. Use a single dword/qword slot when the size matches,
+    // otherwise one byte per slot so padding can never overwrite neighbors.
+    uint32_t byteSizeCode; // 0 = byte, 1 = dword, 2 = qword
+    uint32_t count;
+    uint32_t bytesPerSlot;
+    if (size == 4)      { byteSizeCode = 1; count = 1; bytesPerSlot = 4; }
+    else if (size == 8) { byteSizeCode = 2; count = 1; bytesPerSlot = 8; }
+    else                { byteSizeCode = 0; count = static_cast<uint32_t>(size); bytesPerSlot = 1; }
 
-    std::vector<uint8_t> packet(sizeof(DebugerEditMemoryPacket) + paddedSize, 0);
+    size_t payloadSize = static_cast<size_t>(count) * sizeof(uint64_t);
+    std::vector<uint8_t> packet(sizeof(DebugerEditMemoryPacket) + payloadSize, 0);
     auto* hdr = reinterpret_cast<DebugerEditMemoryPacket*>(packet.data());
     hdr->Result = 0;
     hdr->Address = address;
     hdr->ProcessId = 0;
     hdr->MemoryType = 0; // virtual
     hdr->ByteSize = byteSizeCode;
-    hdr->CountOf64Chunks = static_cast<uint32_t>(paddedSize / 8);
-    hdr->FinalStructureSize = static_cast<uint32_t>(sizeof(DebugerEditMemoryPacket) + paddedSize);
+    hdr->CountOf64Chunks = count;
+    hdr->FinalStructureSize = static_cast<uint32_t>(sizeof(DebugerEditMemoryPacket) + payloadSize);
 
-    std::memcpy(packet.data() + sizeof(DebugerEditMemoryPacket), in, size);
+    const auto* src = static_cast<const uint8_t*>(in);
+    for (uint32_t i = 0; i < count; ++i) {
+        std::memcpy(packet.data() + sizeof(DebugerEditMemoryPacket) + i * sizeof(uint64_t),
+                    src + static_cast<size_t>(i) * bytesPerSlot, bytesPerSlot);
+    }
 
     DWORD bytes = 0;
     if (!SendVmmIoctl(IOCTL_HYPERDBG_EDIT_MEMORY, packet.data(), static_cast<DWORD>(packet.size()),
@@ -138,7 +148,7 @@ bool EditKernelMemoryHyperDbg(uint64_t address, const void* in, size_t size) {
         return false;
     }
 
-    if (hdr->Result != 0) {
+    if (hdr->Result != DEBUGGER_OPERATION_WAS_SUCCESSFUL) {
         std::cerr << "[hinv::vmm] EditMemory result: 0x" << std::hex << hdr->Result << std::dec << "\n";
         return false;
     }
@@ -167,7 +177,7 @@ bool VirtualToPhysicalHyperDbg(uint64_t virtualAddress, uint64_t& outPhysical) {
         return false;
     }
 
-    if (packet.KernelStatus != 0) {
+    if (packet.KernelStatus != DEBUGGER_OPERATION_WAS_SUCCESSFUL) {
         std::cerr << "[hinv::vmm] VA2PA kernel status: 0x" << std::hex << packet.KernelStatus << std::dec << "\n";
         return false;
     }

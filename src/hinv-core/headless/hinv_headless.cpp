@@ -145,12 +145,12 @@ static void HandleClient(HANDLE hPipe) {
         if (!ok && GetLastError() == ERROR_IO_PENDING) {
             HANDLE handles[2] = { g_stopEvent, ovRead.hEvent };
             DWORD wait = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
-            if (wait == WAIT_OBJECT_0) {
-                CancelIo(hPipe);
-                CloseHandle(ovRead.hEvent);
-                break;
-            }
             if (wait != WAIT_OBJECT_0 + 1) {
+                // Stop requested or wait failed: cancel and WAIT for the I/O to
+                // complete. The OVERLAPPED must stay valid until the operation
+                // finishes, so it cannot go out of scope while still pending.
+                CancelIo(hPipe);
+                GetOverlappedResult(hPipe, &ovRead, &bytesRead, TRUE);
                 CloseHandle(ovRead.hEvent);
                 break;
             }
@@ -232,13 +232,24 @@ static void StartIpcControlServer() {
         if (!connected && err == ERROR_IO_PENDING) {
             HANDLE handles[2] = { g_stopEvent, ov.hEvent };
             DWORD wait = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
-            if (wait == WAIT_OBJECT_0) {
+            if (wait == WAIT_OBJECT_0 + 1) {
+                // The connect operation signaled; confirm it actually
+                // succeeded instead of assuming a connection.
+                DWORD transferred = 0;
+                connected = GetOverlappedResult(hPipe, &ov, &transferred, FALSE);
+            } else {
+                // Stop requested or wait failed: cancel and wait for the
+                // pending connect to complete before ov goes out of scope.
                 CancelIo(hPipe);
-                CloseHandle(ov.hEvent);
-                CloseHandle(hPipe);
-                break;
+                DWORD ignored = 0;
+                GetOverlappedResult(hPipe, &ov, &ignored, TRUE);
+                connected = FALSE;
+                if (wait == WAIT_OBJECT_0) {
+                    CloseHandle(ov.hEvent);
+                    CloseHandle(hPipe);
+                    break;
+                }
             }
-            connected = TRUE;
         } else if (!connected && err == ERROR_PIPE_CONNECTED) {
             connected = TRUE;
         }

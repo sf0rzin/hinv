@@ -27,7 +27,7 @@ Think of it as a lab toolkit: read the code, run it in a VM, break it, fix it, a
 | `hinv_byovd` | Loads a vulnerable signed driver as a service and exposes kernel read/write primitives. Currently supports `dbutil_2_3.sys`; additional backends can be added. |
 | `hinv_kmem` | Kernel export resolution, SMAP-safe shellcode execution via `HalDispatchTable`, memory allocation (`ExAllocatePool2`), and driver object lookup (`ObReferenceObjectByName`). |
 | `hinv_mapper` | Manual PE mapper: parses a `.sys` file, allocates kernel memory, copies sections, fixes relocations, resolves imports, and calls `DriverEntry`. |
-| `hinv_cleaner` | Kernel trace sanitizer for `MmUnloadedDrivers` and `PiDDBCacheTable`, with lock acquisition (`PiDDBLock`). |
+| `hinv_cleaner` | Kernel trace sanitizer for `MmUnloadedDrivers` and `PiDDBCacheTable`. Both paths are currently **fail-closed (disabled)** pending per-build layout verification — see Known limitations. |
 | `hinv_vmm` / `hinv_ept_shadow` | HyperDbg device integration and EPT cloak wrappers (`!epthook2`, `!monitor`). |
 | `hinv_headless` | Named-pipe IPC server and script executor for automated workflows. |
 | `hinv_client` | Header-only C++ SDK for controlling a running headless instance. |
@@ -195,13 +195,14 @@ Do not use this software on systems you do not own or without explicit written p
 This is an **experimental prototype**. The following areas are incomplete or unstable:
 
 - **PTE self-reference index** is hardcoded to `0x1ED`. Some Windows builds randomize this value.
-- **PiDDBCacheTable traversal** only supports the classic `LIST_ENTRY` layout (Windows 7–10 21H2). Newer builds using `RTL_RB_TREE` require a dedicated traversal that is not yet implemented.
-- **Driver object hijack** borrows `\Driver\Null`; a future improvement is allocating a synthetic `DRIVER_OBJECT`.
+- **MmUnloadedDrivers cleaner is DISABLED (fail-closed).** Its layout (array of pointers vs. inline array of records) is build-dependent; the previous heuristic could zero the global itself. It stays off until the layout is resolved per build/symbols. `ClearUnloadedDriverEntry` logs and returns `false`.
+- **PiDDBCacheTable cleaner is DISABLED (fail-closed).** The table is an `RTL_AVL_TABLE` on current builds, not a `LIST_ENTRY` head, and `PiDDBLock` is not exported. Safe removal requires an `RtlEnumerateGenericTableAvl`-style traversal plus a per-build lock location; until then `ClearPiDddbCache` logs and returns `false`.
+- **Driver object hijack** borrows `\Driver\Null`; a future improvement is allocating a synthetic `DRIVER_OBJECT`. If restoring the original `DriverStart`/`DriverSize` fails, the mapper reports failure honestly and deliberately leaves the mapped pool allocated rather than leaving `\Driver\Null` pointing at freed memory.
 - **Vulnerable driver compatibility** varies by build. Verify the `dbutil_2_3.sys` IOCTL structure against your specific binary before use.
-- **HyperDbg integration** uses structured packets for read/edit/VA2PA, but arbitrary script commands (`!syscall`, `!monitor`, etc.) require the full `libhyperdbg` script engine and are not yet supported.
+- **HyperDbg integration** uses structured packets for read/edit/VA2PA, honoring HyperDbg's `DEBUGGER_OPERATION_WAS_SUCCESSFUL` (`0xFFFFFFFF`) status convention and per-value 8-byte-slot edit layout. Arbitrary script commands (`!syscall`, `!monitor`, etc.) require the full `libhyperdbg` script engine and are not supported.
 - **EPT / split-TLB cloaking** is not implemented. The relevant functions return `false` to indicate the operation did not occur.
 - **Named pipe security** uses a basic SYSTEM/Administrators ACL but does not validate client tokens.
-- **Automated tests** cover PE parser safety; kernel-mode behavior is not automatically tested.
+- **Automated tests** cover PE parser safety (section/import/relocation bounds and malformed inputs are rejected fail-closed); kernel-mode behavior is not automatically tested.
 
 ---
 

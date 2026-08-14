@@ -280,7 +280,14 @@ bool AcquireKernelLock(byovd::IByovdBackend* backend, uint64_t lockAddress, int 
     if (!ExecuteKernelShellcodeSmapSafe(backend, sc, buildCtx, &result)) {
         return false;
     }
-    return result != 0; // BOOLEAN return from ExAcquireResourceExclusiveLite
+    if (type == 0) {
+        // ExAcquireResourceExclusiveLite returns BOOLEAN in RAX.
+        return result != 0;
+    }
+    // KeAcquireGuardedMutex returns void, so RAX is meaningless. If the
+    // shellcode executed to completion, the acquire call itself was made;
+    // guarded mutex acquire cannot fail.
+    return true;
 }
 
 bool ReleaseKernelLock(byovd::IByovdBackend* backend, uint64_t lockAddress, int type) {

@@ -25,5 +25,11 @@ MappingResult MapDriver(byovd::IByovdBackend* backend, const std::wstring& drive
 // Same, but accepts the raw file bytes already loaded in memory.
 MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<uint8_t>& rawImage);
 
+// Internal: build the mapped image (sections, relocations, imports) from raw
+// PE bytes for the target kernel base. Fail-closed: returns false on any
+// malformed structure. Exposed for unit tests.
+bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<uint8_t>& raw,
+                      uint64_t imageBase, std::vector<uint8_t>& mapped);
+
 } // namespace mapper
 } // namespace hinv
