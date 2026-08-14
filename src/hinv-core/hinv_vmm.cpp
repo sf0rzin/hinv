@@ -7,12 +7,6 @@
 namespace hinv {
 namespace vmm {
 
-static std::string ToHex(uint64_t value) {
-    std::ostringstream ss;
-    ss << "0x" << std::hex << std::uppercase << value;
-    return ss.str();
-}
-
 bool IsVmmDeviceActive() {
     HANDLE hDevice = OpenVmmDevice();
     if (hDevice != INVALID_HANDLE_VALUE) {

@@ -9,11 +9,6 @@
 namespace hinv {
 namespace mapper {
 
-static std::wstring ToLower(std::wstring s) {
-    std::transform(s.begin(), s.end(), s.begin(), ::towlower);
-    return s;
-}
-
 static bool ReadFileBytes(const std::wstring& path, std::vector<uint8_t>& out) {
     std::ifstream file(path.c_str(), std::ios::binary | std::ios::ate);
     if (!file.is_open()) return false;
@@ -23,10 +18,6 @@ static bool ReadFileBytes(const std::wstring& path, std::vector<uint8_t>& out) {
     file.read(reinterpret_cast<char*>(out.data()), size);
     return file.good();
 }
-
-static uint16_t R16(const uint8_t* p) { return *reinterpret_cast<const uint16_t*>(p); }
-static uint32_t R32(const uint8_t* p) { return *reinterpret_cast<const uint32_t*>(p); }
-static uint64_t R64(const uint8_t* p) { return *reinterpret_cast<const uint64_t*>(p); }
 
 // ---------------------------------------------------------------------------
 // Resolve a single import name to a kernel virtual address.
@@ -65,6 +56,14 @@ bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<uint8_t>&
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(raw.data() + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
     if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+    // Only AMD64 is supported: anything else would be mapped and executed
+    // with the wrong ABI. Also pin the optional header layout we rely on.
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return false;
+    if (nt->FileHeader.SizeOfOptionalHeader != sizeof(IMAGE_OPTIONAL_HEADER64)) return false;
+    // Directories past NumberOfRvaAndSizes must be treated as absent, and a
+    // count larger than the fixed array is malformed.
+    if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_NUMBEROF_DIRECTORY_ENTRIES) return false;
+    const uint32_t numDataDirs = nt->OptionalHeader.NumberOfRvaAndSizes;
 
     uint32_t imageSize = nt->OptionalHeader.SizeOfImage;
     uint64_t preferredBase = nt->OptionalHeader.ImageBase;
@@ -85,14 +84,23 @@ bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<uint8_t>&
     if (sectionTableEnd > raw.size()) return false;
 
     for (uint16_t i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-        if (sec[i].PointerToRawData == 0 || sec[i].SizeOfRawData == 0) continue;
+        // Fail-closed: every section's virtual range must fit the image, even
+        // uninitialized (BSS) sections that occupy no file bytes.
+        if (sec[i].Misc.VirtualSize != 0) {
+            if (sec[i].VirtualAddress >= imageSize) return false;
+            if (static_cast<uint64_t>(sec[i].VirtualAddress) + sec[i].Misc.VirtualSize > imageSize)
+                return false;
+        }
 
-        // Fail-closed: a section claiming data outside the file or the image
-        // is malformed — reject it instead of skipping or truncating.
-        if (sec[i].VirtualAddress >= imageSize) return false;
+        if (sec[i].SizeOfRawData == 0) continue;
+        // A section with raw data must point at it; per the PE spec,
+        // uninitialized data is marked by SizeOfRawData == 0, so raw size
+        // without a raw pointer is malformed.
+        if (sec[i].PointerToRawData == 0) return false;
         if (sec[i].PointerToRawData >= raw.size()) return false;
         size_t rawSize = sec[i].SizeOfRawData;
         if (static_cast<uint64_t>(sec[i].PointerToRawData) + rawSize > raw.size()) return false;
+        if (sec[i].VirtualAddress >= imageSize) return false;
         if (static_cast<uint64_t>(sec[i].VirtualAddress) + rawSize > imageSize) return false;
 
         std::memcpy(mapped.data() + sec[i].VirtualAddress,
@@ -102,7 +110,8 @@ bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<uint8_t>&
 
     // Fix base relocation table.
     const auto& relocDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-    if (relocDir.VirtualAddress != 0 && relocDir.Size != 0) {
+    if (numDataDirs > IMAGE_DIRECTORY_ENTRY_BASERELOC &&
+        relocDir.VirtualAddress != 0 && relocDir.Size != 0) {
         // Use 64-bit arithmetic: the directory RVA + size can overflow 32 bits.
         if (static_cast<uint64_t>(relocDir.VirtualAddress) + relocDir.Size > imageSize) return false;
         uint64_t delta = imageBase - preferredBase;
@@ -153,7 +162,8 @@ bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<uint8_t>&
 
     // Resolve imports.
     const auto& importDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (importDir.VirtualAddress != 0 && importDir.Size != 0) {
+    if (numDataDirs > IMAGE_DIRECTORY_ENTRY_IMPORT &&
+        importDir.VirtualAddress != 0 && importDir.Size != 0) {
         if (importDir.VirtualAddress >= imageSize) return false;
         size_t guard = 0;
         for (size_t descIdx = 0; ; ++descIdx) {
@@ -245,6 +255,10 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
     }
     if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
         result.error = "not a PE32+ image";
+        return result;
+    }
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
+        result.error = "unsupported machine type (need AMD64)";
         return result;
     }
 

@@ -27,8 +27,27 @@ static std::unique_ptr<byovd::IByovdBackend> g_backend;
 static std::mutex g_backendMutex;
 static std::atomic<bool> g_running{ false };
 static HANDLE g_stopEvent = nullptr;
+struct ClientSlot {
+    std::atomic<bool> done{ false };
+    std::thread thread;
+};
+
 static std::mutex g_clientThreadsMutex;
-static std::vector<std::thread> g_clientThreads;
+static std::vector<std::unique_ptr<ClientSlot>> g_clientThreads;
+
+// Join and remove handlers that already finished. Caller must hold
+// g_clientThreadsMutex. Called on every accepted connection so short-lived
+// clients don't accumulate threads and native handles until shutdown.
+static void ReapFinishedClientsLocked() {
+    for (auto it = g_clientThreads.begin(); it != g_clientThreads.end();) {
+        if ((*it)->done.load() && (*it)->thread.joinable()) {
+            (*it)->thread.join();
+            it = g_clientThreads.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
 
 byovd::IByovdBackend* GetActiveBackend() {
     std::lock_guard<std::mutex> lock(g_backendMutex);
@@ -189,7 +208,10 @@ static void HandleClient(HANDLE hPipe) {
         if (request == "exit") break;
     }
 
-    FlushFileBuffers(hPipe);
+    // No FlushFileBuffers here: on the server side it blocks until the client
+    // drains the response, so an idle client could hang session shutdown (the
+    // join in RunHeadlessSession) forever. The response write above already
+    // completed synchronously via GetOverlappedResult.
     DisconnectNamedPipe(hPipe);
     CloseHandle(hPipe);
 }
@@ -267,8 +289,15 @@ static void StartIpcControlServer() {
         if (connected && g_running) {
             // Track client threads so the session can join them on shutdown;
             // a detached thread could outlive the BYOVD backend it uses.
+            auto slot = std::make_unique<ClientSlot>();
+            ClientSlot* raw = slot.get();
+            raw->thread = std::thread([raw, hPipe]() {
+                HandleClient(hPipe);
+                raw->done.store(true);
+            });
             std::lock_guard<std::mutex> lock(g_clientThreadsMutex);
-            g_clientThreads.emplace_back(HandleClient, hPipe);
+            g_clientThreads.push_back(std::move(slot));
+            ReapFinishedClientsLocked();
         } else {
             CloseHandle(hPipe);
         }
@@ -307,8 +336,8 @@ bool RunHeadlessSession(const HeadlessConfig& config) {
     // could still be inside ProcessCommand using g_backend.
     {
         std::lock_guard<std::mutex> lock(g_clientThreadsMutex);
-        for (auto& t : g_clientThreads) {
-            if (t.joinable()) t.join();
+        for (auto& slot : g_clientThreads) {
+            if (slot->thread.joinable()) slot->thread.join();
         }
         g_clientThreads.clear();
     }

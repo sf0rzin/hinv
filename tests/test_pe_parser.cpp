@@ -66,6 +66,7 @@ std::vector<uint8_t> MakePe(uint32_t imageSize, size_t rawSize) {
     nt->FileHeader.NumberOfSections = 1;
     nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
     nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
     nt->OptionalHeader.SizeOfImage = imageSize;
     nt->OptionalHeader.SizeOfHeaders = 0x200;
     nt->OptionalHeader.ImageBase = PREFERRED_BASE;
@@ -188,6 +189,95 @@ int main() {
         W16(pe, RvaToOff(0x1088), 0x7000); // relocation type 7: unknown on AMD64
         Check(!hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped),
               "unknown relocation type rejected");
+    }
+
+    // --- BuildMappedImage: machine type, optional header layout, BSS --------
+
+    {
+        auto pe = MakePe(0x2000, 0x400);
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(pe.data() + E_LFANEW);
+        nt->FileHeader.Machine = IMAGE_FILE_MACHINE_ARM64;
+        Check(!hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped),
+              "non-AMD64 machine rejected");
+        result = hinv::mapper::MapDriverBytes(&backend, pe);
+        Check(!result.success && result.error == "unsupported machine type (need AMD64)",
+              "non-AMD64 machine rejected at front door");
+    }
+
+    {
+        auto pe = MakePe(0x2000, 0x400);
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(pe.data() + E_LFANEW);
+        nt->FileHeader.SizeOfOptionalHeader = 0;
+        Check(!hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped),
+              "wrong SizeOfOptionalHeader rejected");
+    }
+
+    {
+        auto pe = MakePe(0x2000, 0x400);
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(pe.data() + E_LFANEW);
+        nt->OptionalHeader.NumberOfRvaAndSizes = 0xFFFFFFFF;
+        Check(!hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped),
+              "oversized NumberOfRvaAndSizes rejected");
+    }
+
+    {
+        // A directory index beyond NumberOfRvaAndSizes must be treated as
+        // absent: the relocation below is well-formed but must NOT be applied.
+        auto pe = MakePe(0x2000, 0x400);
+        W64(pe, RvaToOff(0x1000), PREFERRED_BASE + 0x2000);
+        SetDataDirectory(pe, IMAGE_DIRECTORY_ENTRY_BASERELOC, 0x1080, 0x0C);
+        W32(pe, RvaToOff(0x1080), 0x1000);
+        W32(pe, RvaToOff(0x1084), 0x0C);
+        W16(pe, RvaToOff(0x1088), 0xA000); // DIR64, offset 0
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(pe.data() + E_LFANEW);
+        nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_DIRECTORY_ENTRY_BASERELOC; // 5 < 6
+        bool ok = hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped);
+        uint64_t val = 0;
+        if (ok) std::memcpy(&val, mapped.data() + 0x1000, 8);
+        Check(ok, "image with truncated directory count still builds");
+        Check(ok && val == PREFERRED_BASE + 0x2000,
+              "relocation beyond NumberOfRvaAndSizes not applied");
+    }
+
+    {
+        auto pe = MakePe(0x3000, 0x400);
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(pe.data() + E_LFANEW);
+        nt->FileHeader.NumberOfSections = 2;
+        auto* sec = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+            pe.data() + E_LFANEW + 4 + sizeof(IMAGE_FILE_HEADER) + sizeof(IMAGE_OPTIONAL_HEADER64));
+        auto* bss = sec + 1;
+        std::memcpy(bss->Name, ".bss", 4);
+        bss->VirtualAddress = 0x2000;
+        bss->Misc.VirtualSize = 0x800;
+        bss->PointerToRawData = 0;
+        bss->SizeOfRawData = 0;
+        Check(hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped),
+              "BSS section within image accepted");
+    }
+
+    {
+        auto pe = MakePe(0x2000, 0x400);
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(pe.data() + E_LFANEW);
+        nt->FileHeader.NumberOfSections = 2;
+        auto* sec = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+            pe.data() + E_LFANEW + 4 + sizeof(IMAGE_FILE_HEADER) + sizeof(IMAGE_OPTIONAL_HEADER64));
+        auto* bss = sec + 1;
+        std::memcpy(bss->Name, ".bss", 4);
+        bss->VirtualAddress = 0x1800;
+        bss->Misc.VirtualSize = 0x1000; // 0x1800 + 0x1000 > SizeOfImage (0x2000)
+        bss->PointerToRawData = 0;
+        bss->SizeOfRawData = 0;
+        Check(!hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped),
+              "BSS section beyond image rejected");
+    }
+
+    {
+        auto pe = MakePe(0x2000, 0x400);
+        auto* sec = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+            pe.data() + E_LFANEW + 4 + sizeof(IMAGE_FILE_HEADER) + sizeof(IMAGE_OPTIONAL_HEADER64));
+        sec->PointerToRawData = 0; // SizeOfRawData stays nonzero
+        Check(!hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped),
+              "raw size without raw pointer rejected");
     }
 
     // --- BuildMappedImage: sections -----------------------------------------

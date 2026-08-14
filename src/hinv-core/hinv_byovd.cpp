@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cstring>
 
-#pragma comment(lib, "advapi32.lib")
+#ifdef _MSC_VER
+#pragma comment(lib, "advapi32.lib") // CMake links advapi32 for other toolchains
+#endif
 
 namespace hinv {
 namespace byovd {

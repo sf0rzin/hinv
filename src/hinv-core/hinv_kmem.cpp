@@ -45,7 +45,9 @@ typedef enum _KPROFILE_SOURCE {
 #define ProfileTotalIssues ((KPROFILE_SOURCE)2)
 #endif
 
-#pragma comment(lib, "ntdll.lib")
+#ifdef _MSC_VER
+#pragma comment(lib, "ntdll.lib") // CMake links ntdll for other toolchains
+#endif
 
 namespace hinv {
 namespace kmem {
@@ -53,10 +55,6 @@ namespace kmem {
 // ---------------------------------------------------------------------------
 // PE helpers (work on raw headers read from kernel memory)
 // ---------------------------------------------------------------------------
-
-static uint16_t R16(const uint8_t* p) { return *reinterpret_cast<const uint16_t*>(p); }
-static uint32_t R32(const uint8_t* p) { return *reinterpret_cast<const uint32_t*>(p); }
-static uint64_t R64(const uint8_t* p) { return *reinterpret_cast<const uint64_t*>(p); }
 
 static std::wstring ToLower(std::wstring s) {
     std::transform(s.begin(), s.end(), s.begin(), ::towlower);
