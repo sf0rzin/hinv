@@ -15,6 +15,7 @@ enum class BackendType {
     RTCore64,   // MSI Afterburner RTCore64  - physical map/read/write
     WinIo64,    // WinIo / RWEverything style
     DbUtil,     // Dell dbutil_2_3.sys       - arbitrary kernel virt read/write
+    Intel,      // Intel iqvw64e.sys         - kernel<->user CopyMemory (kdmapper-style)
 };
 
 struct DriverProfile {
