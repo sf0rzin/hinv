@@ -4,6 +4,7 @@
 #include "../hinv_cleaner.hpp"
 #include "../hinv_mapper.hpp"
 #include "../hinv_kmem.hpp"
+#include "../hinv_util.hpp"
 
 #include <fstream>
 #include <iostream>
@@ -65,17 +66,41 @@ static std::vector<std::string> Tokenize(const std::string& line) {
     return tokens;
 }
 
+// Everything after "<cmd> " is the literal argument — driver paths may contain
+// spaces, so load/clean must NOT go through whitespace tokenization (a split
+// path could map the WRONG file into the kernel, silently).
+static std::string RestAfterCommand(const std::string& line) {
+    size_t sp = line.find_first_of(" \t");
+    if (sp == std::string::npos) return {};
+    size_t start = line.find_first_not_of(" \t", sp + 1);
+    if (start == std::string::npos) return {};
+    size_t end = line.find_last_not_of(" \t\r\n");
+    return line.substr(start, end - start + 1);
+}
+
 std::string ProcessCommand(const std::string& command) {
     auto tokens = Tokenize(command);
     if (tokens.empty()) return "OK";
 
     const std::string& cmd = tokens[0];
 
-    if (cmd == "load" && tokens.size() >= 2) {
-        std::wstring path(tokens[1].begin(), tokens[1].end());
+    if (cmd == "load") {
+        std::string arg = RestAfterCommand(command);
+        if (arg.empty()) return "ERR usage: load <path> [null-drvobj]";
+        // Optional trailing token enables the \Driver\Null hijack (required for
+        // drivers that create devices, e.g. hyperkd).
+        bool nullDrvObj = false;
+        const std::string suffix = " null-drvobj";
+        if (arg.size() > suffix.size() &&
+            arg.compare(arg.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            nullDrvObj = true;
+            arg.erase(arg.size() - suffix.size());
+            while (!arg.empty() && (arg.back() == ' ' || arg.back() == '\t')) arg.pop_back();
+        }
+        std::wstring path = util::ToWstring(arg); // console input is ACP/UTF-8, not bytes
         std::lock_guard<std::mutex> lock(g_backendMutex);
         if (!g_backend) return "ERR no BYOVD backend loaded";
-        auto result = mapper::MapDriver(g_backend.get(), path);
+        auto result = mapper::MapDriver(g_backend.get(), path, nullDrvObj);
         if (!result.success) return "ERR map failed: " + result.error;
         std::ostringstream ss;
         ss << "OK image=0x" << std::hex << result.imageBase
@@ -83,8 +108,10 @@ std::string ProcessCommand(const std::string& command) {
         return ss.str();
     }
 
-    if (cmd == "clean" && tokens.size() >= 2) {
-        std::wstring name(tokens[1].begin(), tokens[1].end());
+    if (cmd == "clean") {
+        std::string arg = RestAfterCommand(command);
+        if (arg.empty()) return "ERR usage: clean <drivername>";
+        std::wstring name = util::ToWstring(arg);
         std::lock_guard<std::mutex> lock(g_backendMutex);
         if (!g_backend) return "ERR no BYOVD backend loaded";
         uint32_t timestamp = cleaner::GetDriverFileTimestamp(g_byovdPath);
@@ -137,6 +164,11 @@ bool ExecuteScriptFile(const std::string& scriptPath) {
         if (line.empty() || line[0] == '#') continue;
         std::string resp = ProcessCommand(line);
         std::cout << "[hinv::headless] [CMD] " << line << " -> " << resp << "\n";
+    }
+    // getline stops on error too: an I/O failure mid-script is not success.
+    if (file.bad()) {
+        std::cerr << "[hinv::headless] Script read error: " << scriptPath << "\n";
+        return false;
     }
     return true;
 }
@@ -332,7 +364,12 @@ bool RunHeadlessSession(const HeadlessConfig& config) {
     }
 
     if (!config.scriptPath.empty()) {
-        ExecuteScriptFile(config.scriptPath);
+        // A failed script (missing file, read error) must not fall through into
+        // the blocking IPC server — abort instead of hanging a batch run.
+        if (!ExecuteScriptFile(config.scriptPath)) {
+            std::cerr << "[hinv::headless] Script failed, aborting session\n";
+            return false;
+        }
     }
 
     std::thread ipcThread(StartIpcControlServer);

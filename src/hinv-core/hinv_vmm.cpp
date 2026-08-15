@@ -1,8 +1,16 @@
 #include "hinv_vmm.hpp"
+#include "hinv_kmem.hpp"
+#include <winternl.h>
 #include <iostream>
 #include <cstring>
 #include <sstream>
 #include <iomanip>
+#include <vector>
+#include <mutex>
+
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
+#endif
 
 namespace hinv {
 namespace vmm {
@@ -14,16 +22,85 @@ namespace vmm {
 static_assert(sizeof(DebugerReadMemoryPacket) == 48, "DEBUGGER_READ_MEMORY wire size drifted");
 static_assert(sizeof(DebugerEditMemoryPacket) == 40, "DEBUGGER_EDIT_MEMORY wire size drifted");
 
-bool IsVmmDeviceActive() {
-    HANDLE hDevice = OpenVmmDevice();
-    if (hDevice != INVALID_HANDLE_VALUE) {
-        CloseVmmDevice(hDevice);
-        return true;
+namespace {
+
+// Enumerating an object directory does NOT dispatch IRPs to the device — unlike
+// CreateFile, which triggers hyperkd's IRP_MJ_CREATE and burns the one-shot
+// log session. This is the only session-safe way to probe for the device.
+bool NtDirectoryHasEntry(const wchar_t* dirPath, const wchar_t* entryName) {
+    auto NtOpenDirectoryObject = reinterpret_cast<NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES)>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtOpenDirectoryObject")));
+    auto NtQueryDirectoryObject = reinterpret_cast<NTSTATUS(NTAPI*)(HANDLE, PVOID, ULONG, BOOLEAN, BOOLEAN, PULONG, PULONG)>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryDirectoryObject")));
+    if (!NtOpenDirectoryObject || !NtQueryDirectoryObject) return false;
+
+    UNICODE_STRING name{};
+    name.Buffer = const_cast<PWCH>(dirPath);
+    name.Length = static_cast<USHORT>(wcslen(dirPath) * sizeof(wchar_t));
+    name.MaximumLength = name.Length;
+    OBJECT_ATTRIBUTES oa{};
+    oa.Length = sizeof(oa);
+    oa.ObjectName = &name;
+    oa.Attributes = OBJ_CASE_INSENSITIVE;
+    HANDLE hDir = nullptr;
+    if (!NT_SUCCESS(NtOpenDirectoryObject(&hDir, 0x0001 /* DIRECTORY_QUERY */, &oa))) return false;
+
+    const size_t wantLen = wcslen(entryName);
+    bool found = false;
+    std::vector<uint8_t> buf(0x1000);
+    ULONG ctx = 0;
+    while (NT_SUCCESS(NtQueryDirectoryObject(hDir, buf.data(), static_cast<ULONG>(buf.size()),
+                                             TRUE /*ReturnSingleEntry*/, FALSE /*RestartScan*/, &ctx, nullptr))) {
+        auto* un = reinterpret_cast<UNICODE_STRING*>(buf.data());
+        if (un->Buffer && un->Length / 2 == wantLen &&
+            _wcsnicmp(un->Buffer, entryName, wantLen) == 0) {
+            found = true;
+            break;
+        }
     }
-    return false;
+    CloseHandle(hDir);
+    return found;
+}
+
+} // namespace
+
+bool IsVmmDeviceActive() {
+    kmem::Trace("vmm: probe device via object directory (no open)");
+    // The device object lives in \Device (global namespace, created by
+    // IoCreateDevice) — unlike the \DosDevices symlink, which IoCreateSymbolic
+    // Link scopes to the loading process's logon session when the driver is
+    // manually mapped from usermode context. Session-safe: no handle to the
+    // device is ever opened or closed.
+    bool ok = NtDirectoryHasEntry(L"\\Device", L"HyperDbgDebuggerDevice");
+    kmem::Trace(ok ? "vmm: device present" : "vmm: device absent");
+    return ok;
 }
 
 HANDLE OpenVmmDevice() {
+    // hyperkd's IRP_MJ_CREATE handler enforces SeSinglePrivilegeCheck(
+    // SeDebugPrivilege): being elevated is not enough, the privilege must be
+    // ENABLED on our token (it ships present-but-disabled for admins).
+    static bool privilegeArmed = [] {
+        HANDLE token = nullptr;
+        bool ok = false;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+            TOKEN_PRIVILEGES tp{};
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            if (LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &tp.Privileges[0].Luid) &&
+                AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr)) {
+                // AdjustTokenPrivileges returns TRUE even when a privilege was
+                // not assigned — GetLastError holds ERROR_NOT_ALL_ASSIGNED then.
+                ok = (GetLastError() == ERROR_SUCCESS);
+            }
+            CloseHandle(token);
+        }
+        if (!ok)
+            std::cerr << "[hinv::vmm] WARNING: SeDebugPrivilege not enabled; hyperkd will deny the device open\n";
+        return ok;
+    }();
+    (void)privilegeArmed;
+
     return CreateFileW(
         HYPERDBG_DEVICE_NAME,
         GENERIC_READ | GENERIC_WRITE,
@@ -40,17 +117,30 @@ void CloseVmmDevice(HANDLE hDevice) {
 }
 
 bool SendVmmIoctl(DWORD ioctlCode, LPVOID inBuffer, DWORD inSize, LPVOID outBuffer, DWORD outSize, LPDWORD bytesReturned) {
-    HANDLE hDevice = OpenVmmDevice();
-    if (hDevice == INVALID_HANDLE_VALUE) {
-        std::cerr << "[hinv::vmm] Cannot open HyperDbg device: " << GetLastError() << "\n";
-        return false;
+    // hyperkd's CREATE handler burns the log session on close (it clears the
+    // "session opened" gate while hyperlog can only initialize once per boot),
+    // so every open/close pair after the first fails with STATUS_UNSUCCESSFUL.
+    // Keep ONE handle for the whole process lifetime instead of open/close
+    // per IOCTL. But a magic static would POISON the process forever if the
+    // first open happened before hyperkd was loaded — so open lazily and retry
+    // while invalid. The mutex also serializes concurrent IOCTLs on the shared
+    // (non-overlapped) handle.
+    static HANDLE s_device = nullptr;
+    static std::mutex s_deviceMutex;
+    std::lock_guard<std::mutex> lock(s_deviceMutex);
+    if (!s_device || s_device == INVALID_HANDLE_VALUE) {
+        s_device = OpenVmmDevice();
+        if (s_device == INVALID_HANDLE_VALUE) {
+            std::cerr << "[hinv::vmm] Cannot open HyperDbg device: " << GetLastError() << "\n";
+            return false;
+        }
     }
+    HANDLE hDevice = s_device;
 
     DWORD localBytes = 0;
     DWORD* pBytes = bytesReturned ? bytesReturned : &localBytes;
     BOOL ok = DeviceIoControl(hDevice, ioctlCode, inBuffer, inSize, outBuffer, outSize, pBytes, nullptr);
     DWORD err = GetLastError();
-    CloseVmmDevice(hDevice);
 
     if (!ok) {
         std::cerr << "[hinv::vmm] DeviceIoControl failed: " << err << "\n";
@@ -64,6 +154,17 @@ bool InitializeVmm() {
     DWORD bytes = 0;
     if (!SendVmmIoctl(IOCTL_HYPERDBG_INIT_VMM, &kernelStatus, sizeof(kernelStatus),
                       &kernelStatus, sizeof(kernelStatus), &bytes)) {
+        return false;
+    }
+    // hyperkd completes the IRP with STATUS_SUCCESS unconditionally — the real
+    // outcome lives in these 4 bytes (verified against hyperkd.sys v0.23
+    // disassembly): the kernel only arms the VMM IOCTL gate on success.
+    if (kernelStatus == 0xC0000063) { // DEBUGGER_ERROR_VMM_ALREADY_INITIALIZED
+        std::cout << "[hinv::vmm] HyperDbg VMM already initialized\n";
+        return true;
+    }
+    if (kernelStatus != DEBUGGER_OPERATION_WAS_SUCCESSFUL) {
+        std::cerr << "[hinv::vmm] VMM init failed, kernel status: 0x" << std::hex << kernelStatus << std::dec << "\n";
         return false;
     }
     std::cout << "[hinv::vmm] HyperDbg VMM initialized\n";

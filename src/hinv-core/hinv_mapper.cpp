@@ -26,7 +26,9 @@ static bool ReadFileBytes(const std::wstring& path, std::vector<uint8_t>& out) {
 static uint64_t ResolveImport(byovd::IByovdBackend* backend, const std::string& dllName,
                               const std::string& procName, uint16_t ordinal, bool byOrdinal) {
     if (byOrdinal) {
-        (void)ordinal;
+        // Ordinal imports are deliberately unsupported (fail-closed upstream).
+        std::cerr << "[hinv::mapper] Unresolved import: " << dllName << "!#" << ordinal
+                  << " (ordinal imports unsupported)\n";
         return 0;
     }
 
@@ -228,7 +230,25 @@ bool BuildMappedImage(byovd::IByovdBackend* backend, const std::vector<uint8_t>&
 // Public API
 // ---------------------------------------------------------------------------
 
-MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<uint8_t>& rawImage) {
+// Best-effort counterpart of the function table registration done after
+// ProtectKernelMemory. Returns true when removal is CONFIRMED (or there was
+// nothing to remove). Callers must not free the image on false: the kernel's
+// function table would keep pointing into freed pool.
+static bool UnregisterFunctionTable(byovd::IByovdBackend* backend, uint64_t functionTableVa,
+                                    uint64_t imageBase) {
+    if (!functionTableVa) return true;
+    // Builds that still export RtlAddFunctionTable also export its remover.
+    if (uint64_t delFn = kmem::ResolveKernelExport(backend, L"ntoskrnl.exe", "RtlDeleteFunctionTable")) {
+        uint8_t ok = 0;
+        if (!kmem::CallKernelFunction(backend, &ok, delFn, functionTableVa)) return false;
+        return ok != 0;
+    }
+    // 24H2+: registration went straight into PsInvertedFunctionTable.
+    return kmem::RemoveInvertedFunctionTableEntry(backend, imageBase);
+}
+
+MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<uint8_t>& rawImage,
+                             bool hijackNullDriverObject) {
     MappingResult result{};
     if (!backend || rawImage.size() < sizeof(IMAGE_DOS_HEADER)) {
         result.error = "invalid arguments";
@@ -306,11 +326,11 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
 
     // Locate DriverEntry RVA.
     uint32_t entryRva = nt->OptionalHeader.AddressOfEntryPoint;
-    uint64_t driverEntryVa = kernelBase + entryRva;
 
     // Pool memory is NX since Windows 8; flip the whole image to RWX before
     // calling into it (kdmapper applies per-section protections the same way,
-    // via MmSetPageProtection).
+    // via MmSetPageProtection). Companion kernel DLLs need this too: their
+    // code runs when a chain-mapped driver calls their exports.
     kmem::Trace("mapper: protect begin");
     if (!kmem::ProtectKernelMemory(backend, kernelBase, imageSize, PAGE_EXECUTE_READWRITE)) {
         result.error = "failed to make mapped image executable";
@@ -320,27 +340,153 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
     }
     kmem::Trace("mapper: protect ok");
 
-    // Minimal synthetic DRIVER_OBJECT in kernel pool (no \Driver\Null hijack):
-    // only DriverStart/DriverSize are populated, matching kdmapper's approach.
-    // DRIVER_OBJECT (x64): DriverStart @ 0x18, DriverSize @ 0x20.
-    kmem::Trace("mapper: drvobj alloc begin");
-    constexpr size_t DRV_OBJ_SIZE = 0x200;
-    uint64_t drvObj = 0;
-    if (!kmem::AllocateKernelMemory(backend, DRV_OBJ_SIZE, drvObj) || !drvObj) {
-        result.error = "failed to allocate synthetic DRIVER_OBJECT";
+    // Register the exception directory (.pdata) as a dynamic function table.
+    // RtlLookupFunctionEntry only walks PsLoadedModuleList plus registered
+    // dynamic tables — a manually mapped image is in neither, so ANY exception
+    // inside it would blow past its SEH handlers and bugcheck. (That is what
+    // turned HyperDbg's SEH-guarded MSR scan into KMODE_EXCEPTION_NOT_HANDLED.)
+    uint64_t functionTableVa = 0;
+    uint32_t functionTableCount = 0;
+    const uint32_t numDataDirs = nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_NUMBEROF_DIRECTORY_ENTRIES
+                                     ? nt->OptionalHeader.NumberOfRvaAndSizes
+                                     : IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    const auto& excDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (numDataDirs > IMAGE_DIRECTORY_ENTRY_EXCEPTION && excDir.VirtualAddress != 0 && excDir.Size != 0) {
+        // A declared-but-out-of-bounds .pdata is a malformed PE, not "no SEH":
+        // silently skipping registration would recreate the exact bugcheck
+        // scenario this block exists to prevent. Fail closed.
+        if (static_cast<uint64_t>(excDir.VirtualAddress) + excDir.Size > imageSize) {
+            result.error = "exception directory out of bounds";
+            result.imageBase = kernelBase;
+            kmem::FreeKernelMemory(backend, kernelBase);
+            return result;
+        }
+        functionTableVa = kernelBase + excDir.VirtualAddress;
+        functionTableCount = excDir.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
+        uint64_t addFn = kmem::ResolveKernelExport(backend, L"ntoskrnl.exe", "RtlAddFunctionTable");
+        if (addFn) {
+            // Official path (present up to Win11 23H2).
+            // Kernel RtlAddFunctionTable(FunctionTable, EntryCount, Base, End).
+            uint8_t ok = 0;
+            if (!kmem::CallKernelFunction(backend, &ok, addFn, functionTableVa,
+                                          static_cast<uint64_t>(functionTableCount),
+                                          kernelBase, kernelBase + imageSize) || !ok) {
+                result.error = "RtlAddFunctionTable failed";
+                result.imageBase = kernelBase;
+                kmem::FreeKernelMemory(backend, kernelBase);
+                return result;
+            }
+            kmem::Trace("mapper: function table registered");
+        } else {
+            // Win11 24H2 removed RtlAddFunctionTable: insert into
+            // PsInvertedFunctionTable directly. Fail closed either way — an
+            // image with SEH but no registered table bugchecks on the first
+            // exception (HyperDbg's MSR scan proved it twice).
+            if (!kmem::InsertInvertedFunctionTableEntry(backend, functionTableVa, kernelBase,
+                                                        imageSize, excDir.Size)) {
+                result.error = "function table registration failed (no RtlAddFunctionTable, inverted-table insert failed)";
+                result.imageBase = kernelBase;
+                kmem::FreeKernelMemory(backend, kernelBase);
+                return result;
+            }
+            std::cout << "[hinv::mapper] Registered .pdata via PsInvertedFunctionTable (24H2 path)\n";
+            kmem::Trace("mapper: function table registered (inverted)");
+        }
+    }
+
+    // Kernel-mode DLLs (e.g. HyperDbg companions hyperlog.dll / hyperhv.dll)
+    // have no entry point: the loader's job ends at mapping. Calling base+0
+    // would execute the DOS header as code, so skip DriverEntry entirely.
+    // Their exports are consumed by chain-mapped drivers via the registry.
+    if (entryRva == 0) {
+        kmem::Trace("mapper: no entry point (kernel DLL), skipping DriverEntry");
         result.imageBase = kernelBase;
-        kmem::FreeKernelMemory(backend, kernelBase);
+        result.driverEntryStatus = 0;
+        result.imageSize = imageSize;
+        result.success = true;
         return result;
     }
-    {
+    uint64_t driverEntryVa = kernelBase + entryRva;
+
+    // DriverEntry's first argument: either the real DRIVER_OBJECT of
+    // \Driver\Null (hijack mode, for drivers that call IoCreateDevice) or a
+    // minimal synthetic object in kernel pool.
+    uint64_t drvObj = 0;
+    bool borrowedObj = false;
+    uint64_t savedUnload = 0;
+    uint64_t savedDispatch[28]{}; // MajorFunction[0..27]
+    if (hijackNullDriverObject) {
+        kmem::Trace("mapper: null drvobj resolve begin");
+        HANDLE hNul = CreateFileW(L"\\\\.\\Nul", GENERIC_READ,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hNul != INVALID_HANDLE_VALUE) {
+            drvObj = kmem::GetDriverObjectFromHandle(backend, hNul);
+            CloseHandle(hNul);
+        }
+        if (!drvObj) {
+            result.error = "failed to obtain \\Driver\\Null DRIVER_OBJECT";
+            result.imageBase = kernelBase;
+            if (UnregisterFunctionTable(backend, functionTableVa, kernelBase)) {
+                kmem::FreeKernelMemory(backend, kernelBase);
+                result.imageBase = 0;
+            } else {
+                std::cerr << "[hinv::mapper] Function table removal unconfirmed; image left resident\n";
+            }
+            return result;
+        }
+        borrowedObj = true;
+        // Back up null.sys's DriverUnload and entire MajorFunction table before
+        // DriverEntry overwrites them. If the entry point fails, we restore
+        // null.sys first and only then free the image — otherwise the null
+        // driver's IRP dispatch would point into freed pool (kernel UAF).
+        bool backupOk = kmem::ReadU64(backend, drvObj + 0x68, savedUnload); // DriverUnload
+        for (int i = 0; backupOk && i < 28; ++i)
+            backupOk = kmem::ReadU64(backend, drvObj + 0x70 + i * 8, savedDispatch[i]);
+        if (!backupOk) {
+            result.error = "failed to back up \\Driver\\Null dispatch table";
+            result.imageBase = kernelBase;
+            if (UnregisterFunctionTable(backend, functionTableVa, kernelBase)) {
+                kmem::FreeKernelMemory(backend, kernelBase);
+                result.imageBase = 0;
+            } else {
+                std::cerr << "[hinv::mapper] Function table removal unconfirmed; image left resident\n";
+            }
+            return result;
+        }
+        std::cout << "[hinv::mapper] Borrowing \\Driver\\Null DRIVER_OBJECT at 0x"
+                  << std::hex << drvObj << std::dec << "\n";
+        kmem::Trace("mapper: null drvobj ok");
+    } else {
+        // Minimal synthetic DRIVER_OBJECT in kernel pool (no \Driver\Null
+        // hijack): only DriverStart/DriverSize are populated.
+        // DRIVER_OBJECT (x64): DriverStart @ 0x18, DriverSize @ 0x20.
+        kmem::Trace("mapper: drvobj alloc begin");
+        constexpr size_t DRV_OBJ_SIZE = 0x200;
+        if (!kmem::AllocateKernelMemory(backend, DRV_OBJ_SIZE, drvObj) || !drvObj) {
+            result.error = "failed to allocate synthetic DRIVER_OBJECT";
+            result.imageBase = kernelBase;
+            if (UnregisterFunctionTable(backend, functionTableVa, kernelBase)) {
+                kmem::FreeKernelMemory(backend, kernelBase);
+                result.imageBase = 0;
+            } else {
+                std::cerr << "[hinv::mapper] Function table removal unconfirmed; image left resident\n";
+            }
+            return result;
+        }
         std::vector<uint8_t> zeros(DRV_OBJ_SIZE, 0);
         if (!backend->WriteKernelMemory(drvObj, zeros.data(), zeros.size()) ||
             !kmem::WriteU64(backend, drvObj + 0x18, kernelBase) ||
             !kmem::WriteU32(backend, drvObj + 0x20, imageSize)) {
             result.error = "failed to initialize synthetic DRIVER_OBJECT";
             result.imageBase = kernelBase;
-            kmem::FreeKernelMemory(backend, drvObj);
-            kmem::FreeKernelMemory(backend, kernelBase);
+            if (UnregisterFunctionTable(backend, functionTableVa, kernelBase)) {
+                kmem::FreeKernelMemory(backend, drvObj);
+                kmem::FreeKernelMemory(backend, kernelBase);
+                result.imageBase = 0;
+            } else {
+                std::cerr << "[hinv::mapper] Function table removal unconfirmed; image left resident\n";
+            }
             return result;
         }
     }
@@ -351,33 +497,82 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
     kmem::Trace("mapper: driverentry returned");
     std::cout << "[hinv::mapper] DriverEntry returned 0x" << std::hex << status << std::dec << "\n";
 
-    // The synthetic object is ours; the mapped image stays resident on success.
-    kmem::FreeKernelMemory(backend, drvObj);
-    kmem::Trace("mapper: drvobj freed");
-
     result.imageBase = kernelBase;
-    result.driverObject = 0; // synthetic object already freed; nothing borrowed
     result.driverEntryStatus = status;
     result.imageSize = imageSize;
 
     result.success = (status == 0); // STATUS_SUCCESS
     if (!result.success) {
         result.error = "DriverEntry returned failure";
-        // On failure, free the mapped image to avoid leaking pool memory.
-        kmem::FreeKernelMemory(backend, kernelBase);
-        result.imageBase = 0;
+        // Once DriverEntry ran, the driver may already have created devices and
+        // installed handlers pointing into this image, and there is NO real
+        // rundown for IRPs potentially in flight — so on entry failure we keep
+        // BOTH the image and the DRIVER_OBJECT resident. A pool leak on the
+        // failure path beats a use-after-free.
+        if (borrowedObj) {
+            // Restore null.sys's dispatch table, with every write checked. Even
+            // with a perfect restore, an IRP may still be executing a handler
+            // from this image right now — another reason nothing is freed here.
+            bool restoreOk = true;
+            for (int i = 0; i < 28; ++i)
+                restoreOk = kmem::WriteU64(backend, drvObj + 0x70 + i * 8, savedDispatch[i]) && restoreOk;
+            restoreOk = kmem::WriteU64(backend, drvObj + 0x68, savedUnload) && restoreOk;
+            kmem::Trace(restoreOk ? "mapper: null dispatch restored after failure"
+                                  : "mapper: null dispatch restore INCOMPLETE");
+            if (!restoreOk)
+                std::cerr << "[hinv::mapper] WARNING: null.sys dispatch restore failed\n";
+        }
+        std::cerr << "[hinv::mapper] DriverEntry failed; image left resident to avoid UAF\n";
+        return result;
     }
+
+    // On success the driver is resident, so its DRIVER_OBJECT must stay too:
+    // a driver that called IoCreateDevice has DeviceObject->DriverObject
+    // pointing here, and the I/O manager dereferences MajorFunction through
+    // it on every IRP. Freeing it would be a kernel use-after-free on the
+    // first IOCTL. Deliberate 0x200-byte pool leak per mapped driver
+    // (a borrowed null.sys object needs no cleanup by definition).
+    result.driverObject = drvObj;
+
+    // Replicate IopLoadDriver: devices created in DriverEntry come out of
+    // IoCreateDevice with DO_DEVICE_INITIALIZING set, and the normal loader
+    // clears it after a successful entry. We ARE the loader, so clear it
+    // ourselves — otherwise IopParseDevice rejects every open with
+    // STATUS_DEVICE_NOT_CONNECTED (this is why HyperDbg's device refused
+    // CreateFile with Win32 error 433).
+    {
+        uint64_t dev = 0;
+        if (kmem::ReadU64(backend, drvObj + 0x8, dev)) { // DRIVER_OBJECT.DeviceObject
+            for (int n = 0; dev && n < 16; ++n) {
+                uint32_t flags = 0;
+                if (kmem::ReadU32(backend, dev + 0x30, flags) && (flags & 0x80)) {
+                    if (kmem::WriteU32(backend, dev + 0x30, flags & ~0x80u)) {
+                        std::cout << "[hinv::mapper] Cleared DO_DEVICE_INITIALIZING on device 0x"
+                                  << std::hex << dev << std::dec << "\n";
+                    } else {
+                        // Without this clear the device rejects every open with
+                        // STATUS_DEVICE_NOT_CONNECTED — never claim otherwise.
+                        std::cerr << "[hinv::mapper] WARNING: failed to clear DO_DEVICE_INITIALIZING on device 0x"
+                                  << std::hex << dev << std::dec << " — opens will fail with 433\n";
+                    }
+                }
+                if (!kmem::ReadU64(backend, dev + 0x10, dev)) break; // DEVICE_OBJECT.NextDevice
+            }
+        }
+    }
+    kmem::Trace("mapper: drvobj kept resident");
     return result;
 }
 
-MappingResult MapDriver(byovd::IByovdBackend* backend, const std::wstring& driverPath) {
+MappingResult MapDriver(byovd::IByovdBackend* backend, const std::wstring& driverPath,
+                        bool hijackNullDriverObject) {
     std::vector<uint8_t> raw;
     if (!ReadFileBytes(driverPath, raw)) {
         MappingResult r{};
         r.error = "failed to read driver file";
         return r;
     }
-    auto result = MapDriverBytes(backend, raw);
+    auto result = MapDriverBytes(backend, raw, hijackNullDriverObject);
     if (result.success) {
         // Register the mapped module so later chain-mapped modules can resolve
         // imports from it (it is invisible to EnumKernelModules).

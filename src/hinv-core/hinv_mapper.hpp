@@ -20,11 +20,20 @@ struct MappingResult {
 };
 
 // Manually map a kernel driver (.sys) into kernel memory using the supplied BYOVD backend.
-// The driver object of \\Driver\\Null is borrowed/hijacked for the DriverEntry call.
-MappingResult MapDriver(byovd::IByovdBackend* backend, const std::wstring& driverPath);
+// When hijackNullDriverObject is true, DriverEntry receives the real
+// DRIVER_OBJECT of \Driver\Null (recovered via handle enumeration) instead of
+// a synthetic pool object — required by drivers that call IoCreateDevice
+// (e.g. HyperDbg's hyperkd.sys), because the I/O manager refuses to open
+// devices owned by a non-Object-Manager DRIVER_OBJECT. Caveats in hijack mode:
+// null.sys's MajorFunction[]/DriverUnload stay overwritten until reboot, and
+// DriverObject->DriverStart/DriverSize describe null.sys, not the mapped image
+// (drivers that self-locate through them will misbehave).
+MappingResult MapDriver(byovd::IByovdBackend* backend, const std::wstring& driverPath,
+                        bool hijackNullDriverObject = false);
 
 // Same, but accepts the raw file bytes already loaded in memory.
-MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<uint8_t>& rawImage);
+MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<uint8_t>& rawImage,
+                             bool hijackNullDriverObject = false);
 
 // Internal: build the mapped image (sections, relocations, imports) from raw
 // PE bytes for the target kernel base. Fail-closed: returns false on any

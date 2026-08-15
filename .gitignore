@@ -26,3 +26,6 @@
 # System files
 Desktop.ini
 Thumbs.db
+
+# VM staging area (contains unattended setup files with secrets; not ours)
+/.codex-vm-staging/

