@@ -1,5 +1,6 @@
 #pragma once
 #include <windows.h>
+#include <winternl.h>
 #include <string>
 #include <cstdint>
 #include <vector>
@@ -18,6 +19,15 @@ struct CleanResult {
     bool hashBucketList = false;
     bool wdFilter = false;
     std::wstring error;
+    bool wdFilterPresent = false;
+    // True only when every applicable cleaner completed successfully.
+    bool complete = false;
+};
+
+struct UnloadPreventionState {
+    bool armed = false;
+    uint64_t nameFieldVa = 0;
+    UNICODE_STRING originalName{};
 };
 
 // Remove traces of a loaded driver from kernel bookkeeping structures.
@@ -33,7 +43,10 @@ uint32_t GetDriverFileTimestamp(const std::wstring& driverPath);
 // MiRememberUnloadedDriver skips it at unload time (kdmapper approach). Must be
 // called while the driver is still loaded and the device handle is open; the
 // backend calls this from its Shutdown before stopping the service.
-bool PreventUnloadedDriverTrace(byovd::IByovdBackend* backend, HANDLE deviceHandle);
+bool PreventUnloadedDriverTrace(byovd::IByovdBackend* backend, HANDLE deviceHandle,
+                                UnloadPreventionState* state);
+bool RestoreUnloadedDriverTrace(byovd::IByovdBackend* backend,
+                                UnloadPreventionState& state);
 
 // Direct helpers exposed for scripting.
 bool ClearUnloadedDriverEntry(byovd::IByovdBackend* backend, const std::wstring& driverName);

@@ -6,7 +6,7 @@ This is an experimental research project. Only the latest commit on `master` rec
 
 ## Reporting a Vulnerability
 
-If you discover a security issue in `hinv`, please open a private GitHub issue or contact the maintainers directly. Do not disclose the vulnerability publicly until a fix is available.
+If you discover a security issue in `hinv`, use a GitHub Security Advisory/private report when available, or contact the maintainers through a private channel. Do not disclose the vulnerability publicly until a fix is available.
 
 ## Scope
 
@@ -23,7 +23,7 @@ If you discover a security issue in `hinv`, please open a private GitHub issue o
 
 - **BSODs** are expected during development and testing.
 - **Kernel memory corruption** may occur if offsets or signatures are incorrect for your Windows build.
-- **Vulnerable driver compatibility** varies; `dbutil_2_3.sys` may be blocked by newer Windows versions.
+- **Vulnerable driver compatibility** varies; `dbutil_2_3.sys` may be blocked by newer Windows versions. Teardown is fail-closed when the build-specific unload-prevention offset is not validated, so a service may remain for manual recovery.
 
 ## Disclaimer
 

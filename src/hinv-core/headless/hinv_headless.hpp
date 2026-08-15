@@ -1,8 +1,7 @@
 #pragma once
 #include <windows.h>
+#include <filesystem>
 #include <string>
-#include <atomic>
-#include <memory>
 
 #include "../hinv_byovd.hpp"
 
@@ -12,7 +11,7 @@ namespace headless {
 constexpr const wchar_t* HINV_PIPE_NAME = L"\\\\.\\pipe\\hinv_headless";
 
 struct HeadlessConfig {
-    std::string scriptPath = "";
+    std::filesystem::path scriptPath;
     std::wstring byovdDriverPath = L""; // e.g. C:\\path\\to\\iqvw64e.sys
 };
 
@@ -23,7 +22,7 @@ bool RunHeadlessSession(const HeadlessConfig& config);
 void StopHeadlessSession();
 
 // Execute a script file non-interactively.
-bool ExecuteScriptFile(const std::string& scriptPath);
+bool ExecuteScriptFile(const std::filesystem::path& scriptPath);
 
 // Process a single command string. Used by IPC server and script engine.
 // Returns a human-readable response.

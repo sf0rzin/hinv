@@ -5,11 +5,30 @@
 #include <vector>
 #include <type_traits>
 #include <mutex>
+#include <utility>
 
 #include "hinv_byovd.hpp"
 
 namespace hinv {
 namespace kmem {
+
+// A kernel call can execute successfully while the global dispatch hook can
+// no longer be restored. Callers must not collapse this into bool: freeing a
+// buffer after RestorationUncertain can leave the kernel executing freed code.
+enum class KernelCallStatus {
+    NotExecuted,
+    Executed,
+    RestorationUncertain,
+};
+
+// Once a read-only hook restore is uncertain, no subsequent arbitrary kernel
+// call is safe in this process. The caller must retain reachable allocations
+// and terminate/leave the backend for manual recovery.
+bool KernelCallsUsable();
+
+inline bool CallExecuted(KernelCallStatus status) {
+    return status == KernelCallStatus::Executed;
+}
 
 // Loaded kernel module descriptor.
 struct KernelModule {
@@ -40,6 +59,9 @@ struct MappedModule {
 // Register (or update) a manually mapped module. Name is lowercased and
 // stripped of any path. No-op for empty names or zero base/size.
 void RegisterMappedModule(const std::wstring& moduleName, uint64_t base, uint32_t size);
+// Remove a mapped module registration. When base is nonzero, only a matching
+// registration is removed, preventing an old owner from deleting a newer one.
+void UnregisterMappedModule(const std::wstring& moduleName, uint64_t base = 0);
 
 // Resolve kernel export RVA using in-memory PE parsing via backend read.
 // Returns 0 on failure. Forwarded exports ("Dll.Func") are chased recursively
@@ -73,13 +95,15 @@ inline bool WriteU32(byovd::IByovdBackend* b, uint64_t va, uint32_t in)   { retu
 // Exists because stdout buffering loses everything on a bugcheck.
 void Trace(const char* stage);
 
-// --- Inverted function table (SEH registration for manually mapped images) ---
+// --- Inverted function table (read-only inspection) ---
 //
-// Win11 24H2 REMOVED ntoskrnl!RtlAddFunctionTable / RtlDeleteFunctionTable, so
-// the only way to make RtlLookupFunctionEntry see a manually mapped image's
-// .pdata is to insert into PsInvertedFunctionTable directly. Layout recovered
-// from nt!RtlpInsertInvertedFunctionTableEntry / nt!RtlLookupFunctionEntry on
-// build 26100 (and stable since Win10 RS1):
+// Win11 24H2 removed ntoskrnl!RtlAddFunctionTable / RtlDeleteFunctionTable.
+// Although the private PsInvertedFunctionTable layout can be located for
+// diagnostics, its Epoch is not a writer lock and the real lock/routine is
+// build-private. hinv therefore never writes this table; images that require
+// dynamic .pdata registration are rejected when the supported API is absent.
+// The diagnostic layout below is retained only for unit-testable read-only
+// address extraction:
 //   +0x00 CurrentSize (u32)   +0x04 MaximumSize (u32)
 //   +0x08 Epoch (u32; odd while mutating, bumped twice per mutation)
 //   +0x0C Overflow (u8; kernel sets it instead of inserting when full)
@@ -91,18 +115,16 @@ void Trace(const char* stage);
 // (exported on every build), which reads the fast-path entry through
 // PsInvertedFunctionTable+0x18 with a RIP-relative load right after its prologue.
 
-// Resolve PsInvertedFunctionTable. Returns 0 on failure. Result is cached.
+// Resolve PsInvertedFunctionTable for read-only diagnostics. Always returns 0
+// for the production mutation path.
 uint64_t ResolveInvertedFunctionTable(byovd::IByovdBackend* backend);
 
-// Insert an image's .pdata into the inverted function table (idempotent on
-// ImageBase). FALSE means NOT registered — callers must keep the image
-// resident, exactly like a failed RtlAddFunctionTable.
+// Retained for API compatibility with diagnostic callers. Always fails closed;
+// no user-mode code may mutate PsInvertedFunctionTable.
 bool InsertInvertedFunctionTableEntry(byovd::IByovdBackend* backend, uint64_t functionTableVa,
                                       uint64_t imageBase, uint32_t imageSize, uint32_t tableSize);
 
-// Remove the entry for imageBase. TRUE when the entry is gone (or never
-// existed); FALSE when removal could not be confirmed (image must stay
-// resident — the table would keep pointing into freed pool).
+// Retained for API compatibility with diagnostic callers. Always fails closed.
 bool RemoveInvertedFunctionTableEntry(byovd::IByovdBackend* backend, uint64_t imageBase);
 
 namespace detail {
@@ -119,11 +141,33 @@ bool RemoveInvertedFunctionTableEntryAt(byovd::IByovdBackend* backend, uint64_t 
 
 namespace detail {
 
-// Install/remove the temporary ntoskrnl!NtAddAtom prologue hook used by
-// CallKernelFunction. `original` receives the overwritten bytes (12 bytes:
-// mov rax, imm64; jmp rax). Implemented in hinv_kmem.cpp.
-bool InstallCallHook(byovd::IByovdBackend* backend, uint64_t target, uint8_t (&original)[12]);
-bool RemoveCallHook(byovd::IByovdBackend* backend, const uint8_t (&original)[12]);
+// Install/remove the temporary ntoskrnl!NtAddAtom hook used by
+// CallKernelFunction. The entry is changed with one aligned 8-byte store to a
+// relative jump. The jump lands in an executable pool trampoline which checks
+// that the call originates on the owner KTHREAD before dispatching the target.
+enum class HookInstallStatus {
+    Failed,
+    Installed,
+    Uncertain,
+};
+HookInstallStatus InstallCallHook(byovd::IByovdBackend* backend, uint64_t gateVa,
+                                  uint8_t (&original)[8]);
+bool RemoveCallHook(byovd::IByovdBackend* backend, const uint8_t (&original)[8]);
+
+// The hook mutex has an Administrators/SYSTEM DACL and is shared by all
+// cooperating hinv processes. It is not used as a substitute for atomic code
+// publication; the latter is enforced by WriteReadOnlyMemoryAtomic8.
+HANDLE GlobalCallHookMutex();
+void MarkHookStateUncertain();
+
+// Configure the executable trampoline while NtAddAtom is restored.
+bool ConfigureCallGate(byovd::IByovdBackend* backend, uint64_t gateVa,
+                       uint64_t ownerKthread, uint64_t target);
+
+// Allocate and initialize the gate without recursively using the gate itself.
+// Called while CallKernelFunction holds both serialization locks.
+KernelCallStatus PrepareCallGate(byovd::IByovdBackend* backend, uint64_t& gateVa,
+                                 uint64_t& ownerKthread);
 
 // User-mode ntdll!NtAddAtom address (the syscall stub we invoke).
 void* UserNtAddAtom();
@@ -131,45 +175,72 @@ void* UserNtAddAtom();
 } // namespace detail
 
 // Call an arbitrary kernel function with up to 4 register arguments,
-// kdmapper-style: the first bytes of ntoskrnl!NtAddAtom are replaced with a
-// `mov rax, funcVa; jmp rax` stub through the backend's read-only write
-// primitive (physical mapping on the Intel backend), then ntdll!NtAddAtom is
-// invoked from usermode — the syscall enters the hook with our argument
-// registers intact and the target's RAX becomes our return value.
+// kdmapper-style: the first eight bytes of ntoskrnl!NtAddAtom are replaced by
+// one atomically published relative jump to a kernel trampoline. The
+// trampoline rejects calls from every KTHREAD except this call's owner, then
+// jumps to funcVa with the original argument registers intact. ntdll!NtAddAtom
+// is invoked from usermode and the target's RAX becomes the return value.
 //
-// Return value semantics: TRUE means the target executed (read its result via
-// outResult). FALSE only when the hook never installed — the target never ran.
-// A FAILED hook removal after a successful call is logged loudly (the NtAddAtom
-// patch is left in ntoskrnl text — latent PatchGuard bait) but still returns
-// TRUE, because from the caller's perspective the operation DID happen;
-// conflating "call failed" with "restore failed" once made callers free pool
-// the kernel still referenced.
+// Return value semantics are KernelCallStatus: NotExecuted means no target
+// call was dispatched; Executed means the target returned and the hook was
+// restored and verified; RestorationUncertain means the target may have run or
+// the hook may still be installed. In the last case callers must retain every
+// resource reachable by the target.
 //
-// The hook is a global patch with no trampoline: while installed, ANY thread
-// calling NtAddAtom lands on our target. The window is microseconds and the
-// syscall is legacy-rare — inherent to the kdmapper design. A static mutex
-// keeps concurrent CallKernelFunction users from interleaving hooks.
+// The hook is still a global code patch, so unsupported backends and
+// unaligned/out-of-range targets fail closed. The trampoline's KTHREAD gate
+// prevents unrelated NtAddAtom callers from reaching an arbitrary target.
 // No shellcode, no HalDispatchTable, no PTE self-reference games.
 template<typename T, typename... A>
-bool CallKernelFunction(byovd::IByovdBackend* backend, T* outResult, uint64_t funcVa, A... args) {
+KernelCallStatus CallKernelFunction(byovd::IByovdBackend* backend, T* outResult,
+                                    uint64_t funcVa, A... args) {
     static_assert(sizeof...(A) <= 4, "CallKernelFunction supports at most 4 register arguments");
     constexpr bool isVoid = std::is_same_v<T, void>;
 
     if constexpr (!isVoid) {
-        if (!outResult) return false;
+        if (!outResult) return KernelCallStatus::NotExecuted;
     } else {
         (void)outResult;
     }
-    if (!backend || !funcVa) return false;
+    if (!backend || !funcVa) return KernelCallStatus::NotExecuted;
+    if (!KernelCallsUsable()) return KernelCallStatus::RestorationUncertain;
 
     static std::mutex s_callMutex; // serialize hook install/call/remove
     std::lock_guard<std::mutex> callLock(s_callMutex);
 
-    uint8_t original[12]{};
-    if (!detail::InstallCallHook(backend, funcVa, original)) return false;
+    HANDLE globalHookMutex = detail::GlobalCallHookMutex();
+    if (!globalHookMutex || globalHookMutex == INVALID_HANDLE_VALUE)
+        return KernelCallStatus::NotExecuted;
+    const DWORD wait = WaitForSingleObject(globalHookMutex, 30000);
+    if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED)
+        return KernelCallStatus::NotExecuted;
+    struct MutexRelease {
+        HANDLE handle;
+        ~MutexRelease() { ReleaseMutex(handle); }
+    } mutexRelease{ globalHookMutex };
+
+    uint64_t gateVa = 0;
+    uint64_t ownerKthread = 0;
+    const auto gateStatus = detail::PrepareCallGate(backend, gateVa, ownerKthread);
+    if (gateStatus != KernelCallStatus::Executed)
+        return gateStatus;
+    if (!detail::ConfigureCallGate(backend, gateVa, ownerKthread, funcVa))
+        return KernelCallStatus::NotExecuted;
+
+    uint8_t original[8]{};
+    const auto install = detail::InstallCallHook(backend, gateVa, original);
+    if (install == detail::HookInstallStatus::Uncertain)
+        return KernelCallStatus::RestorationUncertain;
+    if (install != detail::HookInstallStatus::Installed)
+        return KernelCallStatus::NotExecuted;
 
     using Fn = T(__stdcall*)(A...);
     auto fn = reinterpret_cast<Fn>(detail::UserNtAddAtom());
+    if (!fn) {
+        return detail::RemoveCallHook(backend, original)
+            ? KernelCallStatus::NotExecuted
+            : KernelCallStatus::RestorationUncertain;
+    }
     Trace("kmem: syscall begin");
     if constexpr (isVoid) {
         fn(args...);
@@ -179,35 +250,43 @@ bool CallKernelFunction(byovd::IByovdBackend* backend, T* outResult, uint64_t fu
     Trace("kmem: syscall returned");
 
     if (!detail::RemoveCallHook(backend, original)) {
-        // The target RAN — its result is valid. The hook staying behind is a
-        // critical latent bug (NtAddAtom still jumps at funcVa), so scream:
         Trace("kmem: CRITICAL hook restore FAILED (NtAddAtom left patched)");
+        return KernelCallStatus::RestorationUncertain;
     }
-    return true; // the target executed regardless of restore outcome
+    return KernelCallStatus::Executed;
 }
 
 // Allocate kernel pool memory via ExAllocatePoolWithTag (NonPagedPool; NX on
 // Win8+, use ProtectKernelMemory to make it executable when needed).
-bool AllocateKernelMemory(byovd::IByovdBackend* backend, size_t size, uint64_t& outKernelVa);
+KernelCallStatus AllocateKernelMemory(byovd::IByovdBackend* backend, size_t size, uint64_t& outKernelVa);
 
 // Free pool memory allocated by AllocateKernelMemory (ExFreePoolWithTag).
-bool FreeKernelMemory(byovd::IByovdBackend* backend, uint64_t kernelVa);
+KernelCallStatus FreeKernelMemory(byovd::IByovdBackend* backend, uint64_t kernelVa);
 
 // Change page protection of a kernel range via MmSetPageProtection.
-bool ProtectKernelMemory(byovd::IByovdBackend* backend, uint64_t kernelVa, size_t size, uint32_t protect);
+KernelCallStatus ProtectKernelMemory(byovd::IByovdBackend* backend, uint64_t kernelVa,
+                                     size_t size, uint32_t protect,
+                                     bool* outProtected = nullptr);
 
 // Call a driver entry point in Ring 0. Returns the NTSTATUS produced by DriverEntry.
-uint32_t CallDriverEntry(byovd::IByovdBackend* backend, uint64_t driverEntryVa,
-                         uint64_t driverObjectVa, uint64_t registryPathVa);
+KernelCallStatus CallDriverEntry(byovd::IByovdBackend* backend, uint64_t driverEntryVa,
+                                  uint64_t driverObjectVa, uint64_t registryPathVa,
+                                  uint32_t& outStatus);
 
-// Recover the real kernel DRIVER_OBJECT that owns an already-opened device
-// handle (e.g. \\.\Nul). Uses NtQuerySystemInformation(SystemExtendedHandle
-// Information) to find our process's FILE_OBJECT, then walks
-// FILE_OBJECT->DeviceObject->DriverObject (both at offset 0x8 on x64).
-// Needed because the I/O manager rejects device opens whose owning
-// DRIVER_OBJECT is not an Object-Manager object (our synthetic pool object
-// fails IopParseDevice with ERROR_DEVICE_NOT_CONNECTED). Returns 0 on failure.
-uint64_t GetDriverObjectFromHandle(byovd::IByovdBackend* backend, HANDLE deviceHandle);
+struct RealDriverEntryResult {
+    KernelCallStatus callStatus = KernelCallStatus::NotExecuted;
+    uint32_t ioCreateStatus = 0xC0000001u;
+    uint32_t driverEntryStatus = 0xC0000001u;
+    uint64_t driverObject = 0;
+    uint64_t callbackStub = 0;
+};
+
+// Create an Object-Manager-owned DRIVER_OBJECT through IoCreateDriver and
+// invoke the mapped DriverEntry with it. This avoids borrowing and modifying
+// a live system driver's object. The returned status is DriverEntry's status
+// when the kernel call succeeds, or STATUS_UNSUCCESSFUL otherwise.
+RealDriverEntryResult CallDriverEntryWithRealObject(byovd::IByovdBackend* backend,
+                                                    uint64_t driverEntryVa);
 
 } // namespace kmem
 } // namespace hinv

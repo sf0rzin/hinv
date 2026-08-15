@@ -24,7 +24,7 @@ Think of it as a lab toolkit: read the code, run it in a VM, break it, fix it, a
 
 | Component | Description |
 |-----------|-------------|
-| `hinv_byovd` | Loads a vulnerable signed driver as a service and exposes kernel read/write primitives. Supports `dbutil_2_3.sys` (default fallback) and `iqvw64e.sys` (Intel, kdmapper-compatible `CopyMemory` IOCTL); additional backends can be added. |
+| `hinv_byovd` | Loads an explicitly supported vulnerable signed driver as a service and exposes kernel read/write primitives. Supports `dbutil_2_3.sys` and the reference `iqvw64e.sys` binary (Intel, kdmapper-compatible `CopyMemory` IOCTL); unknown names and unverified reference binaries are rejected. |
 | `hinv_kmem` | Kernel export resolution, arbitrary kernel function calls via a temporary `ntoskrnl!NtAddAtom` prologue hook (kdmapper-style), pool allocation (`ExAllocatePoolWithTag`), and page protection changes (`MmSetPageProtection`). |
 | `hinv_mapper` | Manual PE mapper: parses a `.sys` file, allocates kernel memory, copies sections, fixes relocations, resolves imports, and calls `DriverEntry`. |
 | `hinv_cleaner` | Kernel trace sanitizer: `PiDDBCacheTable` (AVL), `g_KernelHashBucketList` (ci.dll), `WdFilter` runtime driver list, and `MmUnloadedDrivers` prevention at unload time. Patterns ported from kdmapper, validated on Windows 11 26200. |
@@ -102,11 +102,13 @@ cl /std:c++20 /EHsc /DUNICODE /D_UNICODE /Fe:hinv.exe ^
 
 ### Load an unsigned driver into a lab VM
 
+Manual mapping, kernel allocation, protection changes, and trace cleaning require the Intel backend because they use its read-only physical-mapping primitive. The DbUtil backend is limited to plain kernel read/write operations.
+
 ```cmd
-hinv.exe load C:\lab\test_driver.sys --byovd C:\lab\dbutil_2_3.sys
+hinv.exe load C:\lab\test_driver.sys --byovd C:\lab\iqvw64e.sys
 ```
 
-Or with the Intel `iqvw64e.sys` vulnerable driver (the same one kdmapper uses; the backend is auto-detected by file name):
+The Intel `iqvw64e.sys` backend is selected by its exact file name and the reference SHA256 is verified before loading:
 
 ```cmd
 hinv.exe load C:\lab\test_driver.sys --byovd C:\lab\iqvw64e.sys
@@ -115,14 +117,16 @@ hinv.exe load C:\lab\test_driver.sys --byovd C:\lab\iqvw64e.sys
 ### Clean traces left by the vulnerable driver
 
 ```cmd
-hinv.exe clean dbutil_2_3.sys --byovd C:\lab\dbutil_2_3.sys
+hinv.exe clean iqvw64e.sys --byovd C:\lab\iqvw64e.sys
 ```
 
 ### Run a headless automation script
 
 ```cmd
-hinv.exe headless --byovd C:\lab\dbutil_2_3.sys --script script.txt
+hinv.exe headless --byovd C:\lab\iqvw64e.sys --script script.txt
 ```
+
+Scripts stop on the first `ERR` response; `exit` ends the script and session. Trace cleaning returns a failure when any applicable structure was not confirmed.
 
 Example `script.txt`:
 
@@ -131,7 +135,7 @@ Example `script.txt`:
 load C:\lab\test_driver.sys
 
 # Remove traces of the vulnerable driver from kernel logs
-clean dbutil_2_3.sys
+clean iqvw64e.sys
 
 # Shut down the engine
 exit
@@ -146,7 +150,7 @@ int main() {
     hinv::Client client;
     if (client.Connect()) {
         client.LoadDriver("C:\\lab\\test_driver.sys");
-        client.CleanKernelTraces("dbutil_2_3.sys");
+        client.CleanKernelTraces("iqvw64e.sys");
     }
     return 0;
 }
@@ -177,7 +181,7 @@ hinv::vmm::VirtualToPhysicalHyperDbg(0xFFFFF80000000000, physical);
 `hyperkd.sys` (HyperDbg's kernel debugger) imports not only from `ntoskrnl.exe` but also from its companion kernel-mode DLLs (`hyperhv.dll`, `hyperlog.dll`, `hypertrace.dll`, `kdserial.dll`). Because manually mapped modules are invisible to the loaded-module list, hinv keeps a **process-local registry of mapped modules**: after each successful `load`, the module's file name and base address are registered, and import resolution checks this registry before falling back to normally loaded modules. This makes chain-mapping possible in a single invocation — companions first, `hyperkd.sys` last:
 
 ```cmd
-hinv.exe load drivers\hyperhv.dll drivers\hyperlog.dll drivers\hypertrace.dll drivers\kdserial.dll drivers\hyperkd.sys --byovd drivers\iqvw64e.sys
+hinv.exe load drivers\hyperhv.dll drivers\hyperlog.dll drivers\hypertrace.dll drivers\kdserial.dll drivers\hyperkd.sys --byovd drivers\iqvw64e.sys --null-drvobj
 ```
 
 Prerequisites:
@@ -213,7 +217,7 @@ Do not use this software on systems you do not own or without explicit written p
 
 ## Lab validation
 
-The full pipeline is exercised on real machines during development. To reproduce (a disposable VM is still the recommended environment):
+The full pipeline must be exercised only inside a disposable VM with snapshots. Do not reproduce it on a real host machine:
 
 1. Obtain `iqvw64e.sys` — the public [LOLDrivers sample](https://www.loldrivers.io/drivers/1d2cdef1-de44-4849-80e5-e2fa288df681/) (SHA256 `4429f32db1cc70567919d7d47b844a91cf1329a6cd116f582305f3b7b60cd60b`).
 2. Build or pick any test `.sys` (a no-op `DriverEntry` returning `STATUS_SUCCESS` is enough).
@@ -240,15 +244,17 @@ Hard-won rules, baked in after live-fire debugging on Windows 11 26200:
 
 This is an **experimental prototype**. The following areas are incomplete or unstable:
 
-- **Kernel execution primitive** no longer uses shellcode, `HalDispatchTable`, or the (randomized-per-boot) PTE self-reference index. Kernel functions are called through a temporary `ntoskrnl!NtAddAtom` hook written via the Intel backend's physical-mapping IOCTLs (`0x25`/`0x19`/`0x1A`), kdmapper-style. This requires a backend with `WriteReadOnlyMemory` support — currently only `iqvw64e.sys`; the DbUtil backend can only read/write plain kernel memory.
+- **Kernel execution primitive** no longer uses shellcode, `HalDispatchTable`, or the (randomized-per-boot) PTE self-reference index. Kernel functions are called through a temporary `ntoskrnl!NtAddAtom` hook written via the Intel backend's physical-mapping IOCTLs (`0x25`/`0x19`/`0x1A`), kdmapper-style. The entry patch is one aligned atomic 8-byte jump to an executable gate that rejects unrelated `KTHREAD`s. This requires a backend with atomic read-only writes — currently only `iqvw64e.sys`; the DbUtil backend can only read/write plain kernel memory.
+- A kernel call has three outcomes: not executed, executed and restored, or restoration uncertain. The last outcome retains all reachable allocations and aborts further kernel calls; it is never reported as success.
+- **PsInvertedFunctionTable** is read-only to hinv. On builds without the supported `RtlAddFunctionTable` export, mapping an image with `.pdata` is rejected and its allocation is released. An epoch counter is not a substitute for the private kernel writer lock.
 - **MmUnloadedDrivers** is not cleaned post-hoc (the array layout is build-dependent and only written at unload). Instead, the backend arms prevention at unload: the vulnerable driver's own `KLDR_DATA_TABLE_ENTRY` name is zeroed so `MiRememberUnloadedDriver` skips recording it (kdmapper approach).
 - **PiDDBCacheTable / g_KernelHashBucketList / WdFilter** cleaners are implemented with kdmapper's patterns and kdmapper's locking discipline (`PiDDBLock` / `g_HashCacheLock` acquired via `ExAcquireResourceExclusiveLite`), resolved per build by pattern scan. If a pattern matches nothing on a future build, the cleaner fails closed with a log line.
-- **Driver object** is a minimal synthetic `DRIVER_OBJECT` allocated in kernel pool (no `\Driver\Null` hijack): only `DriverStart`/`DriverSize` are populated, which is enough for drivers that don't touch their object deeply — same approach as kdmapper.
-- **Vulnerable driver compatibility** varies by build. Two backends are implemented: `dbutil_2_3.sys` (default fallback for unrecognized file names) and `iqvw64e.sys` (kdmapper-compatible, `\\.\Nal` device, single `CopyMemory` IOCTL `0x80862007`; reference binary is the public LOLDrivers sample, SHA256 `4429f32db1cc70567919d7d47b844a91cf1329a6cd116f582305f3b7b60cd60b`). Verify the IOCTL structures against your specific binary before use. The Intel backend supplies read/write plus the kdmapper physical-mapping helpers (`GetPhysicalAddress`/`MapIoSpace`/`UnmapIoSpace`), which power read-only memory writes for the `NtAddAtom` hook.
+- **Driver object** is a minimal synthetic `DRIVER_OBJECT` allocated in kernel pool by default. With the legacy `--null-drvobj` flag, hinv calls `IoCreateDriver` so the mapped entry receives a real Object-Manager-owned object; it no longer hijacks `\Driver\Null`.
+- **Vulnerable driver compatibility** varies by build. Two backends are implemented: `dbutil_2_3.sys` (plain kernel read/write only) and the reference `iqvw64e.sys` (kdmapper-compatible, `\\.\Nal` device, single `CopyMemory` IOCTL `0x80862007`; the public LOLDrivers sample with SHA256 `4429f32db1cc70567919d7d47b844a91cf1329a6cd116f582305f3b7b60cd60b`). Unknown names are rejected, and the Intel profile verifies this SHA256 before loading. The Intel backend supplies read/write plus the kdmapper physical-mapping helpers (`GetPhysicalAddress`/`MapIoSpace`/`UnmapIoSpace`), which power read-only memory writes for the `NtAddAtom` hook.
 - **HyperDbg integration** uses structured packets for read/edit/VA2PA, honoring HyperDbg's `DEBUGGER_OPERATION_WAS_SUCCESSFUL` (`0xFFFFFFFF`) status convention and per-value 8-byte-slot edit layout. Arbitrary script commands (`!syscall`, `!monitor`, etc.) require the full `libhyperdbg` script engine and are not supported.
 - **EPT cloaking and text commands** (`!epthook2`, `!monitor`, …) were removed rather than kept as stubs that always fail; they require HyperDbg's `DEBUGGER_EVENT` machinery / script engine. Only the structured packet operations (`hinv_vmm`) remain.
-- **Named pipe security** uses a basic SYSTEM/Administrators ACL but does not validate client tokens.
-- **Automated tests** cover PE parser safety (section/import/relocation bounds and malformed inputs are rejected fail-closed); kernel-mode behavior is not automatically tested.
+- **Named pipe security** restricts access to local SYSTEM/Administrators and rejects remote clients. A client with local administrator rights can still control the session.
+- **Automated tests** cover PE parser safety (section/import/relocation/unwind bounds, fixed-base images, and malformed inputs are rejected fail-closed), refusal of unsynchronized IFT writes, and the SDK's timeout/result contract; kernel-mode behavior is not automatically tested.
 
 ---
 

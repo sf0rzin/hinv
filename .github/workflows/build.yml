@@ -9,6 +9,9 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
 
     steps:
     - uses: actions/checkout@v4
@@ -18,16 +21,23 @@ jobs:
 
     - name: Build with CMake
       run: |
-        cmake -B build -A x64
+        cmake -S . -B build -A x64 -DBUILD_TESTING=ON
         cmake --build build --config Release
 
-    - name: Run parser safety tests
+    - name: Run safety and SDK contract tests
       run: |
-        cmake --build build --config Release --target hinv_tests
-        ctest --test-dir build -C Release --output-on-failure
+        ctest --test-dir build -C Release --output-on-failure --no-tests=error --timeout 120
 
     - name: Upload binaries
       uses: actions/upload-artifact@v4
       with:
         name: hinv-windows-x64
         path: build/Release/hinv.exe
+
+    - name: Upload test logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: hinv-test-logs
+        path: build/Testing/Temporary/
+        if-no-files-found: ignore

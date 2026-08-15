@@ -11,11 +11,17 @@
 #include <sstream>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
+#include <memory>
 #include <vector>
 #include <cstring>
 #include <cstdlib>
 #include <chrono>
+#include <algorithm>
+#include <cwctype>
+#include <unordered_map>
+#include <unordered_set>
 #include <sddl.h>
 #include <aclapi.h>
 
@@ -24,28 +30,106 @@ namespace headless {
 
 static std::unique_ptr<byovd::IByovdBackend> g_backend;
 static std::mutex g_backendMutex;
+static std::mutex g_sessionMutex;
 static std::atomic<bool> g_running{ false };
+static std::atomic<bool> g_acceptingCommands{ false };
+static std::mutex g_stopEventMutex;
 static HANDLE g_stopEvent = nullptr;
 static std::wstring g_byovdPath; // used by 'clean' for the driver file timestamp
+static constexpr std::size_t MAX_CLIENTS = 32;
 struct ClientSlot {
     std::atomic<bool> done{ false };
     std::thread thread;
 };
 
 static std::mutex g_clientThreadsMutex;
+static std::condition_variable g_clientThreadsChanged;
 static std::vector<std::unique_ptr<ClientSlot>> g_clientThreads;
+static std::mutex g_commandAdmissionMutex;
+static std::mutex g_requestMutex;
+static std::unordered_map<std::string, std::string> g_completedRequests;
+static std::unordered_set<std::string> g_activeRequests;
+static std::unordered_set<std::wstring> g_loadedDriverPaths;
+static std::unordered_map<std::wstring, std::vector<uint8_t>> g_scriptModuleBytes;
 
-// Join and remove handlers that already finished. Caller must hold
-// g_clientThreadsMutex. Called on every accepted connection so short-lived
-// clients don't accumulate threads and native handles until shutdown.
-static void ReapFinishedClientsLocked() {
-    for (auto it = g_clientThreads.begin(); it != g_clientThreads.end();) {
-        if ((*it)->done.load() && (*it)->thread.joinable()) {
-            (*it)->thread.join();
-            it = g_clientThreads.erase(it);
-        } else {
-            ++it;
+static void SignalStop() {
+    g_running.store(false);
+    g_acceptingCommands.store(false);
+    {
+        std::lock_guard<std::mutex> lock(g_stopEventMutex);
+        if (g_stopEvent) SetEvent(g_stopEvent);
+    }
+    g_clientThreadsChanged.notify_all();
+}
+
+static bool BeginCommand() {
+    return g_running.load() && g_acceptingCommands.load();
+}
+
+static void BeginShutdownRequest() {
+    // Stop admitting new commands before the bye response is written. Existing
+    // commands are joined by RunHeadlessSession before the backend is torn
+    // down, so they cannot race a reset after the acknowledgement.
+    g_acceptingCommands.store(false);
+}
+
+static bool PublishStopEvent(HANDLE stopEvent) {
+    std::lock_guard<std::mutex> lock(g_stopEventMutex);
+    if (g_stopEvent) return false;
+    g_stopEvent = stopEvent;
+    if (!g_running.load()) SetEvent(stopEvent);
+    return true;
+}
+
+static void CloseStopEvent(HANDLE stopEvent) {
+    std::lock_guard<std::mutex> lock(g_stopEventMutex);
+    if (g_stopEvent == stopEvent) g_stopEvent = nullptr;
+    CloseHandle(stopEvent);
+}
+
+// Remove one completed slot under the lock, then join it after releasing the
+// lock. This remains safe if a handler later needs the tracking lock itself.
+static void ReapFinishedClients() {
+    for (;;) {
+        std::unique_ptr<ClientSlot> finished;
+        {
+            std::lock_guard<std::mutex> lock(g_clientThreadsMutex);
+            auto it = g_clientThreads.begin();
+            while (it != g_clientThreads.end() && !(*it)->done.load()) ++it;
+            if (it == g_clientThreads.end()) return;
+            finished = std::move(*it);
+            g_clientThreads.erase(it);
         }
+        if (finished->thread.joinable()) finished->thread.join();
+    }
+}
+
+static bool WaitForClientCapacity() {
+    for (;;) {
+        ReapFinishedClients();
+        std::unique_lock<std::mutex> lock(g_clientThreadsMutex);
+        if (!g_running.load()) return false;
+        if (g_clientThreads.size() < MAX_CLIENTS) return true;
+        g_clientThreadsChanged.wait(lock, [] {
+            if (!g_running.load()) return true;
+            for (const auto& slot : g_clientThreads) {
+                if (slot->done.load()) return true;
+            }
+            return false;
+        });
+    }
+}
+
+static void JoinAllClients() {
+    for (;;) {
+        std::unique_ptr<ClientSlot> slot;
+        {
+            std::lock_guard<std::mutex> lock(g_clientThreadsMutex);
+            if (g_clientThreads.empty()) return;
+            slot = std::move(g_clientThreads.back());
+            g_clientThreads.pop_back();
+        }
+        if (slot->thread.joinable()) slot->thread.join();
     }
 }
 
@@ -78,30 +162,61 @@ static std::string RestAfterCommand(const std::string& line) {
     return line.substr(start, end - start + 1);
 }
 
-std::string ProcessCommand(const std::string& command) {
+static std::wstring LoadPathKey(const std::wstring& path) {
+    std::error_code error;
+    const std::filesystem::path canonical =
+        std::filesystem::weakly_canonical(path, error);
+    std::wstring key = error ? path : canonical.native();
+    std::transform(key.begin(), key.end(), key.begin(), ::towlower);
+    return key;
+}
+
+static std::string ProcessCommandInternal(
+    const std::string& command, bool deferExit, bool* exitRequested) {
+    if (exitRequested) *exitRequested = false;
+    if (command.size() >= ipc::kMaxMessageBytes) return "ERR command too large";
+
     auto tokens = Tokenize(command);
     if (tokens.empty()) return "OK";
 
     const std::string& cmd = tokens[0];
 
-    if (cmd == "load") {
+    // Hold admission through the complete command. This makes the check and
+    // the privileged operation one critical section relative to `exit`: once
+    // bye is accepted, queued commands cannot begin underneath teardown.
+    std::unique_lock<std::mutex> admission(g_commandAdmissionMutex);
+
+    if (cmd == "load" || cmd == "load-null-drvobj") {
+        if (!BeginCommand()) return "ERR shutting down";
         std::string arg = RestAfterCommand(command);
-        if (arg.empty()) return "ERR usage: load <path> [null-drvobj]";
-        // Optional trailing token enables the \Driver\Null hijack (required for
-        // drivers that create devices, e.g. hyperkd).
-        bool nullDrvObj = false;
-        const std::string suffix = " null-drvobj";
-        if (arg.size() > suffix.size() &&
-            arg.compare(arg.size() - suffix.size(), suffix.size(), suffix) == 0) {
-            nullDrvObj = true;
-            arg.erase(arg.size() - suffix.size());
-            while (!arg.empty() && (arg.back() == ' ' || arg.back() == '\t')) arg.pop_back();
+        if (arg.empty()) {
+            return cmd == "load"
+                ? "ERR usage: load <utf8-path>"
+                : "ERR usage: load-null-drvobj <utf8-path>";
         }
-        std::wstring path = util::ToWstring(arg); // console input is ACP/UTF-8, not bytes
+        if (arg.find('\0') != std::string::npos) return "ERR invalid UTF-8 path";
+        std::wstring path;
+        if (!util::Utf8ToWide(arg, &path)) return "ERR invalid UTF-8 path";
+        const std::wstring pathKey = LoadPathKey(path);
+        if (g_loadedDriverPaths.find(pathKey) != g_loadedDriverPaths.end())
+            return "ERR module already loaded (request may have completed after a timeout)";
+
+        const bool nullDrvObj = cmd == "load-null-drvobj";
         std::lock_guard<std::mutex> lock(g_backendMutex);
         if (!g_backend) return "ERR no BYOVD backend loaded";
-        auto result = mapper::MapDriver(g_backend.get(), path, nullDrvObj);
-        if (!result.success) return "ERR map failed: " + result.error;
+        mapper::MappingResult result;
+        const auto cachedModule = g_scriptModuleBytes.find(pathKey);
+        if (cachedModule != g_scriptModuleBytes.end()) {
+            result = mapper::MapDriverBytes(g_backend.get(), cachedModule->second, nullDrvObj);
+        } else {
+            result = mapper::MapDriver(g_backend.get(), path, nullDrvObj);
+        }
+        if (!result.success) {
+            if (result.imageBase != 0)
+                g_loadedDriverPaths.insert(pathKey);
+            return "ERR map failed: " + result.error;
+        }
+        g_loadedDriverPaths.insert(pathKey);
         std::ostringstream ss;
         ss << "OK image=0x" << std::hex << result.imageBase
            << " status=0x" << result.driverEntryStatus << std::dec;
@@ -109,19 +224,26 @@ std::string ProcessCommand(const std::string& command) {
     }
 
     if (cmd == "clean") {
+        if (!BeginCommand()) return "ERR shutting down";
         std::string arg = RestAfterCommand(command);
-        if (arg.empty()) return "ERR usage: clean <drivername>";
-        std::wstring name = util::ToWstring(arg);
+        if (arg.empty()) return "ERR usage: clean <utf8-drivername>";
+        if (arg.find('\0') != std::string::npos) return "ERR invalid UTF-8 driver name";
+        std::wstring name;
+        if (!util::Utf8ToWide(arg, &name)) return "ERR invalid UTF-8 driver name";
         std::lock_guard<std::mutex> lock(g_backendMutex);
         if (!g_backend) return "ERR no BYOVD backend loaded";
         uint32_t timestamp = cleaner::GetDriverFileTimestamp(g_byovdPath);
         auto result = cleaner::CleanDriverTraces(g_backend.get(), name, timestamp);
-        if (!result.piDdbCache && !result.hashBucketList && !result.wdFilter)
-            return "ERR " + std::string(result.error.begin(), result.error.end());
+        if ((!result.piDdbCache && !result.hashBucketList && !result.wdFilter) || !result.complete) {
+            std::string error;
+            if (!util::WideToUtf8(result.error, &error)) error = "trace cleanup failed";
+            return "ERR " + error;
+        }
         return "OK";
     }
 
     if (cmd == "status") {
+        if (!BeginCommand()) return "ERR shutting down";
         std::string backendState;
         {
             std::lock_guard<std::mutex> lock(g_backendMutex);
@@ -134,94 +256,273 @@ std::string ProcessCommand(const std::string& command) {
     }
 
     if (cmd == "initvmm") {
+        if (!BeginCommand()) return "ERR shutting down";
         return vmm::InitializeVmm() ? "OK" : "ERR init failed";
     }
 
     if (cmd == "exit") {
-        g_running = false;
-        if (g_stopEvent) SetEvent(g_stopEvent);
+        if (tokens.size() != 1) return "ERR usage: exit";
+        if (!BeginCommand()) return "ERR shutting down";
+        BeginShutdownRequest();
+        if (exitRequested) *exitRequested = true;
+        if (!deferExit) SignalStop();
         return "OK bye";
     }
 
     return "ERR unknown command";
 }
 
+std::string ProcessCommand(const std::string& command) {
+    return ProcessCommandInternal(command, false, nullptr);
+}
+
+static bool ParseRequestEnvelope(const std::string& request, std::string& id,
+                                 std::string& command) {
+    id.clear();
+    command = request;
+    if (request.size() < 3 || request[0] != '@') return true;
+    const size_t separator = request.find(' ');
+    if (separator <= 1 || separator > 65) return true;
+    for (size_t i = 1; i < separator; ++i) {
+        const char c = request[i];
+        const bool hex = (c >= '0' && c <= '9') ||
+                         (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!hex && c != '-') return true;
+    }
+    id = request.substr(1, separator - 1);
+    command = request.substr(separator + 1);
+    return !command.empty();
+}
+
+static std::string ProcessClientRequest(const std::string& request) {
+    std::string id;
+    std::string command;
+    if (!ParseRequestEnvelope(request, id, command)) return "ERR invalid request envelope";
+    if (id.empty()) return ProcessCommandInternal(command, true, nullptr);
+
+    {
+        std::lock_guard<std::mutex> lock(g_requestMutex);
+        const auto completed = g_completedRequests.find(id);
+        if (completed != g_completedRequests.end()) {
+            if (completed->second == "OK bye") SignalStop();
+            return "@" + id + " " + completed->second;
+        }
+        if (!g_activeRequests.insert(id).second)
+            return "@" + id + " ERR operation in progress";
+    }
+
+    std::string response;
+    try {
+        response = ProcessCommandInternal(command, true, nullptr);
+    } catch (...) {
+        response = "ERR command processing failed";
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_requestMutex);
+        g_activeRequests.erase(id);
+        g_completedRequests[id] = response;
+        while (g_completedRequests.size() > 256)
+            g_completedRequests.erase(g_completedRequests.begin());
+    }
+    return "@" + id + " " + response;
+}
+
 // ---------------------------------------------------------------------------
 // Script execution
 // ---------------------------------------------------------------------------
 
-bool ExecuteScriptFile(const std::string& scriptPath) {
+static bool ReadScriptFile(const std::filesystem::path& scriptPath,
+                           std::vector<std::string>& lines) {
+    lines.clear();
     if (scriptPath.empty()) return true;
-
-    std::ifstream file(scriptPath);
+    std::ifstream file(scriptPath, std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "[hinv::headless] Cannot open script: " << scriptPath << "\n";
+        std::wcerr << L"[hinv::headless] Cannot open script: " << scriptPath.native() << L"\n";
         return false;
     }
 
+    bool firstLine = true;
     std::string line;
     while (std::getline(file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        std::string resp = ProcessCommand(line);
-        std::cout << "[hinv::headless] [CMD] " << line << " -> " << resp << "\n";
+        if (line.size() >= ipc::kMaxMessageBytes)
+            return false;
+        if (firstLine) {
+            firstLine = false;
+            if (line.size() >= 3 &&
+                static_cast<unsigned char>(line[0]) == 0xEF &&
+                static_cast<unsigned char>(line[1]) == 0xBB &&
+                static_cast<unsigned char>(line[2]) == 0xBF)
+                line.erase(0, 3);
+        }
+        lines.push_back(line);
     }
-    // getline stops on error too: an I/O failure mid-script is not success.
     if (file.bad()) {
-        std::cerr << "[hinv::headless] Script read error: " << scriptPath << "\n";
+        std::wcerr << L"[hinv::headless] Script read error: " << scriptPath.native() << L"\n";
         return false;
     }
     return true;
+}
+
+static bool ValidateScriptLines(const std::vector<std::string>& lines) {
+    for (const auto& line : lines) {
+        if (line.empty() || line[0] == '#') continue;
+        const auto tokens = Tokenize(line);
+        if (tokens.empty()) continue;
+        const std::string& command = tokens[0];
+        if (command == "load" || command == "load-null-drvobj") {
+            const std::string arg = RestAfterCommand(line);
+            std::wstring path;
+            std::vector<uint8_t> bytes;
+            std::string error;
+            if (arg.empty() || !util::Utf8ToWide(arg, &path) ||
+                !mapper::ReadDriverFileBytes(path, bytes) ||
+                !mapper::ValidateDriverImageBytes(bytes, &error)) {
+                std::cerr << "[hinv::headless] Script preflight rejected module: " << arg
+                          << " (" << error << ")\n";
+                return false;
+            }
+            g_scriptModuleBytes[LoadPathKey(path)] = std::move(bytes);
+            continue;
+        }
+        if (command == "clean") {
+            const std::string arg = RestAfterCommand(line);
+            std::wstring name;
+            if (arg.empty() || !util::Utf8ToWide(arg, &name)) return false;
+            continue;
+        }
+        if (command == "status" || command == "initvmm") {
+            if (tokens.size() != 1) return false;
+            continue;
+        }
+        if (command == "exit") {
+            if (tokens.size() != 1) return false;
+            continue;
+        }
+        std::cerr << "[hinv::headless] Script contains an unknown command: " << command << "\n";
+        return false;
+    }
+    return true;
+}
+
+static bool ExecuteScriptLines(const std::vector<std::string>& lines) {
+    const bool stopAware = g_running.load();
+    bool firstLine = true;
+    for (const auto& originalLine : lines) {
+        std::string line = originalLine;
+        if (firstLine) firstLine = false;
+        if (line.empty() || line[0] == '#') continue;
+        bool exitRequested = false;
+        std::string resp = ProcessCommandInternal(line, false, &exitRequested);
+        std::cout << "[hinv::headless] [CMD] " << line << " -> " << resp << "\n";
+        if (resp.rfind("ERR", 0) == 0) {
+            std::cerr << "[hinv::headless] Command failed: " << line << "\n";
+            return false;
+        }
+        if (exitRequested || (stopAware && !g_running.load())) break;
+    }
+    return true;
+}
+
+bool ExecuteScriptFile(const std::filesystem::path& scriptPath) {
+    if (scriptPath.empty()) return true;
+    std::vector<std::string> lines;
+    return ReadScriptFile(scriptPath, lines) &&
+           ValidateScriptLines(lines) && ExecuteScriptLines(lines);
 }
 
 // ---------------------------------------------------------------------------
 // Named Pipe IPC server
 // ---------------------------------------------------------------------------
 
-static void HandleClient(HANDLE hPipe) {
-    constexpr size_t BUF_SIZE = 4096;
+static bool WriteResponse(
+    HANDLE hPipe, HANDLE stopEvent, const std::string& response, bool exitRequested) {
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!overlapped.hEvent) return false;
+
+    DWORD written = 0;
+    BOOL ok = WriteFile(hPipe, response.data(), static_cast<DWORD>(response.size()),
+                        &written, &overlapped);
+    const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    if (!ok && error == ERROR_IO_PENDING) {
+        DWORD wait = WAIT_FAILED;
+        if (exitRequested) {
+            // The exit response gets a bounded chance to complete before this
+            // handler signals the shared stop event.
+            wait = WaitForSingleObject(overlapped.hEvent, ipc::OperationTimeoutMs());
+            if (wait == WAIT_OBJECT_0) {
+                ok = GetOverlappedResult(hPipe, &overlapped, &written, FALSE);
+            }
+        } else {
+            HANDLE waits[2] = { stopEvent, overlapped.hEvent };
+            wait = WaitForMultipleObjects(
+                2, waits, FALSE, ipc::OperationTimeoutMs());
+            if (wait == WAIT_OBJECT_0 + 1) {
+                ok = GetOverlappedResult(hPipe, &overlapped, &written, FALSE);
+            }
+        }
+
+        if ((!exitRequested && wait != WAIT_OBJECT_0 + 1) ||
+            (exitRequested && wait != WAIT_OBJECT_0)) {
+            CancelIoEx(hPipe, &overlapped);
+            DWORD ignored = 0;
+            GetOverlappedResult(hPipe, &overlapped, &ignored, TRUE);
+            ok = FALSE;
+        }
+    }
+
+    CloseHandle(overlapped.hEvent);
+    return ok && written == response.size();
+}
+
+static void HandleClient(HANDLE hPipe, HANDLE stopEvent) {
+    constexpr std::size_t BUF_SIZE = 4096;
     char buffer[BUF_SIZE]{};
 
-    while (g_running) {
+    while (g_running.load()) {
         // Read one complete message. In message mode an oversized message
-        // arrives as ERROR_MORE_DATA chunks — accumulate instead of dropping
-        // the connection (the previous behavior closed the pipe on any client
-        // sending more than 4095 bytes).
-        constexpr size_t MAX_MESSAGE = 65536;
+        // arrives as ERROR_MORE_DATA chunks. Check every chunk, including the
+        // final successful one, against the shared protocol cap.
         std::string request;
         bool fatal = false;
         for (;;) {
-            OVERLAPPED ovRead{};
-            ovRead.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            if (!ovRead.hEvent) { fatal = true; break; }
+            OVERLAPPED overlapped{};
+            overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!overlapped.hEvent) { fatal = true; break; }
 
             DWORD bytesRead = 0;
-            BOOL ok = ReadFile(hPipe, buffer, BUF_SIZE - 1, &bytesRead, &ovRead);
-            DWORD err = GetLastError();
-            if (!ok && err == ERROR_IO_PENDING) {
-                HANDLE handles[2] = { g_stopEvent, ovRead.hEvent };
+            BOOL ok = ReadFile(
+                hPipe, buffer, static_cast<DWORD>(BUF_SIZE), &bytesRead, &overlapped);
+            DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+            if (!ok && error == ERROR_IO_PENDING) {
+                HANDLE handles[2] = { stopEvent, overlapped.hEvent };
                 DWORD wait = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
                 if (wait != WAIT_OBJECT_0 + 1) {
-                    // Stop requested or wait failed: cancel and WAIT for the I/O to
-                    // complete. The OVERLAPPED must stay valid until the operation
-                    // finishes, so it cannot go out of scope while still pending.
-                    CancelIo(hPipe);
-                    GetOverlappedResult(hPipe, &ovRead, &bytesRead, TRUE);
-                    CloseHandle(ovRead.hEvent);
+                    CancelIoEx(hPipe, &overlapped);
+                    GetOverlappedResult(hPipe, &overlapped, &bytesRead, TRUE);
+                    CloseHandle(overlapped.hEvent);
                     fatal = true;
                     break;
                 }
-                ok = GetOverlappedResult(hPipe, &ovRead, &bytesRead, TRUE);
-                err = GetLastError();
+                ok = GetOverlappedResult(hPipe, &overlapped, &bytesRead, FALSE);
+                error = ok ? ERROR_SUCCESS : GetLastError();
             }
-            CloseHandle(ovRead.hEvent);
+            CloseHandle(overlapped.hEvent);
 
-            if (!ok && err == ERROR_MORE_DATA && bytesRead > 0) {
-                request.append(buffer, bytesRead);
-                if (request.size() > MAX_MESSAGE) { fatal = true; break; }
+            if (bytesRead > ipc::kMaxMessageBytes - request.size()) {
+                fatal = true;
+                break;
+            }
+            request.append(buffer, bytesRead);
+            if (ok) {
+                if (bytesRead == 0) fatal = true;
+                break;
+            }
+            if (error == ERROR_MORE_DATA && bytesRead != 0 &&
+                request.size() < ipc::kMaxMessageBytes) {
                 continue;
             }
-            if (!ok || bytesRead == 0) { fatal = true; break; }
-            request.append(buffer, bytesRead);
+            fatal = true;
             break;
         }
         if (fatal || request.empty()) break;
@@ -229,43 +530,45 @@ static void HandleClient(HANDLE hPipe) {
         while (!request.empty() && (request.back() == '\n' || request.back() == '\r'))
             request.pop_back();
 
-        std::string response = ProcessCommand(request) + "\n";
+        std::string requestId;
+        std::string command;
+        ParseRequestEnvelope(request, requestId, command);
+        const auto commandTokens = Tokenize(command);
+        const bool exitRequested = !commandTokens.empty() && commandTokens[0] == "exit";
+        std::string response = ProcessClientRequest(request);
+        if (response.size() >= ipc::kMaxMessageBytes)
+            response = "ERR response too large";
+        response.push_back('\n');
 
-        OVERLAPPED ovWrite{};
-        ovWrite.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!ovWrite.hEvent) break;
-
-        DWORD written = 0;
-        BOOL ok = WriteFile(hPipe, response.c_str(), static_cast<DWORD>(response.size()), &written, &ovWrite);
-        if (!ok && GetLastError() == ERROR_IO_PENDING) {
-            ok = GetOverlappedResult(hPipe, &ovWrite, &written, TRUE);
-        }
-        CloseHandle(ovWrite.hEvent);
-
-        if (request == "exit") break;
+        const bool wroteResponse =
+            WriteResponse(hPipe, stopEvent, response, exitRequested);
+        if (exitRequested) SignalStop();
+        if (!wroteResponse || exitRequested) break;
     }
 
     // No FlushFileBuffers here: on the server side it blocks until the client
-    // drains the response, so an idle client could hang session shutdown (the
-    // join in RunHeadlessSession) forever. The response write above already
-    // completed synchronously via GetOverlappedResult.
+    // drains the response. The bounded overlapped write above is sufficient.
     DisconnectNamedPipe(hPipe);
     CloseHandle(hPipe);
 }
 
-static void StartIpcControlServer() {
+static bool StartIpcControlServer(HANDLE stopEvent) {
     std::cout << "[hinv::headless] IPC server listening on " << "\\\\.\\pipe\\hinv_headless" << "\n";
-    g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_stopEvent) return;
 
     // Restrict pipe access to SYSTEM and Administrators.
     PSECURITY_DESCRIPTOR sd = nullptr;
+    auto fail = [&](const char* operation, DWORD error = ERROR_SUCCESS) {
+        std::cerr << "[hinv::headless] " << operation << " failed";
+        if (error != ERROR_SUCCESS) std::cerr << ": " << error;
+        std::cerr << "\n";
+        if (sd) LocalFree(sd);
+        SignalStop();
+        return false;
+    };
+
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
             L"D:P(A;;GA;;;SY)(A;;GA;;;BA)", SDDL_REVISION_1, &sd, nullptr)) {
-        std::cerr << "[hinv::headless] Failed to build security descriptor\n";
-        CloseHandle(g_stopEvent);
-        g_stopEvent = nullptr; // ownership stays consistent: RunHeadlessSession closes it otherwise
-        return;
+        return fail("ConvertStringSecurityDescriptorToSecurityDescriptorW", GetLastError());
     }
 
     SECURITY_ATTRIBUTES sa{};
@@ -273,12 +576,20 @@ static void StartIpcControlServer() {
     sa.lpSecurityDescriptor = sd;
     sa.bInheritHandle = FALSE;
 
-    while (g_running) {
+    bool firstPipe = true;
+    while (g_running.load()) {
+        // A listening instance also counts toward nMaxInstances. Do not call
+        // CreateNamedPipeW until a tracked handler slot is genuinely free.
+        if (!WaitForClientCapacity()) break;
+        if (!g_running.load()) break;
+
+        DWORD openMode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+        if (firstPipe) openMode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
         HANDLE hPipe = CreateNamedPipeW(
             HINV_PIPE_NAME,
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            PIPE_UNLIMITED_INSTANCES,
+            openMode,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            static_cast<DWORD>(MAX_CLIENTS),
             4096,
             4096,
             0,
@@ -286,62 +597,99 @@ static void StartIpcControlServer() {
         );
 
         if (hPipe == INVALID_HANDLE_VALUE) {
-            std::cerr << "[hinv::headless] CreateNamedPipe failed: " << GetLastError() << "\n";
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
+            return fail("CreateNamedPipeW", GetLastError());
+        }
+        firstPipe = false;
+
+        OVERLAPPED overlapped{};
+        overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!overlapped.hEvent) {
+            const DWORD error = GetLastError();
+            CloseHandle(hPipe);
+            return fail("CreateEventW(connect)", error);
         }
 
-        OVERLAPPED ov{};
-        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!ov.hEvent) { CloseHandle(hPipe); continue; }
-
-        BOOL connected = ConnectNamedPipe(hPipe, &ov);
-        DWORD err = GetLastError();
-        if (!connected && err == ERROR_IO_PENDING) {
-            HANDLE handles[2] = { g_stopEvent, ov.hEvent };
+        BOOL connected = ConnectNamedPipe(hPipe, &overlapped);
+        DWORD connectError = connected ? ERROR_SUCCESS : GetLastError();
+        DWORD fatalConnectError = ERROR_SUCCESS;
+        if (!connected && connectError == ERROR_IO_PENDING) {
+            HANDLE handles[2] = { stopEvent, overlapped.hEvent };
             DWORD wait = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
             if (wait == WAIT_OBJECT_0 + 1) {
-                // The connect operation signaled; confirm it actually
-                // succeeded instead of assuming a connection.
                 DWORD transferred = 0;
-                connected = GetOverlappedResult(hPipe, &ov, &transferred, FALSE);
+                connected = GetOverlappedResult(
+                    hPipe, &overlapped, &transferred, FALSE);
+                connectError = connected ? ERROR_SUCCESS : GetLastError();
             } else {
-                // Stop requested or wait failed: cancel and wait for the
-                // pending connect to complete before ov goes out of scope.
-                CancelIo(hPipe);
+                if (wait == WAIT_FAILED) fatalConnectError = GetLastError();
+                CancelIoEx(hPipe, &overlapped);
                 DWORD ignored = 0;
-                GetOverlappedResult(hPipe, &ov, &ignored, TRUE);
+                GetOverlappedResult(hPipe, &overlapped, &ignored, TRUE);
                 connected = FALSE;
-                if (wait == WAIT_OBJECT_0) {
-                    CloseHandle(ov.hEvent);
-                    CloseHandle(hPipe);
-                    break;
-                }
+                connectError = ERROR_OPERATION_ABORTED;
             }
-        } else if (!connected && err == ERROR_PIPE_CONNECTED) {
+        } else if (!connected && connectError == ERROR_PIPE_CONNECTED) {
             connected = TRUE;
+            connectError = ERROR_SUCCESS;
         }
-        CloseHandle(ov.hEvent);
+        CloseHandle(overlapped.hEvent);
 
-        if (connected && g_running) {
+        if (fatalConnectError != ERROR_SUCCESS) {
+            CloseHandle(hPipe);
+            return fail("WaitForMultipleObjects(connect)", fatalConnectError);
+        }
+
+        if (!connected) {
+            CloseHandle(hPipe);
+            if (!g_running.load()) break;
+            if (connectError == ERROR_NO_DATA || connectError == ERROR_PIPE_NOT_CONNECTED ||
+                connectError == ERROR_OPERATION_ABORTED)
+                continue;
+            return fail("ConnectNamedPipe", connectError);
+        }
+
+        if (g_running.load()) {
             // Track client threads so the session can join them on shutdown;
             // a detached thread could outlive the BYOVD backend it uses.
-            auto slot = std::make_unique<ClientSlot>();
+            std::unique_ptr<ClientSlot> slot;
+            try {
+                slot = std::make_unique<ClientSlot>();
+            } catch (...) {
+                CloseHandle(hPipe);
+                return fail("client slot allocation");
+            }
             ClientSlot* raw = slot.get();
-            raw->thread = std::thread([raw, hPipe]() {
-                HandleClient(hPipe);
-                raw->done.store(true);
-            });
-            std::lock_guard<std::mutex> lock(g_clientThreadsMutex);
-            g_clientThreads.push_back(std::move(slot));
-            ReapFinishedClientsLocked();
+            try {
+                raw->thread = std::thread([raw, hPipe, stopEvent]() {
+                    try {
+                        HandleClient(hPipe, stopEvent);
+                    } catch (...) {
+                        DisconnectNamedPipe(hPipe);
+                        CloseHandle(hPipe);
+                    }
+                    raw->done.store(true);
+                    g_clientThreadsChanged.notify_all();
+                });
+            } catch (...) {
+                CloseHandle(hPipe);
+                return fail("client thread creation");
+            }
+
+            try {
+                std::lock_guard<std::mutex> lock(g_clientThreadsMutex);
+                g_clientThreads.push_back(std::move(slot));
+            } catch (...) {
+                SignalStop();
+                if (slot && slot->thread.joinable()) slot->thread.join();
+                return fail("client thread tracking");
+            }
         } else {
             CloseHandle(hPipe);
         }
     }
     LocalFree(sd);
-    // g_stopEvent is closed by RunHeadlessSession only after every client
-    // thread has been joined, so a handler never waits on a closed handle.
+    // RunHeadlessSession closes stopEvent only after every handler has joined.
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -349,50 +697,156 @@ static void StartIpcControlServer() {
 // ---------------------------------------------------------------------------
 
 bool RunHeadlessSession(const HeadlessConfig& config) {
-    g_running = true;
+    std::unique_lock<std::mutex> sessionLock(g_sessionMutex, std::try_to_lock);
+    if (!sessionLock.owns_lock()) {
+        std::cerr << "[hinv::headless] Another session is already running\n";
+        return false;
+    }
 
-    if (!config.byovdDriverPath.empty()) {
+    {
         std::lock_guard<std::mutex> lock(g_backendMutex);
-        g_backend = byovd::LoadVulnerableDriver(config.byovdDriverPath);
-        if (!g_backend) {
-            std::cerr << "[hinv::headless] Failed to load BYOVD driver\n";
-            g_running = false;
+        if (g_backend) {
+            std::cerr << "[hinv::headless] Session state is still active\n";
             return false;
         }
-        g_byovdPath = config.byovdDriverPath;
+    }
+
+    try {
+        std::lock_guard<std::mutex> lock(g_clientThreadsMutex);
+        if (!g_clientThreads.empty()) {
+            std::cerr << "[hinv::headless] Client state is still active\n";
+            return false;
+        }
+        g_clientThreads.reserve(MAX_CLIENTS);
+    } catch (...) {
+        std::cerr << "[hinv::headless] Cannot allocate client tracking state\n";
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_requestMutex);
+        g_completedRequests.clear();
+        g_activeRequests.clear();
+    }
+    g_scriptModuleBytes.clear();
+
+    std::vector<std::string> scriptLines;
+    if (!config.byovdDriverPath.empty()) {
+        std::vector<uint8_t> byovdBytes;
+        if (!mapper::ReadDriverFileBytes(config.byovdDriverPath, byovdBytes) ||
+            cleaner::GetDriverFileTimestamp(config.byovdDriverPath) == 0) {
+            std::cerr << "[hinv::headless] BYOVD preflight failed\n";
+            return false;
+        }
+    }
+    if (!config.scriptPath.empty()) {
+        // Open and validate the complete script, including every module path,
+        // before loading a privileged BYOVD. A typo cannot leave the backend
+        // service resident anymore.
+        if (!ReadScriptFile(config.scriptPath, scriptLines) ||
+            !ValidateScriptLines(scriptLines)) {
+            std::cerr << "[hinv::headless] Script preflight failed\n";
+            return false;
+        }
+    }
+
+    g_running.store(true);
+    g_acceptingCommands.store(false);
+    HANDLE stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!stopEvent) {
+        g_running.store(false);
+        std::cerr << "[hinv::headless] Cannot create stop event: " << GetLastError() << "\n";
+        return false;
+    }
+    if (!PublishStopEvent(stopEvent)) {
+        CloseHandle(stopEvent);
+        SignalStop();
+        std::cerr << "[hinv::headless] Stop event state is still active\n";
+        return false;
+    }
+    g_acceptingCommands.store(true);
+
+    auto cleanup = [stopEvent] {
+        SignalStop();
+        CloseStopEvent(stopEvent);
+        bool backendOk = true;
+        {
+            std::lock_guard<std::mutex> lock(g_backendMutex);
+            if (g_backend) {
+                backendOk = g_backend->Shutdown();
+                // A false shutdown deliberately leaves the backend reachable
+                // for recovery; destroying it would discard the only handle
+                // and service ownership state needed for a safe retry.
+                if (backendOk) {
+                    g_backend.reset();
+                    g_byovdPath.clear();
+                }
+            }
+        }
+        const bool vmmOk = vmm::ShutdownVmm();
+        return backendOk && vmmOk;
+    };
+
+    if (g_running.load() && !config.byovdDriverPath.empty()) {
+        bool loaded = false;
+        {
+            std::lock_guard<std::mutex> lock(g_backendMutex);
+            g_backend = byovd::LoadVulnerableDriver(config.byovdDriverPath);
+            loaded = static_cast<bool>(g_backend);
+            if (loaded) g_byovdPath = config.byovdDriverPath;
+        }
+        if (!loaded) {
+            std::cerr << "[hinv::headless] Failed to load BYOVD driver\n";
+            const bool cleanupOk = cleanup();
+            if (!cleanupOk) std::cerr << "[hinv::headless] Cleanup also failed\n";
+            return false;
+        }
         std::wcout << L"[hinv::headless] BYOVD backend loaded: " << config.byovdDriverPath << L"\n";
     }
 
-    if (!config.scriptPath.empty()) {
-        // A failed script (missing file, read error) must not fall through into
-        // the blocking IPC server — abort instead of hanging a batch run.
-        if (!ExecuteScriptFile(config.scriptPath)) {
-            std::cerr << "[hinv::headless] Script failed, aborting session\n";
+    if (g_running.load() && !scriptLines.empty() && !ExecuteScriptLines(scriptLines)) {
+        std::cerr << "[hinv::headless] Script failed, aborting session\n";
+        const bool cleanupOk = cleanup();
+        if (!cleanupOk) std::cerr << "[hinv::headless] Cleanup also failed\n";
+        return false;
+    }
+
+    bool ipcFailed = false;
+    std::thread ipcThread;
+    if (g_running.load()) {
+        try {
+            ipcThread = std::thread([&] {
+                try {
+                    if (!StartIpcControlServer(stopEvent)) ipcFailed = true;
+                } catch (...) {
+                    ipcFailed = true;
+                    SignalStop();
+                }
+            });
+        } catch (...) {
+            SignalStop();
+            JoinAllClients();
+            const bool cleanupOk = cleanup();
+            if (!cleanupOk) std::cerr << "[hinv::headless] Cleanup also failed\n";
             return false;
         }
+        ipcThread.join(); // blocks until exit, StopHeadlessSession, or IPC failure
     }
 
-    std::thread ipcThread(StartIpcControlServer);
-    ipcThread.join(); // blocks until exit
+    // Signal before joining even if an unexpected server return omitted it.
+    // Handlers may be waiting in ReadFile and can still use the backend until
+    // their thread exits.
+    SignalStop();
+    JoinAllClients();
 
-    // Join every client handler before tearing down the backend: a thread
-    // could still be inside ProcessCommand using g_backend.
-    {
-        std::lock_guard<std::mutex> lock(g_clientThreadsMutex);
-        for (auto& slot : g_clientThreads) {
-            if (slot->thread.joinable()) slot->thread.join();
-        }
-        g_clientThreads.clear();
+    const bool cleanupOk = cleanup();
+    if (ipcFailed) {
+        std::cerr << "[hinv::headless] IPC server failed\n";
+        return false;
     }
-
-    if (g_stopEvent) {
-        CloseHandle(g_stopEvent);
-        g_stopEvent = nullptr;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_backendMutex);
-        g_backend.reset();
+    if (!cleanupOk) {
+        std::cerr << "[hinv::headless] Session cleanup failed\n";
+        return false;
     }
 
     std::cout << "[hinv::headless] Session ended\n";
@@ -400,8 +854,7 @@ bool RunHeadlessSession(const HeadlessConfig& config) {
 }
 
 void StopHeadlessSession() {
-    g_running = false;
-    if (g_stopEvent) SetEvent(g_stopEvent);
+    SignalStop();
 }
 
 } // namespace headless

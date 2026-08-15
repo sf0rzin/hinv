@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <vector>
 #include <mutex>
+#include <limits>
 
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
@@ -23,6 +24,23 @@ static_assert(sizeof(DebugerReadMemoryPacket) == 48, "DEBUGGER_READ_MEMORY wire 
 static_assert(sizeof(DebugerEditMemoryPacket) == 40, "DEBUGGER_EDIT_MEMORY wire size drifted");
 
 namespace {
+
+enum class VmmSessionState {
+    Unopened,
+    Active,
+    Closed
+};
+
+constexpr size_t MAX_VMM_TRANSFER_SIZE = 0x10000;
+
+HANDLE g_vmmDevice = INVALID_HANDLE_VALUE;
+std::mutex g_vmmDeviceMutex;
+VmmSessionState g_vmmSessionState = VmmSessionState::Unopened;
+
+bool IsValidTransferRange(uint64_t address, size_t size) {
+    return size != 0 && size <= MAX_VMM_TRANSFER_SIZE &&
+           static_cast<uint64_t>(size) <= std::numeric_limits<uint64_t>::max() - address;
+}
 
 // Enumerating an object directory does NOT dispatch IRPs to the device — unlike
 // CreateFile, which triggers hyperkd's IRP_MJ_CREATE and burns the one-shot
@@ -113,37 +131,62 @@ HANDLE OpenVmmDevice() {
 }
 
 void CloseVmmDevice(HANDLE hDevice) {
-    if (hDevice != INVALID_HANDLE_VALUE) CloseHandle(hDevice);
+    if (!hDevice || hDevice == INVALID_HANDLE_VALUE) return;
+
+    std::lock_guard<std::mutex> lock(g_vmmDeviceMutex);
+    if (g_vmmSessionState == VmmSessionState::Active && hDevice == g_vmmDevice) {
+        std::cerr << "[hinv::vmm] Refusing to close the shared HyperDbg session through the raw handle API\n";
+        return;
+    }
+    CloseHandle(hDevice);
+}
+
+bool ShutdownVmm() {
+    std::lock_guard<std::mutex> lock(g_vmmDeviceMutex);
+    if (g_vmmSessionState != VmmSessionState::Active || g_vmmDevice == INVALID_HANDLE_VALUE)
+        return true;
+
+    HANDLE hDevice = g_vmmDevice;
+    if (!CloseHandle(hDevice)) {
+        std::cerr << "[hinv::vmm] Failed to close HyperDbg device session: " << GetLastError() << "\n";
+        return false;
+    }
+    g_vmmDevice = INVALID_HANDLE_VALUE;
+    g_vmmSessionState = VmmSessionState::Closed;
+    return true;
 }
 
 bool SendVmmIoctl(DWORD ioctlCode, LPVOID inBuffer, DWORD inSize, LPVOID outBuffer, DWORD outSize, LPDWORD bytesReturned) {
     // hyperkd's CREATE handler burns the log session on close (it clears the
     // "session opened" gate while hyperlog can only initialize once per boot),
     // so every open/close pair after the first fails with STATUS_UNSUCCESSFUL.
-    // Keep ONE handle for the whole process lifetime instead of open/close
-    // per IOCTL. But a magic static would POISON the process forever if the
-    // first open happened before hyperkd was loaded — so open lazily and retry
-    // while invalid. The mutex also serializes concurrent IOCTLs on the shared
-    // (non-overlapped) handle.
-    static HANDLE s_device = nullptr;
-    static std::mutex s_deviceMutex;
-    std::lock_guard<std::mutex> lock(s_deviceMutex);
-    if (!s_device || s_device == INVALID_HANDLE_VALUE) {
-        s_device = OpenVmmDevice();
-        if (s_device == INVALID_HANDLE_VALUE) {
+    // Keep ONE handle until explicit session closure instead of open/close per
+    // IOCTL. A failed first open must remain retryable if hyperkd was not loaded
+    // yet, while a deliberately closed session must never be reopened. The
+    // mutex also serializes concurrent IOCTLs on the shared (non-overlapped)
+    // handle.
+    std::lock_guard<std::mutex> lock(g_vmmDeviceMutex);
+    if (g_vmmSessionState == VmmSessionState::Closed) {
+        std::cerr << "[hinv::vmm] HyperDbg device session is already closed and cannot be reopened safely\n";
+        return false;
+    }
+    if (g_vmmDevice == INVALID_HANDLE_VALUE) {
+        g_vmmDevice = OpenVmmDevice();
+        if (g_vmmDevice == INVALID_HANDLE_VALUE) {
             std::cerr << "[hinv::vmm] Cannot open HyperDbg device: " << GetLastError() << "\n";
             return false;
         }
+        g_vmmSessionState = VmmSessionState::Active;
     }
-    HANDLE hDevice = s_device;
+    HANDLE hDevice = g_vmmDevice;
 
     DWORD localBytes = 0;
     DWORD* pBytes = bytesReturned ? bytesReturned : &localBytes;
+    *pBytes = 0;
     BOOL ok = DeviceIoControl(hDevice, ioctlCode, inBuffer, inSize, outBuffer, outSize, pBytes, nullptr);
-    DWORD err = GetLastError();
 
     if (!ok) {
-        std::cerr << "[hinv::vmm] DeviceIoControl failed: " << err << "\n";
+        std::cerr << "[hinv::vmm] DeviceIoControl failed: " << GetLastError() << "\n";
         return false;
     }
     return true;
@@ -156,13 +199,14 @@ bool InitializeVmm() {
                       &kernelStatus, sizeof(kernelStatus), &bytes)) {
         return false;
     }
+    if (bytes != static_cast<DWORD>(sizeof(kernelStatus))) {
+        std::cerr << "[hinv::vmm] VMM init returned " << bytes << " bytes, expected "
+                  << sizeof(kernelStatus) << "\n";
+        return false;
+    }
     // hyperkd completes the IRP with STATUS_SUCCESS unconditionally — the real
     // outcome lives in these 4 bytes (verified against hyperkd.sys v0.23
     // disassembly): the kernel only arms the VMM IOCTL gate on success.
-    if (kernelStatus == 0xC0000063) { // DEBUGGER_ERROR_VMM_ALREADY_INITIALIZED
-        std::cout << "[hinv::vmm] HyperDbg VMM already initialized\n";
-        return true;
-    }
     if (kernelStatus != DEBUGGER_OPERATION_WAS_SUCCESSFUL) {
         std::cerr << "[hinv::vmm] VMM init failed, kernel status: 0x" << std::hex << kernelStatus << std::dec << "\n";
         return false;
@@ -176,11 +220,11 @@ bool InitializeVmm() {
 // ---------------------------------------------------------------------------
 
 bool ReadKernelMemoryHyperDbg(uint64_t address, void* out, size_t size) {
-    if (!out || size == 0 || size > 0x10000) return false;
+    if (!out || !IsValidTransferRange(address, size)) return false;
 
     std::vector<uint8_t> packet(sizeof(DebugerReadMemoryPacket) + size, 0);
     auto* hdr = reinterpret_cast<DebugerReadMemoryPacket*>(packet.data());
-    hdr->Pid = 0; // system process
+    hdr->Pid = GetCurrentProcessId();
     hdr->Address = address;
     hdr->Size = static_cast<uint32_t>(size);
     hdr->GetAddressMode = 0;
@@ -191,21 +235,24 @@ bool ReadKernelMemoryHyperDbg(uint64_t address, void* out, size_t size) {
     hdr->KernelStatus = 0;
 
     DWORD bytes = 0;
-    if (!SendVmmIoctl(IOCTL_HYPERDBG_READ_MEMORY, packet.data(), static_cast<DWORD>(packet.size()),
-                      packet.data(), static_cast<DWORD>(packet.size()), &bytes)) {
+    const DWORD headerSize = static_cast<DWORD>(sizeof(DebugerReadMemoryPacket));
+    const DWORD packetSize = static_cast<DWORD>(packet.size());
+    if (!SendVmmIoctl(IOCTL_HYPERDBG_READ_MEMORY, packet.data(), headerSize,
+                       packet.data(), packetSize, &bytes)) {
         return false;
     }
 
+    if (bytes < headerSize || bytes > packetSize) {
+        std::cerr << "[hinv::vmm] ReadMemory returned invalid packet size: " << bytes << "\n";
+        return false;
+    }
     if (hdr->KernelStatus != DEBUGGER_OPERATION_WAS_SUCCESSFUL) {
         std::cerr << "[hinv::vmm] ReadMemory kernel status: 0x" << std::hex << hdr->KernelStatus << std::dec << "\n";
         return false;
     }
-    // Payload size is derived from bytes actually returned, like the official
-    // library does (bytesReturned - header size); ReturnLength is advisory.
-    size_t payloadSize = (bytes >= sizeof(DebugerReadMemoryPacket))
-                         ? (bytes - sizeof(DebugerReadMemoryPacket)) : 0;
-    if (payloadSize < size) {
-        std::cerr << "[hinv::vmm] ReadMemory returned " << payloadSize << " bytes, expected " << size << "\n";
+    if (bytes != packetSize) {
+        std::cerr << "[hinv::vmm] ReadMemory returned " << (bytes - headerSize)
+                  << " data bytes, expected " << size << "\n";
         return false;
     }
 
@@ -214,7 +261,10 @@ bool ReadKernelMemoryHyperDbg(uint64_t address, void* out, size_t size) {
 }
 
 bool EditKernelMemoryHyperDbg(uint64_t address, const void* in, size_t size) {
-    if (!in || size == 0 || size > 0x10000) return false;
+    if (!in || !IsValidTransferRange(address, size)) return false;
+
+    std::vector<uint8_t> expected(size);
+    std::memcpy(expected.data(), in, size);
 
     // Official HyperDbg semantics: CountOf64Chunks is the number of VALUES,
     // each stored in its own 8-byte slot; the kernel writes ByteSize bytes
@@ -232,26 +282,45 @@ bool EditKernelMemoryHyperDbg(uint64_t address, const void* in, size_t size) {
     auto* hdr = reinterpret_cast<DebugerEditMemoryPacket*>(packet.data());
     hdr->Result = 0;
     hdr->Address = address;
-    hdr->ProcessId = 0;
+    hdr->ProcessId = GetCurrentProcessId();
     hdr->MemoryType = 0; // virtual
     hdr->ByteSize = byteSizeCode;
     hdr->CountOf64Chunks = count;
     hdr->FinalStructureSize = static_cast<uint32_t>(sizeof(DebugerEditMemoryPacket) + payloadSize);
 
-    const auto* src = static_cast<const uint8_t*>(in);
+    const auto* src = expected.data();
     for (uint32_t i = 0; i < count; ++i) {
         std::memcpy(packet.data() + sizeof(DebugerEditMemoryPacket) + i * sizeof(uint64_t),
                     src + static_cast<size_t>(i) * bytesPerSlot, bytesPerSlot);
     }
 
     DWORD bytes = 0;
+    const DWORD headerSize = static_cast<DWORD>(sizeof(DebugerEditMemoryPacket));
     if (!SendVmmIoctl(IOCTL_HYPERDBG_EDIT_MEMORY, packet.data(), static_cast<DWORD>(packet.size()),
-                      packet.data(), static_cast<DWORD>(packet.size()), &bytes)) {
+                       packet.data(), headerSize, &bytes)) {
         return false;
     }
 
+    if (bytes != headerSize) {
+        std::cerr << "[hinv::vmm] EditMemory returned " << bytes << " bytes, expected "
+                  << headerSize << "\n";
+        return false;
+    }
     if (hdr->Result != DEBUGGER_OPERATION_WAS_SUCCESSFUL) {
         std::cerr << "[hinv::vmm] EditMemory result: 0x" << std::hex << hdr->Result << std::dec << "\n";
+        return false;
+    }
+
+    // HyperDbg v0.23 reports success even when an unsafe per-chunk write does
+    // not complete. Verify the complete bounded write after the IOCTL lock is
+    // released by SendVmmIoctl.
+    std::vector<uint8_t> actual(size);
+    if (!ReadKernelMemoryHyperDbg(address, actual.data(), actual.size())) {
+        std::cerr << "[hinv::vmm] EditMemory readback failed\n";
+        return false;
+    }
+    if (std::memcmp(actual.data(), expected.data(), size) != 0) {
+        std::cerr << "[hinv::vmm] EditMemory readback did not match requested bytes\n";
         return false;
     }
     return true;
@@ -272,16 +341,21 @@ bool VirtualToPhysicalHyperDbg(uint64_t virtualAddress, uint64_t& outPhysical) {
     Va2PaPacket packet{};
     packet.VirtualAddress = virtualAddress;
     packet.PhysicalAddress = 0;
-    packet.ProcessId = 0;
+    packet.ProcessId = GetCurrentProcessId();
     packet.IsVirtual2Physical = 1;
     packet.KernelStatus = 0;
 
     DWORD bytes = 0;
     if (!SendVmmIoctl(IOCTL_HYPERDBG_VA2PA_AND_PA2VA, &packet, sizeof(packet),
-                      &packet, sizeof(packet), &bytes)) {
+                       &packet, sizeof(packet), &bytes)) {
         return false;
     }
 
+    if (bytes != static_cast<DWORD>(sizeof(packet))) {
+        std::cerr << "[hinv::vmm] VA2PA returned " << bytes << " bytes, expected "
+                  << sizeof(packet) << "\n";
+        return false;
+    }
     if (packet.KernelStatus != DEBUGGER_OPERATION_WAS_SUCCESSFUL) {
         std::cerr << "[hinv::vmm] VA2PA kernel status: 0x" << std::hex << packet.KernelStatus << std::dec << "\n";
         return false;

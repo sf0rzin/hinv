@@ -19,15 +19,17 @@ struct MappingResult {
     std::string error;
 };
 
+// Read and validate a module before any privileged backend is initialized.
+// The returned bytes can then be passed to MapDriverBytes, avoiding a
+// second path-based open after the TOCTOU-sensitive preflight.
+bool ReadDriverFileBytes(const std::wstring& path, std::vector<uint8_t>& out);
+bool ValidateDriverImageBytes(const std::vector<uint8_t>& raw, std::string* error = nullptr);
+
 // Manually map a kernel driver (.sys) into kernel memory using the supplied BYOVD backend.
-// When hijackNullDriverObject is true, DriverEntry receives the real
-// DRIVER_OBJECT of \Driver\Null (recovered via handle enumeration) instead of
-// a synthetic pool object — required by drivers that call IoCreateDevice
-// (e.g. HyperDbg's hyperkd.sys), because the I/O manager refuses to open
-// devices owned by a non-Object-Manager DRIVER_OBJECT. Caveats in hijack mode:
-// null.sys's MajorFunction[]/DriverUnload stay overwritten until reboot, and
-// DriverObject->DriverStart/DriverSize describe null.sys, not the mapped image
-// (drivers that self-locate through them will misbehave).
+// When hijackNullDriverObject is true, DriverEntry receives a real
+// Object-Manager-owned DRIVER_OBJECT created through IoCreateDriver instead of
+// a synthetic pool object. The historical parameter/CLI flag name is retained
+// for compatibility, but no existing system driver's object is modified.
 MappingResult MapDriver(byovd::IByovdBackend* backend, const std::wstring& driverPath,
                         bool hijackNullDriverObject = false);
 

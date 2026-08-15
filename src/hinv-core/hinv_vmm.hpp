@@ -68,10 +68,16 @@ struct DebugerEditMemoryPacket {
     // data follows
 };
 
-// Open/close the HyperDbg device handle.
+// Low-level standalone handle API. Do not mix these caller-owned handles with
+// SendVmmIoctl's process-shared one-shot session. CloseVmmDevice refuses to
+// close that shared handle.
 bool IsVmmDeviceActive();
 HANDLE OpenVmmDevice();
 void CloseVmmDevice(HANDLE hDevice);
+
+// Close the process-owned device session. This does not terminate the VMM or
+// send HyperDbg's termination IOCTL, and the one-shot session is not reopened.
+bool ShutdownVmm();
 
 // Send a raw DeviceIoControl to HyperDbg.
 bool SendVmmIoctl(DWORD ioctlCode, LPVOID inBuffer, DWORD inSize, LPVOID outBuffer, DWORD outSize, LPDWORD bytesReturned = nullptr);

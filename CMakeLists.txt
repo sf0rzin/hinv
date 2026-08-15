@@ -1,10 +1,18 @@
 cmake_minimum_required(VERSION 3.20)
 project(hinv LANGUAGES CXX)
 
+if (NOT WIN32)
+    message(FATAL_ERROR "hinv requires Windows")
+endif()
+if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "hinv requires a 64-bit build")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-include_directories(
+set(HINV_INCLUDE_DIR
     src/hinv-core
 )
 
@@ -24,7 +32,8 @@ set(HINV_CLI_SOURCES
 
 add_executable(hinv ${HINV_CORE_SOURCES} ${HINV_CLI_SOURCES})
 
-target_compile_definitions(hinv PRIVATE UNICODE _UNICODE)
+target_compile_definitions(hinv PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(hinv PRIVATE ${HINV_INCLUDE_DIR})
 if (MSVC)
     target_compile_options(hinv PRIVATE /W4)
 else()
@@ -35,24 +44,38 @@ else()
     target_link_options(hinv PRIVATE -static)
 endif()
 
-target_link_libraries(hinv PRIVATE psapi advapi32 ntdll)
+target_link_libraries(hinv PRIVATE psapi advapi32 ntdll bcrypt)
 
 # Tests
-enable_testing()
+include(CTest)
+if (BUILD_TESTING)
 
 set(TEST_SOURCES
     tests/test_pe_parser.cpp
 )
 
 add_executable(hinv_tests ${TEST_SOURCES} ${HINV_CORE_SOURCES})
-target_compile_definitions(hinv_tests PRIVATE UNICODE _UNICODE)
-target_include_directories(hinv_tests PRIVATE src/hinv-core)
+target_compile_definitions(hinv_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(hinv_tests PRIVATE ${HINV_INCLUDE_DIR})
 if (MSVC)
     target_compile_options(hinv_tests PRIVATE /W4)
 else()
     target_compile_options(hinv_tests PRIVATE -Wall -Wextra)
     target_link_options(hinv_tests PRIVATE -static)
 endif()
-target_link_libraries(hinv_tests PRIVATE psapi advapi32 ntdll)
+target_link_libraries(hinv_tests PRIVATE psapi advapi32 ntdll bcrypt)
 
 add_test(NAME pe_parser_safety COMMAND hinv_tests)
+
+add_executable(hinv_client_tests tests/test_client_contract.cpp)
+target_compile_definitions(hinv_client_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(hinv_client_tests PRIVATE ${HINV_INCLUDE_DIR})
+if (MSVC)
+    target_compile_options(hinv_client_tests PRIVATE /W4)
+else()
+    target_compile_options(hinv_client_tests PRIVATE -Wall -Wextra)
+    target_link_options(hinv_client_tests PRIVATE -static)
+endif()
+target_link_libraries(hinv_client_tests PRIVATE advapi32 ntdll)
+add_test(NAME client_sdk_contract COMMAND hinv_client_tests)
+endif()

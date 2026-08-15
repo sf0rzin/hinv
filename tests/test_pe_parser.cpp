@@ -21,7 +21,7 @@
 class MockBackend : public hinv::byovd::IByovdBackend {
 public:
     bool Initialize(const std::wstring&) override { return true; }
-    void Shutdown() override {}
+    bool Shutdown() override { return true; }
     bool IsReady() const override { return true; }
     bool ReadKernelMemory(uint64_t, void*, size_t) override { return false; }
     bool WriteKernelMemory(uint64_t, const void*, size_t) override { return false; }
@@ -80,12 +80,15 @@ constexpr uint64_t IFT_TABLE_VA = 0xFFFFF803EB200020ULL; // mirrors build 26100
 constexpr uint64_t IFT_LFE_VA   = 0xFFFFF803EA232140ULL; // fake RtlLookupFunctionEntry
 
 // Serves two ranges: the fake RtlLookupFunctionEntry bytes and a fake
-// PsInvertedFunctionTable. Writes only land on the table.
+// PsInvertedFunctionTable. The production path only reads this structure;
+// writes are retained here to prove the refusal path is side-effect free.
 class IftBackend : public MockBackend {
 public:
     std::vector<uint8_t> func;  // at IFT_LFE_VA
     std::vector<uint8_t> table; // at IFT_TABLE_VA
     bool failWrites = false;
+    int failOnWrite = -1;
+    int writeCount = 0;
 
     bool ReadKernelMemory(uint64_t va, void* out, size_t size) override {
         if (va >= IFT_LFE_VA && va - IFT_LFE_VA + size <= func.size()) {
@@ -100,6 +103,7 @@ public:
     }
     bool WriteKernelMemory(uint64_t va, const void* in, size_t size) override {
         if (failWrites) return false;
+        if (failOnWrite >= 0 && writeCount++ == failOnWrite) return false;
         if (va >= IFT_TABLE_VA && va - IFT_TABLE_VA + size <= table.size()) {
             std::memcpy(table.data() + (va - IFT_TABLE_VA), in, size);
             return true;
@@ -186,13 +190,65 @@ int main() {
     MockBackend backend;
     std::vector<uint8_t> mapped;
 
-    // --- MapDriverBytes front-door validation (unchanged behavior) ---------
+    // --- MapDriverBytes front-door validation --------------------------------
 
-    // Valid PE passes parsing and fails only at kernel allocation with the mock.
+    // A fixed-base image is not safe for the manual mapper. Add a minimal,
+    // valid relocation block so this fixture reaches kernel allocation.
     auto validPe = MakePe(0x2000, 0x400);
+    SetDataDirectory(validPe, IMAGE_DIRECTORY_ENTRY_BASERELOC, 0x1080, 0x0C);
+    W32(validPe, RvaToOff(0x1080), 0x1000);
+    W32(validPe, RvaToOff(0x1084), 0x0C);
+    W16(validPe, RvaToOff(0x1088), 0x0000); // ABSOLUTE padding entry
     auto result = hinv::mapper::MapDriverBytes(&backend, validPe);
     Check(!result.success && result.error == "kernel allocation failed",
           "valid PE reaches allocation (fails only with mock backend)");
+
+    auto preflightPe = validPe;
+    auto* preflightNt = reinterpret_cast<IMAGE_NT_HEADERS64*>(preflightPe.data() + E_LFANEW);
+    auto* preflightSection = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+        preflightPe.data() + E_LFANEW + 4 + sizeof(IMAGE_FILE_HEADER) +
+        sizeof(IMAGE_OPTIONAL_HEADER64));
+    preflightSection->Characteristics |= IMAGE_SCN_MEM_EXECUTE;
+    preflightNt->OptionalHeader.AddressOfEntryPoint = 0x1100;
+    std::string preflightError;
+    Check(hinv::mapper::ValidateDriverImageBytes(preflightPe, &preflightError),
+          "unprivileged module preflight accepts valid image");
+
+    auto fixedBasePe = MakePe(0x2000, 0x400);
+    result = hinv::mapper::MapDriverBytes(&backend, fixedBasePe);
+    Check(!result.success && result.error.find("no base relocation") != std::string::npos,
+          "fixed-base image rejected before kernel allocation");
+
+    auto badEntryPe = validPe;
+    auto* badEntryNt = reinterpret_cast<IMAGE_NT_HEADERS64*>(badEntryPe.data() + E_LFANEW);
+    badEntryNt->OptionalHeader.AddressOfEntryPoint = 0x100; // inside headers
+    result = hinv::mapper::MapDriverBytes(&backend, badEntryPe);
+    Check(!result.success && result.error.find("executable section") != std::string::npos,
+          "entry point outside executable section rejected");
+
+    auto executableEntryPe = validPe;
+    auto* executableEntryNt = reinterpret_cast<IMAGE_NT_HEADERS64*>(
+        executableEntryPe.data() + E_LFANEW);
+    auto* executableEntrySection = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+        executableEntryPe.data() + E_LFANEW + 4 + sizeof(IMAGE_FILE_HEADER) +
+        sizeof(IMAGE_OPTIONAL_HEADER64));
+    executableEntrySection->Characteristics |= IMAGE_SCN_MEM_EXECUTE;
+    executableEntryNt->OptionalHeader.AddressOfEntryPoint = 0x1100;
+    result = hinv::mapper::MapDriverBytes(&backend, executableEntryPe);
+    Check(!result.success && result.error == "kernel allocation failed",
+          "entry point in copied executable bytes accepted");
+
+    auto virtualTailEntryPe = executableEntryPe;
+    auto* virtualTailNt = reinterpret_cast<IMAGE_NT_HEADERS64*>(virtualTailEntryPe.data() + E_LFANEW);
+    auto* virtualTailSection = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+        virtualTailEntryPe.data() + E_LFANEW + 4 + sizeof(IMAGE_FILE_HEADER) +
+        sizeof(IMAGE_OPTIONAL_HEADER64));
+    virtualTailSection->Characteristics |= IMAGE_SCN_MEM_EXECUTE;
+    virtualTailSection->Misc.VirtualSize = 0x800;
+    virtualTailNt->OptionalHeader.AddressOfEntryPoint = 0x1300; // past raw bytes, inside VirtualSize
+    result = hinv::mapper::MapDriverBytes(&backend, virtualTailEntryPe);
+    Check(!result.success && result.error.find("executable section") != std::string::npos,
+          "entry point in executable section virtual tail rejected");
 
     result = hinv::mapper::MapDriverBytes(&backend, {});
     Check(!result.success && result.error == "invalid arguments", "empty input rejected");
@@ -437,6 +493,14 @@ int main() {
     }
 
     {
+        auto pe = MakePe(0x2000, 0x400);
+        SetDataDirectory(pe, IMAGE_DIRECTORY_ENTRY_IMPORT, 0x1000, 0x14);
+        W32(pe, RvaToOff(0x1000), 0x1110); // Name is zero, but OriginalFirstThunk is not
+        Check(!hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped),
+              "partially-null import descriptor terminator rejected");
+    }
+
+    {
         // Second descriptor falls outside the image; only the first was checked before.
         auto pe = MakePe(0x1400, 0x600); // .text covers RVA 0x1000..0x1400
         SetDataDirectory(pe, IMAGE_DIRECTORY_ENTRY_IMPORT, 0x13EC, 0x28);
@@ -470,6 +534,116 @@ int main() {
         std::memcpy(pe.data() + RvaToOff(0x1100), "a.dll", 6);
         Check(!hinv::mapper::BuildMappedImage(&backend, pe, FAKE_KERNEL_BASE, mapped),
               "truncated thunk rejected");
+    }
+
+    // --- BuildMappedImage: AMD64 unwind metadata -----------------------------
+
+    {
+        auto validUnwindPe = MakePe(0x2000, 0x1200);
+        SetDataDirectory(validUnwindPe, IMAGE_DIRECTORY_ENTRY_EXCEPTION, 0x1100,
+                         sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+        W32(validUnwindPe, RvaToOff(0x1100), 0x1000); // BeginAddress
+        W32(validUnwindPe, RvaToOff(0x1104), 0x1010); // EndAddress
+        W32(validUnwindPe, RvaToOff(0x1108), 0x1180); // UnwindInfoAddress
+        validUnwindPe[RvaToOff(0x1180)] = 1;           // version 1, no flags/codes
+        Check(hinv::mapper::BuildMappedImage(&backend, validUnwindPe,
+                                              FAKE_KERNEL_BASE, mapped),
+              "valid AMD64 unwind info accepted");
+
+        auto truncatedHeader = validUnwindPe;
+        W32(truncatedHeader, RvaToOff(0x1108), 0x1FFE);
+        Check(!hinv::mapper::BuildMappedImage(&backend, truncatedHeader,
+                                               FAKE_KERNEL_BASE, mapped),
+              "truncated unwind info header rejected");
+
+        auto truncatedCodes = validUnwindPe;
+        W32(truncatedCodes, RvaToOff(0x1108), 0x1FFC);
+        truncatedCodes[RvaToOff(0x1FFC)] = 1;
+        truncatedCodes[RvaToOff(0x1FFE)] = 1; // one code requires two stored slots
+        Check(!hinv::mapper::BuildMappedImage(&backend, truncatedCodes,
+                                               FAKE_KERNEL_BASE, mapped),
+              "truncated aligned unwind-code area rejected");
+
+        auto truncatedHandler = validUnwindPe;
+        W32(truncatedHandler, RvaToOff(0x1108), 0x1FFC);
+        truncatedHandler[RvaToOff(0x1FFC)] = 1 | (1 << 3); // UNW_FLAG_EHANDLER
+        Check(!hinv::mapper::BuildMappedImage(&backend, truncatedHandler,
+                                               FAKE_KERNEL_BASE, mapped),
+              "truncated unwind handler RVA rejected");
+
+        auto truncatedChain = validUnwindPe;
+        W32(truncatedChain, RvaToOff(0x1108), 0x1FFC);
+        truncatedChain[RvaToOff(0x1FFC)] = 1 | (4 << 3); // UNW_FLAG_CHAININFO
+        Check(!hinv::mapper::BuildMappedImage(&backend, truncatedChain,
+                                               FAKE_KERNEL_BASE, mapped),
+              "truncated chained runtime function rejected");
+
+        auto truncatedChainedCodes = validUnwindPe;
+        truncatedChainedCodes[RvaToOff(0x1180)] = 1 | (4 << 3);
+        W32(truncatedChainedCodes, RvaToOff(0x1184), 0x1000);
+        W32(truncatedChainedCodes, RvaToOff(0x1188), 0x1010);
+        W32(truncatedChainedCodes, RvaToOff(0x118C), 0x1FFC);
+        truncatedChainedCodes[RvaToOff(0x1FFC)] = 1;
+        truncatedChainedCodes[RvaToOff(0x1FFE)] = 1;
+        Check(!hinv::mapper::BuildMappedImage(&backend, truncatedChainedCodes,
+                                               FAKE_KERNEL_BASE, mapped),
+              "truncated chained unwind-code area rejected");
+
+        auto badVersion = validUnwindPe;
+        badVersion[RvaToOff(0x1180)] = 2;
+        Check(!hinv::mapper::BuildMappedImage(&backend, badVersion,
+                                               FAKE_KERNEL_BASE, mapped),
+              "unsupported unwind info version rejected");
+
+        auto badFlags = validUnwindPe;
+        badFlags[RvaToOff(0x1180)] = 1 | (8 << 3);
+        Check(!hinv::mapper::BuildMappedImage(&backend, badFlags,
+                                               FAKE_KERNEL_BASE, mapped),
+              "unsupported unwind info flags rejected");
+
+        auto badChainedBounds = validUnwindPe;
+        badChainedBounds[RvaToOff(0x1180)] = 1 | (4 << 3);
+        W32(badChainedBounds, RvaToOff(0x1184), 0x1800);
+        W32(badChainedBounds, RvaToOff(0x1188), 0x2001); // EndAddress past image
+        W32(badChainedBounds, RvaToOff(0x118C), 0x1190);
+        Check(!hinv::mapper::BuildMappedImage(&backend, badChainedBounds,
+                                               FAKE_KERNEL_BASE, mapped),
+              "out-of-bounds chained runtime function rejected");
+
+        auto validExtraSlots = validUnwindPe;
+        validExtraSlots[RvaToOff(0x1180) + 1] = 0x20; // SizeOfProlog
+        validExtraSlots[RvaToOff(0x1180) + 2] = 6;    // two multi-slot opcodes
+        validExtraSlots[RvaToOff(0x1180) + 4] = 0x20;
+        validExtraSlots[RvaToOff(0x1180) + 5] = 0x11; // UWOP_ALLOC_LARGE, 3 slots
+        validExtraSlots[RvaToOff(0x1180) + 6] = 0x01;
+        validExtraSlots[RvaToOff(0x1180) + 8] = 0x00;
+        validExtraSlots[RvaToOff(0x1180) + 10] = 0x10;
+        validExtraSlots[RvaToOff(0x1180) + 11] = 0x05; // SAVE_NONVOL_FAR, 3 slots
+        Check(hinv::mapper::BuildMappedImage(&backend, validExtraSlots,
+                                              FAKE_KERNEL_BASE, mapped),
+              "valid unwind opcodes with extra slots accepted");
+
+        auto badOpcode = validUnwindPe;
+        badOpcode[RvaToOff(0x1180) + 2] = 1;
+        badOpcode[RvaToOff(0x1180) + 5] = 6; // reserved UWOP
+        Check(!hinv::mapper::BuildMappedImage(&backend, badOpcode,
+                                               FAKE_KERNEL_BASE, mapped),
+              "reserved unwind opcode rejected");
+
+        auto truncatedOpcode = validUnwindPe;
+        truncatedOpcode[RvaToOff(0x1180) + 2] = 1;
+        truncatedOpcode[RvaToOff(0x1180) + 5] = 0x01; // ALLOC_LARGE needs 2 slots
+        Check(!hinv::mapper::BuildMappedImage(&backend, truncatedOpcode,
+                                               FAKE_KERNEL_BASE, mapped),
+              "unwind opcode extra-slot overrun rejected");
+
+        auto badCodeOffset = validUnwindPe;
+        badCodeOffset[RvaToOff(0x1180) + 1] = 0x10;
+        badCodeOffset[RvaToOff(0x1180) + 2] = 1;
+        badCodeOffset[RvaToOff(0x1180) + 4] = 0x11;
+        Check(!hinv::mapper::BuildMappedImage(&backend, badCodeOffset,
+                                               FAKE_KERNEL_BASE, mapped),
+              "unwind code offset beyond prologue rejected");
     }
 
     // --- Mapped-module registry ---------------------------------------------
@@ -691,6 +865,9 @@ int main() {
         auto fallback = hinv::byovd::DetectProfile(L"unknown_driver.sys");
         Check(fallback.type == hinv::byovd::BackendType::Unknown,
               "detect: unknown driver name rejected (no silent dbutil fallback)");
+        auto renamed = hinv::byovd::DetectProfile(L"copy_iqvw64e.sys");
+        Check(renamed.type == hinv::byovd::BackendType::Unknown,
+              "detect: renamed Intel binary is not accepted by substring");
     }
     // --- Inverted function table (24H2 SEH registration) --------------------
 
@@ -715,37 +892,27 @@ int main() {
         Check(hinv::kmem::detail::FindInvertedFunctionTable(&badHeader, IFT_LFE_VA) == 0,
               "ift: invalid header rejected (wrong address never written through)");
 
-        // Insert into empty table.
-        Check(hinv::kmem::detail::InsertInvertedFunctionTableEntryAt(
+        // Manual IFT mutation is deliberately disabled: the epoch is not a
+        // writer lock, and usermode cannot acquire the private kernel lock.
+        const auto originalIft = ift.table;
+        Check(!hinv::kmem::detail::InsertInvertedFunctionTableEntryAt(
                   &ift, IFT_TABLE_VA, 0xAAAA0000, 0x100000000, 0x2000, 0x60),
-              "ift: insert into empty table");
-        Check(IftCur(ift.table) == 1 && IftEpoch(ift.table) == 12,
-              "ift: insert bumps CurrentSize and Epoch(+2)");
-        Check(IftEntryBase(ift.table, 0) == 0x100000000, "ift: entry 0 image base stored");
+              "ift: unsynchronized insert fails closed");
+        Check(ift.table == originalIft,
+              "ift: refused insert leaves table untouched");
 
-        // Ordered insert in the middle: existing 0x1000, 0x5000; add 0x3000.
-        IftBackend ord;
-        ord.table.assign(0x10 + 6 * 0x18, 0);
-        IftHeader(ord.table, 2, 6, 20, 0);
-        IftEntry(ord.table, 0, 0xF1, 0x1000, 0x100, 0x24);
-        IftEntry(ord.table, 1, 0xF2, 0x5000, 0x100, 0x24);
-        Check(hinv::kmem::detail::InsertInvertedFunctionTableEntryAt(
-                  &ord, IFT_TABLE_VA, 0xF3, 0x3000, 0x100, 0x24),
-              "ift: ordered middle insert");
-        Check(IftCur(ord.table) == 3 &&
-              IftEntryBase(ord.table, 0) == 0x1000 &&
-              IftEntryBase(ord.table, 1) == 0x3000 &&
-              IftEntryBase(ord.table, 2) == 0x5000,
-              "ift: entries stay ascending by ImageBase after insert");
+        IftBackend odd;
+        odd.table.assign(0x10 + 4 * 0x18, 0);
+        IftHeader(odd.table, 1, 4, 11, 0);
+        IftEntry(odd.table, 0, 0xF1, 0x1000, 0x100, 0x24);
+        const auto oddOriginal = odd.table;
+        Check(!hinv::kmem::detail::InsertInvertedFunctionTableEntryAt(
+                  &odd, IFT_TABLE_VA, 0xF2, 0x2000, 0x100, 0x24),
+              "ift: odd epoch is rejected without a lock");
+        Check(odd.table == oddOriginal, "ift: odd epoch table remains unchanged");
 
-        // Idempotent on same ImageBase.
-        Check(hinv::kmem::detail::InsertInvertedFunctionTableEntryAt(
-                  &ord, IFT_TABLE_VA, 0xF3, 0x3000, 0x100, 0x24),
-              "ift: duplicate ImageBase insert is a no-op success");
-        Check(IftCur(ord.table) == 3 && IftEpoch(ord.table) == 22,
-              "ift: duplicate insert leaves table and epoch untouched");
-
-        // Full table and overflowed table both fail closed.
+        // Full and overflowed tables are still rejected without inspecting or
+        // rewriting entries.
         IftBackend full;
         full.table.assign(0x10 + 2 * 0x18, 0);
         IftHeader(full.table, 2, 2, 0, 0);
@@ -758,19 +925,16 @@ int main() {
                   &ovw, IFT_TABLE_VA, 0xF4, 0x9000, 0x100, 0x24),
               "ift: overflowed table insert fails closed");
 
-        // Removal from the middle shifts the tail down.
-        Check(hinv::kmem::detail::RemoveInvertedFunctionTableEntryAt(&ord, IFT_TABLE_VA, 0x3000),
-              "ift: remove middle entry");
-        Check(IftCur(ord.table) == 2 &&
-              IftEntryBase(ord.table, 0) == 0x1000 &&
-              IftEntryBase(ord.table, 1) == 0x5000,
-              "ift: removal shifts tail down");
-        Check(IftEpoch(ord.table) == 24, "ift: removal bumps Epoch(+2)");
-
-        // Removing a missing entry is a no-op success.
-        Check(hinv::kmem::detail::RemoveInvertedFunctionTableEntryAt(&ord, IFT_TABLE_VA, 0xDEAD),
-              "ift: remove missing entry succeeds (nothing to remove)");
-        Check(IftCur(ord.table) == 2, "ift: missing removal leaves CurrentSize");
+        IftBackend removal;
+        removal.table.assign(0x10 + 2 * 0x18, 0);
+        IftHeader(removal.table, 1, 2, 20, 0);
+        IftEntry(removal.table, 0, 0xF1, 0x1000, 0x100, 0x24);
+        const auto removalOriginal = removal.table;
+        Check(!hinv::kmem::detail::RemoveInvertedFunctionTableEntryAt(
+                  &removal, IFT_TABLE_VA, 0x1000),
+              "ift: unsynchronized removal fails closed");
+        Check(removal.table == removalOriginal,
+              "ift: refused removal leaves table untouched");
 
         // Backend write failure must surface as failure, never as success.
         IftBackend wfail;
@@ -778,23 +942,22 @@ int main() {
         IftHeader(wfail.table, 0, 4, 0, 0);
         wfail.failWrites = true;
         Check(!hinv::kmem::detail::InsertInvertedFunctionTableEntryAt(
-                  &wfail, IFT_TABLE_VA, 0xF5, 0x1000, 0x100, 0x24),
-              "ift: write failure propagates as insert failure");
+                   &wfail, IFT_TABLE_VA, 0xF5, 0x1000, 0x100, 0x24),
+               "ift: write failure propagates as insert failure");
 
-        // Entry [0] is the kernel MRU slot and is NOT in sorted order: a base
-        // smaller than everything must insert at [1], never shift [0].
-        IftBackend hot;
-        hot.table.assign(0x10 + 6 * 0x18, 0);
-        IftHeader(hot.table, 2, 6, 30, 0);
-        IftEntry(hot.table, 0, 0xF0, 0x9000, 0x100, 0x24); // hot (out of order)
-        IftEntry(hot.table, 1, 0xF2, 0x5000, 0x100, 0x24);
-        Check(hinv::kmem::detail::InsertInvertedFunctionTableEntryAt(
-                  &hot, IFT_TABLE_VA, 0xF1, 0x1000, 0x100, 0x24),
-              "ift: smallest base inserts below MRU slot");
-        Check(IftEntryBase(hot.table, 0) == 0x9000 &&
-              IftEntryBase(hot.table, 1) == 0x1000 &&
-              IftEntryBase(hot.table, 2) == 0x5000,
-              "ift: MRU slot [0] never shifted by insert");
+        // A backend write failure is irrelevant because no IFT write is ever
+        // attempted by the production path.
+        IftBackend partial;
+        partial.table.assign(0x10 + 4 * 0x18, 0);
+        IftHeader(partial.table, 1, 4, 40, 0);
+        IftEntry(partial.table, 0, 0xF6, 0x1000, 0x100, 0x24);
+        partial.failOnWrite = 0;
+        Check(!hinv::kmem::detail::InsertInvertedFunctionTableEntryAt(
+                   &partial, IFT_TABLE_VA, 0xF7, 0x2000, 0x100, 0x24),
+              "ift: refused insert returns failure before backend writes");
+        Check(IftCur(partial.table) == 1 && IftEpoch(partial.table) == 40 &&
+              IftEntryBase(partial.table, 0) == 0x1000,
+              "ift: refused insert leaves original entry intact");
     }
 
 
