@@ -301,6 +301,7 @@ bool StartDriverService(const std::wstring& serviceName) {
 }
 
 bool StopDriverService(const std::wstring& serviceName) {
+    constexpr DWORD kStopTimeoutMs = 30000;
     SC_HANDLE hScm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!hScm) return false;
     SC_HANDLE hSvc = OpenServiceW(hScm, serviceName.c_str(), SERVICE_STOP | SERVICE_QUERY_STATUS);
@@ -310,13 +311,13 @@ bool StopDriverService(const std::wstring& serviceName) {
         SERVICE_STATUS_PROCESS current{};
         DWORD bytes = 0;
         if (QueryServiceStatusEx(hSvc, SC_STATUS_PROCESS_INFO,
-                                 reinterpret_cast<LPBYTE>(&current), sizeof(current), &bytes) &&
+                                  reinterpret_cast<LPBYTE>(&current), sizeof(current), &bytes) &&
             current.dwCurrentState == SERVICE_STOPPED) {
             ok = true;
         } else if (current.dwCurrentState == SERVICE_STOP_PENDING) {
-            ok = WaitForServiceState(hSvc, SERVICE_STOPPED, 10000);
+            ok = WaitForServiceState(hSvc, SERVICE_STOPPED, kStopTimeoutMs);
         } else if (ControlService(hSvc, SERVICE_CONTROL_STOP, &status) == TRUE) {
-            ok = WaitForServiceState(hSvc, SERVICE_STOPPED, 10000);
+            ok = WaitForServiceState(hSvc, SERVICE_STOPPED, kStopTimeoutMs);
         } else {
             DWORD err = GetLastError();
             if (err == ERROR_SERVICE_NOT_ACTIVE) {
@@ -324,6 +325,19 @@ bool StopDriverService(const std::wstring& serviceName) {
             } else {
                 std::wcerr << L"[hinv::byovd] ControlService(STOP, " << serviceName
                            << L") failed: " << err << L"\n";
+            }
+        }
+        if (!ok) {
+            // A kernel-driver stop can complete just after the polling window
+            // expires. Re-read the terminal state before declaring teardown
+            // unsafe and leaving a service behind.
+            SERVICE_STATUS_PROCESS finalState{};
+            DWORD finalBytes = 0;
+            if (QueryServiceStatusEx(hSvc, SC_STATUS_PROCESS_INFO,
+                                     reinterpret_cast<LPBYTE>(&finalState),
+                                     sizeof(finalState), &finalBytes) &&
+                finalState.dwCurrentState == SERVICE_STOPPED) {
+                ok = true;
             }
         }
         if (!ok) std::wcerr << L"[hinv::byovd] Service did not reach STOPPED: " << serviceName << L"\n";
@@ -879,6 +893,14 @@ public:
                 std::wcerr << L"[hinv::byovd] Refusing teardown: unload-trace prevention was not confirmed\n";
                 return false;
             }
+            // Release the device reference before asking SCM to unload the
+            // driver. Keeping \Device\Nal open can leave a kernel service in
+            // STOP_PENDING until this process exits, which makes a successful
+            // unload look like a teardown failure.
+            if (!CloseHandle(hDevice_)) return false;
+            hDevice_ = INVALID_HANDLE_VALUE;
+            kmem::Trace("byovd: device handle closed");
+
             if (ownsService_ && !StopDriverService(serviceName_)) {
                 kmem::Trace("byovd: service stop FAILED");
                 if (unloadPrevention_.armed &&
@@ -894,9 +916,6 @@ public:
                 teardownBlocked_ = true;
                 return false;
             }
-            if (!CloseHandle(hDevice_)) return false;
-            hDevice_ = INVALID_HANDLE_VALUE;
-            kmem::Trace("byovd: device handle closed");
         }
         // Only tear down the service when THIS instance installed it — an abort
         // path (e.g. the \\.\Nal probe) must never stop another live instance's

@@ -224,6 +224,8 @@ bool ReadKernelMemoryHyperDbg(uint64_t address, void* out, size_t size) {
 
     std::vector<uint8_t> packet(sizeof(DebugerReadMemoryPacket) + size, 0);
     auto* hdr = reinterpret_cast<DebugerReadMemoryPacket*>(packet.data());
+    // HyperDbg still resolves the address in a valid process context for
+    // kernel virtual addresses; PID 0 is not a valid EPROCESS lookup here.
     hdr->Pid = GetCurrentProcessId();
     hdr->Address = address;
     hdr->Size = static_cast<uint32_t>(size);
@@ -237,7 +239,9 @@ bool ReadKernelMemoryHyperDbg(uint64_t address, void* out, size_t size) {
     DWORD bytes = 0;
     const DWORD headerSize = static_cast<DWORD>(sizeof(DebugerReadMemoryPacket));
     const DWORD packetSize = static_cast<DWORD>(packet.size());
-    if (!SendVmmIoctl(IOCTL_HYPERDBG_READ_MEMORY, packet.data(), headerSize,
+    // The driver consumes the request header and writes the requested bytes
+    // into the same trailing payload buffer.
+    if (!SendVmmIoctl(IOCTL_HYPERDBG_READ_MEMORY, packet.data(), packetSize,
                        packet.data(), packetSize, &bytes)) {
         return false;
     }

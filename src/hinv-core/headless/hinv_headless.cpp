@@ -216,6 +216,10 @@ static std::string ProcessCommandInternal(
                 g_loadedDriverPaths.insert(pathKey);
             return "ERR map failed: " + result.error;
         }
+        const size_t slash = path.find_last_of(L"\\/");
+        const std::wstring fileName = slash == std::wstring::npos
+            ? path : path.substr(slash + 1);
+        kmem::RegisterMappedModule(fileName, result.imageBase, result.imageSize);
         g_loadedDriverPaths.insert(pathKey);
         std::ostringstream ss;
         ss << "OK image=0x" << std::hex << result.imageBase

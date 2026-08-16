@@ -550,6 +550,30 @@ int main() {
                                               FAKE_KERNEL_BASE, mapped),
               "valid AMD64 unwind info accepted");
 
+        auto version2Epilog = MakePe(0x2000, 0x1200);
+        SetDataDirectory(version2Epilog, IMAGE_DIRECTORY_ENTRY_EXCEPTION, 0x1100,
+                         sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+        W32(version2Epilog, RvaToOff(0x1100), 0x1000); // BeginAddress
+        W32(version2Epilog, RvaToOff(0x1104), 0x1040); // EndAddress
+        W32(version2Epilog, RvaToOff(0x1108), 0x1180); // UnwindInfoAddress
+        version2Epilog[RvaToOff(0x1180) + 0] = 2;      // UNWIND_INFO version 2
+        version2Epilog[RvaToOff(0x1180) + 1] = 6;      // SizeOfProlog
+        version2Epilog[RvaToOff(0x1180) + 2] = 2;      // epilog + padding slots
+        version2Epilog[RvaToOff(0x1180) + 3] = 0;
+        version2Epilog[RvaToOff(0x1180) + 4] = 2;      // UWOP_EPILOG, size 2
+        version2Epilog[RvaToOff(0x1180) + 5] = 0x16;   // first epilog at function end
+        version2Epilog[RvaToOff(0x1180) + 6] = 0;      // zero-offset padding entry
+        version2Epilog[RvaToOff(0x1180) + 7] = 0x06;
+        Check(hinv::mapper::BuildMappedImage(&backend, version2Epilog,
+                                              FAKE_KERNEL_BASE, mapped),
+              "version 2 UWOP_EPILOG unwind info accepted");
+
+        auto badVersion2Epilog = version2Epilog;
+        badVersion2Epilog[RvaToOff(0x1180) + 4] = 0x80; // larger than function
+        Check(!hinv::mapper::BuildMappedImage(&backend, badVersion2Epilog,
+                                               FAKE_KERNEL_BASE, mapped),
+              "version 2 epilog beyond function rejected");
+
         auto truncatedHeader = validUnwindPe;
         W32(truncatedHeader, RvaToOff(0x1108), 0x1FFE);
         Check(!hinv::mapper::BuildMappedImage(&backend, truncatedHeader,
@@ -590,7 +614,7 @@ int main() {
               "truncated chained unwind-code area rejected");
 
         auto badVersion = validUnwindPe;
-        badVersion[RvaToOff(0x1180)] = 2;
+        badVersion[RvaToOff(0x1180)] = 3;
         Check(!hinv::mapper::BuildMappedImage(&backend, badVersion,
                                                FAKE_KERNEL_BASE, mapped),
               "unsupported unwind info version rejected");

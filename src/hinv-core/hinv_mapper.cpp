@@ -74,7 +74,7 @@ static bool HasValidRuntimeBounds(const IMAGE_RUNTIME_FUNCTION_ENTRY& entry,
 }
 
 static bool ValidateUnwindInfo(const std::vector<uint8_t>& mapped, uint32_t imageSize,
-                               uint32_t unwindInfoRva) {
+                               uint32_t unwindInfoRva, uint32_t functionSize) {
     constexpr uint8_t kSupportedVersion = 1;
     constexpr uint8_t kExceptionHandler = 0x1;
     constexpr uint8_t kUnwindHandler = 0x2;
@@ -98,7 +98,8 @@ static bool ValidateUnwindInfo(const std::vector<uint8_t>& mapped, uint32_t imag
 
         const uint8_t version = header[0] & 0x7;
         const uint8_t flags = header[0] >> 3;
-        if (version != kSupportedVersion || (flags & ~kSupportedFlags) != 0 ||
+        if ((version != kSupportedVersion && version != 2) ||
+            (flags & ~kSupportedFlags) != 0 ||
             ((flags & kChainInfo) != 0 &&
              (flags & (kExceptionHandler | kUnwindHandler)) != 0))
             return false;
@@ -111,6 +112,43 @@ static bool ValidateUnwindInfo(const std::vector<uint8_t>& mapped, uint32_t imag
         const uint64_t codeRva = static_cast<uint64_t>(unwindInfoRva) + kHeaderSize;
         if (!RangeWithin(codeRva, codeBytes, imageSize)) return false;
         const uint64_t trailingDataRva = codeRva + codeBytes;
+
+        // Version 2 adds UWOP_EPILOG (opcode 6) entries at the front of the
+        // code array. The first entry carries the common epilog size; later
+        // entries carry offsets from the function end. They are metadata, not
+        // prologue operations, and must be excluded from opcode decoding.
+        uint32_t codeStart = 0;
+        if (version == 2 && codeCount != 0) {
+            const uint8_t firstOp = mapped[codeRva + 1] & 0x0F;
+            const uint8_t firstInfo = mapped[codeRva + 1] >> 4;
+            if (firstOp == 6) {
+                const uint32_t epilogSize = mapped[codeRva];
+                if (firstInfo > 1 || epilogSize == 0 || epilogSize > functionSize)
+                    return false;
+
+                codeStart = 1;
+                if (firstInfo == 0) {
+                    // When the first entry does not describe the epilog at
+                    // the function end, the next entry supplies its offset.
+                    if (codeStart >= codeCount ||
+                        (mapped[codeRva + static_cast<uint64_t>(codeStart) * 2 + 1] & 0x0F) != 6)
+                        return false;
+                    const uint32_t offset = mapped[codeRva + static_cast<uint64_t>(codeStart) * 2] |
+                                            (static_cast<uint32_t>(mapped[codeRva + static_cast<uint64_t>(codeStart) * 2 + 1] >> 4) << 8);
+                    if (offset > functionSize) return false;
+                    ++codeStart;
+                }
+
+                while (codeStart < codeCount) {
+                    const uint64_t slotRva = codeRva + static_cast<uint64_t>(codeStart) * 2;
+                    if ((mapped[slotRva + 1] & 0x0F) != 6) break;
+                    const uint32_t offset = mapped[slotRva] |
+                                            (static_cast<uint32_t>(mapped[slotRva + 1] >> 4) << 8);
+                    if (offset > functionSize) return false;
+                    ++codeStart;
+                }
+            }
+        }
 
         // Decode every UNWIND_CODE, including the extra slots consumed by
         // large allocations and far saves. Bounds-checking only the byte
@@ -126,7 +164,7 @@ static bool ValidateUnwindInfo(const std::vector<uint8_t>& mapped, uint32_t imag
         constexpr uint8_t kUwopSaveXmm128Far = 9;
         constexpr uint8_t kUwopPushMachframe = 10;
         uint8_t previousCodeOffset = 0xFF;
-        for (uint32_t slot = 0; slot < codeCount;) {
+        for (uint32_t slot = codeStart; slot < codeCount;) {
             const uint64_t slotRva = codeRva + static_cast<uint64_t>(slot) * 2;
             if (!RangeWithin(slotRva, 2, imageSize)) return false;
             const uint8_t codeOffset = mapped[slotRva];
@@ -166,6 +204,10 @@ static bool ValidateUnwindInfo(const std::vector<uint8_t>& mapped, uint32_t imag
                 case kUwopPushMachframe:
                     if (opInfo > 1) return false;
                     break;
+                case 6:
+                    // UWOP_EPILOG is valid only in the version-2 metadata
+                    // prefix handled above, never in the prologue stream.
+                    return false;
                 default:
                     return false;
             }
@@ -186,6 +228,7 @@ static bool ValidateUnwindInfo(const std::vector<uint8_t>& mapped, uint32_t imag
         if (!RangeWithin(trailingDataRva, sizeof(chained), imageSize)) return false;
         std::memcpy(&chained, mapped.data() + trailingDataRva, sizeof(chained));
         if (!HasValidRuntimeBounds(chained, imageSize)) return false;
+        functionSize = chained.EndAddress - chained.BeginAddress;
         unwindInfoRva = chained.UnwindInfoAddress;
     }
 }
@@ -209,7 +252,8 @@ static bool ValidateRuntimeFunctionTable(const std::vector<uint8_t>& mapped,
         if (!HasValidRuntimeBounds(entry, imageSize) ||
             (i != 0 && entry.BeginAddress < previousBegin) ||
             (i != 0 && entry.BeginAddress < previousEnd) ||
-            !ValidateUnwindInfo(mapped, imageSize, entry.UnwindInfoAddress))
+             !ValidateUnwindInfo(mapped, imageSize, entry.UnwindInfoAddress,
+                                 entry.EndAddress - entry.BeginAddress))
             return false;
         previousBegin = entry.BeginAddress;
         previousEnd = entry.EndAddress;
@@ -633,11 +677,12 @@ static kmem::KernelCallStatus UnregisterFunctionTable(byovd::IByovdBackend* back
         return ok != 0 ? kmem::KernelCallStatus::Executed
                        : kmem::KernelCallStatus::RestorationUncertain;
     }
-    // 24H2+ has no supported user-mode API in this project. No manual IFT
-    // registration is ever marked as successful, so reaching this branch is
-    // an invariant violation rather than a license to edit the table.
-    (void)imageBase;
-    return kmem::KernelCallStatus::RestorationUncertain;
+    // The normal 24H2 path is read-only and never reaches here. An explicit
+    // build-gated lab mode may have registered through the private table and
+    // can remove the matching entry with the same guarded helper.
+    return kmem::RemoveInvertedFunctionTableEntry(backend, imageBase)
+        ? kmem::KernelCallStatus::Executed
+        : kmem::KernelCallStatus::RestorationUncertain;
 }
 
 static bool ReleaseImageAfterFailure(byovd::IByovdBackend* backend, uint64_t kernelBase,
@@ -852,16 +897,20 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
             functionTableRegistered = true;
             kmem::Trace("mapper: function table registered");
         } else {
-            // 24H2 removed the public registration API. The private IFT lock
-            // is not exposed and this project must not edit the table with an
-            // epoch-only protocol. Reject before DriverEntry and release the
-            // image because no kernel reference was created.
-            result.error = "no supported function-table registration API on this Windows build";
-            result.imageBase = kernelBase;
-            if (ReleaseImageAfterFailure(backend, kernelBase, functionTableVa,
-                                          kernelBase, false))
-                result.imageBase = 0;
-            return result;
+            // 24H2 removed the public registration API. The default remains
+            // fail-closed; an explicit build-gated lab mode may use the
+            // private inverted table helper for this exact HyperDbg case.
+            if (!kmem::InsertInvertedFunctionTableEntry(
+                    backend, functionTableVa, kernelBase, imageSize, excDir.Size)) {
+                result.error = "no supported function-table registration API on this Windows build";
+                result.imageBase = kernelBase;
+                if (ReleaseImageAfterFailure(backend, kernelBase, functionTableVa,
+                                              kernelBase, false))
+                    result.imageBase = 0;
+                return result;
+            }
+            functionTableRegistered = true;
+            kmem::Trace("mapper: function table registered (legacy inverted)");
         }
     }
 

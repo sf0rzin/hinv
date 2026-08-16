@@ -100,10 +100,11 @@ void Trace(const char* stage);
 // Win11 24H2 removed ntoskrnl!RtlAddFunctionTable / RtlDeleteFunctionTable.
 // Although the private PsInvertedFunctionTable layout can be located for
 // diagnostics, its Epoch is not a writer lock and the real lock/routine is
-// build-private. hinv therefore never writes this table; images that require
-// dynamic .pdata registration are rejected when the supported API is absent.
-// The diagnostic layout below is retained only for unit-testable read-only
-// address extraction:
+// build-private. The default path therefore never writes this table; images
+// that require dynamic .pdata registration are rejected when the supported
+// API is absent. An explicit build-gated lab switch enables the legacy direct
+// mutation path for the tested Windows 26200 HyperDbg image only.
+// The layout below is retained for address extraction and that lab path:
 //   +0x00 CurrentSize (u32)   +0x04 MaximumSize (u32)
 //   +0x08 Epoch (u32; odd while mutating, bumped twice per mutation)
 //   +0x0C Overflow (u8; kernel sets it instead of inserting when full)
@@ -115,16 +116,15 @@ void Trace(const char* stage);
 // (exported on every build), which reads the fast-path entry through
 // PsInvertedFunctionTable+0x18 with a RIP-relative load right after its prologue.
 
-// Resolve PsInvertedFunctionTable for read-only diagnostics. Always returns 0
-// for the production mutation path.
+// Resolve PsInvertedFunctionTable. Returns 0 unless the explicit lab mutation
+// switch is enabled.
 uint64_t ResolveInvertedFunctionTable(byovd::IByovdBackend* backend);
 
-// Retained for API compatibility with diagnostic callers. Always fails closed;
-// no user-mode code may mutate PsInvertedFunctionTable.
+// Inserts/removes entries only when HINV_LEGACY_IFT_MUTATION=1 is enabled on
+// the supported lab build. The default remains fail-closed.
 bool InsertInvertedFunctionTableEntry(byovd::IByovdBackend* backend, uint64_t functionTableVa,
                                       uint64_t imageBase, uint32_t imageSize, uint32_t tableSize);
 
-// Retained for API compatibility with diagnostic callers. Always fails closed.
 bool RemoveInvertedFunctionTableEntry(byovd::IByovdBackend* backend, uint64_t imageBase);
 
 namespace detail {
@@ -142,17 +142,25 @@ bool RemoveInvertedFunctionTableEntryAt(byovd::IByovdBackend* backend, uint64_t 
 namespace detail {
 
 // Install/remove the temporary ntoskrnl!NtAddAtom hook used by
-// CallKernelFunction. The entry is changed with one aligned 8-byte store to a
-// relative jump. The jump lands in an executable pool trampoline which checks
-// that the call originates on the owner KTHREAD before dispatching the target.
+// CallKernelFunction. The normal path changes the entry with one aligned
+// 8-byte store to a relative jump. A lab-only absolute 12-byte compatibility
+// path can be enabled explicitly with HINV_LEGACY_ABSOLUTE_HOOK=1 when pool
+// VA layout makes the relative jump unreachable. Both paths land in an
+// executable pool trampoline which checks the owner KTHREAD.
 enum class HookInstallStatus {
     Failed,
     Installed,
     Uncertain,
 };
+enum class HookMode {
+    Relative8,
+    Absolute12,
+};
+bool LegacyAbsoluteHookEnabled();
 HookInstallStatus InstallCallHook(byovd::IByovdBackend* backend, uint64_t gateVa,
-                                  uint8_t (&original)[8]);
-bool RemoveCallHook(byovd::IByovdBackend* backend, const uint8_t (&original)[8]);
+                                  uint8_t (&original)[12], HookMode& mode);
+bool RemoveCallHook(byovd::IByovdBackend* backend, const uint8_t (&original)[12],
+                    HookMode mode);
 
 // The hook mutex has an Administrators/SYSTEM DACL and is shared by all
 // cooperating hinv processes. It is not used as a substitute for atomic code
@@ -227,8 +235,9 @@ KernelCallStatus CallKernelFunction(byovd::IByovdBackend* backend, T* outResult,
     if (!detail::ConfigureCallGate(backend, gateVa, ownerKthread, funcVa))
         return KernelCallStatus::NotExecuted;
 
-    uint8_t original[8]{};
-    const auto install = detail::InstallCallHook(backend, gateVa, original);
+    uint8_t original[12]{};
+    detail::HookMode hookMode = detail::HookMode::Relative8;
+    const auto install = detail::InstallCallHook(backend, gateVa, original, hookMode);
     if (install == detail::HookInstallStatus::Uncertain)
         return KernelCallStatus::RestorationUncertain;
     if (install != detail::HookInstallStatus::Installed)
@@ -237,7 +246,7 @@ KernelCallStatus CallKernelFunction(byovd::IByovdBackend* backend, T* outResult,
     using Fn = T(__stdcall*)(A...);
     auto fn = reinterpret_cast<Fn>(detail::UserNtAddAtom());
     if (!fn) {
-        return detail::RemoveCallHook(backend, original)
+        return detail::RemoveCallHook(backend, original, hookMode)
             ? KernelCallStatus::NotExecuted
             : KernelCallStatus::RestorationUncertain;
     }
@@ -249,7 +258,7 @@ KernelCallStatus CallKernelFunction(byovd::IByovdBackend* backend, T* outResult,
     }
     Trace("kmem: syscall returned");
 
-    if (!detail::RemoveCallHook(backend, original)) {
+    if (!detail::RemoveCallHook(backend, original, hookMode)) {
         Trace("kmem: CRITICAL hook restore FAILED (NtAddAtom left patched)");
         return KernelCallStatus::RestorationUncertain;
     }

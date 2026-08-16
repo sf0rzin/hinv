@@ -46,6 +46,30 @@ endif()
 
 target_link_libraries(hinv PRIVATE psapi advapi32 ntdll bcrypt)
 
+# Lab-only HyperDbg API smoke binary. It is deliberately excluded from the
+# default build and is not registered as a CTest because it requires a live
+# HyperDbg device in the disposable VM.
+option(HINV_BUILD_LAB_SMOKE "Build the lab-only HyperDbg API smoke binary" OFF)
+if (HINV_BUILD_LAB_SMOKE)
+    add_executable(hinv_hyperdbg_api_smoke EXCLUDE_FROM_ALL
+        tests/hyperdbg_api_smoke.cpp
+        src/hinv-core/hinv_kmem.cpp
+        src/hinv-core/hinv_vmm.cpp
+    )
+    target_compile_definitions(hinv_hyperdbg_api_smoke PRIVATE
+        UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_include_directories(hinv_hyperdbg_api_smoke PRIVATE ${HINV_INCLUDE_DIR})
+    if (MSVC)
+        target_compile_options(hinv_hyperdbg_api_smoke PRIVATE /W4)
+    else()
+        target_compile_options(hinv_hyperdbg_api_smoke PRIVATE -Wall -Wextra)
+        target_link_options(hinv_hyperdbg_api_smoke PRIVATE -static)
+    endif()
+    target_link_libraries(hinv_hyperdbg_api_smoke PRIVATE psapi advapi32 ntdll bcrypt)
+    set_target_properties(hinv_hyperdbg_api_smoke PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lab")
+endif()
+
 # Tests
 include(CTest)
 if (BUILD_TESTING)

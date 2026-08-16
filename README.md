@@ -184,6 +184,13 @@ hinv::vmm::VirtualToPhysicalHyperDbg(0xFFFFF80000000000, physical);
 hinv.exe load drivers\hyperhv.dll drivers\hyperlog.dll drivers\hypertrace.dll drivers\kdserial.dll drivers\hyperkd.sys --byovd drivers\iqvw64e.sys --null-drvobj
 ```
 
+On the Windows 26200 lab build tested here, the compatibility switches are required:
+
+```cmd
+set HINV_LEGACY_ABSOLUTE_HOOK=1
+set HINV_LEGACY_IFT_MUTATION=1
+```
+
 Prerequisites:
 
 - A **disposable VM** (this is an educational prototype; expect instability).
@@ -229,6 +236,25 @@ hinv.exe process-traces iqvw64e.sys --byovd C:\lab\iqvw64e.sys
 hinv.exe headless --byovd C:\lab\iqvw64e.sys --script script.txt
 ```
 
+For structured API coverage, build the lab-only smoke binary explicitly:
+
+```cmd
+cmake -S . -B build -DHINV_BUILD_LAB_SMOKE=ON
+cmake --build build --target hinv_hyperdbg_api_smoke --parallel
+build\lab\hinv_hyperdbg_api_smoke.exe --skip-init
+```
+
+Use `--close-session` only when the smoke process owns the VMM session; the
+default `--skip-init` path leaves a shared headless session open.
+
+The binary uses Win32/NT process APIs and exercises kernel reads, current-process
+scratch reads/edits, VA-to-PA plus physical reads, cross-process reads/edits, and
+PEB/image-base discovery. It edits only memory allocated for the test processes;
+it does not write arbitrary kernel addresses. Run it while the same interactive
+headless session that initialized the VMM remains alive.
+The process must run with `SeDebugPrivilege` available and enabled so Windows
+returns kernel module base addresses.
+
 - Set `HINV_TRACE=C:\lab\trace.log` for per-stage telemetry that survives a bugcheck (every line is flushed by close). When a run fails, the trace shows the last completed stage; when the machine bugchecks, Event ID 1001 in the `System` log carries the bugcheck code and the faulting address.
 - Success looks like `DriverEntry returned 0x0` / `[+] Mapped at 0x...`. A completed pass logs `PiDDBCacheTable processed`, `g_KernelHashBucketList processed`, and `WdFilterDriverList processed` (skipped when WdFilter is not loaded).
 
@@ -244,14 +270,15 @@ Hard-won rules, baked in after live-fire debugging on Windows 11 26200:
 
 This is an **experimental prototype**. The following areas are incomplete or unstable:
 
-- **Kernel execution primitive** no longer uses shellcode, `HalDispatchTable`, or the (randomized-per-boot) PTE self-reference index. Kernel functions are called through a temporary `ntoskrnl!NtAddAtom` hook written via the Intel backend's physical-mapping IOCTLs (`0x25`/`0x19`/`0x1A`), kdmapper-style. The entry patch is one aligned atomic 8-byte jump to an executable gate that rejects unrelated `KTHREAD`s. This requires a backend with atomic read-only writes — currently only `iqvw64e.sys`; the DbUtil backend can only read/write plain kernel memory.
+- **Kernel execution primitive** no longer uses shellcode, `HalDispatchTable`, or the (randomized-per-boot) PTE self-reference index. Kernel functions are called through a temporary `ntoskrnl!NtAddAtom` hook written via the Intel backend's physical-mapping IOCTLs (`0x25`/`0x19`/`0x1A`), kdmapper-style. The normal entry patch is one aligned atomic 8-byte jump to an executable gate that rejects unrelated `KTHREAD`s. This requires a backend with atomic read-only writes — currently only `iqvw64e.sys`; the DbUtil backend can only read/write plain kernel memory. Some Windows 11 pool layouts place the gate outside the signed 32-bit jump range; the default path fails closed there. For a disposable lab VM only, `HINV_LEGACY_ABSOLUTE_HOOK=1` enables the legacy 12-byte absolute publication path, which is non-atomic and must not be used on a host or production system. The KTHREAD gate and read-back restoration checks remain active in that mode.
 - A kernel call has three outcomes: not executed, executed and restored, or restoration uncertain. The last outcome retains all reachable allocations and aborts further kernel calls; it is never reported as success.
-- **PsInvertedFunctionTable** is read-only to hinv. On builds without the supported `RtlAddFunctionTable` export, mapping an image with `.pdata` is rejected and its allocation is released. An epoch counter is not a substitute for the private kernel writer lock.
+- **PsInvertedFunctionTable** is read-only by default. On builds without the supported `RtlAddFunctionTable` export, mapping an image with `.pdata` is rejected and its allocation is released. For the tested Windows build `26200` only, `HINV_LEGACY_IFT_MUTATION=1` enables the legacy direct insert/remove path needed by HyperDbg's manually mapped `.pdata`; the epoch counter is not a substitute for the private kernel writer lock, so this switch is lab-only and unsafe on hosts or other builds.
 - **MmUnloadedDrivers** is not processed post-hoc (the array layout is build-dependent and only written at unload). Instead, the backend arms prevention at unload: the vulnerable driver's own `KLDR_DATA_TABLE_ENTRY` name is zeroed so `MiRememberUnloadedDriver` skips recording it (kdmapper approach).
 - **PiDDBCacheTable / g_KernelHashBucketList / WdFilter** maintenance operations use kdmapper's patterns and locking discipline (`PiDDBLock` / `g_HashCacheLock` acquired via `ExAcquireResourceExclusiveLite`), resolved per build by pattern scan. If a pattern matches nothing on a future build, the maintenance path fails closed with a log line.
 - **Driver object** is a minimal synthetic `DRIVER_OBJECT` allocated in kernel pool by default. With the legacy `--null-drvobj` flag, hinv calls `IoCreateDriver` so the mapped entry receives a real Object-Manager-owned object; it no longer hijacks `\Driver\Null`.
 - **Vulnerable driver compatibility** varies by build. Two backends are implemented: `dbutil_2_3.sys` (plain kernel read/write only) and the reference `iqvw64e.sys` (kdmapper-compatible, `\\.\Nal` device, single `CopyMemory` IOCTL `0x80862007`; the public LOLDrivers sample with SHA256 `4429f32db1cc70567919d7d47b844a91cf1329a6cd116f582305f3b7b60cd60b`). Unknown names are rejected, and the Intel profile verifies this SHA256 before loading. The Intel backend supplies read/write plus the kdmapper physical-mapping helpers (`GetPhysicalAddress`/`MapIoSpace`/`UnmapIoSpace`), which power read-only memory writes for the `NtAddAtom` hook.
 - **HyperDbg integration** uses structured packets for read/edit/VA2PA, honoring HyperDbg's `DEBUGGER_OPERATION_WAS_SUCCESSFUL` (`0xFFFFFFFF`) status convention and per-value 8-byte-slot edit layout. Arbitrary script commands (`!syscall`, `!monitor`, etc.) require the full `libhyperdbg` script engine and are not supported.
+- **VMM initialization** is one-shot per VM boot on this HyperDbg build. Keep the initialized headless session alive for structured reads; a second process must reuse the active session and must not call `InitializeVmm` again.
 - **EPT cloaking and text commands** (`!epthook2`, `!monitor`, …) were removed rather than kept as stubs that always fail; they require HyperDbg's `DEBUGGER_EVENT` machinery / script engine. Only the structured packet operations (`hinv_vmm`) remain.
 - **Named pipe security** restricts access to local SYSTEM/Administrators and rejects remote clients. A client with local administrator rights can still control the session.
 - **Automated tests** cover PE parser safety (section/import/relocation/unwind bounds, fixed-base images, and malformed inputs are rejected fail-closed), refusal of unsynchronized IFT writes, and the SDK's timeout/result contract; kernel-mode behavior is not automatically tested.
