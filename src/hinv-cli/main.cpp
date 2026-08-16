@@ -8,14 +8,14 @@
 #include "../hinv-core/hinv_byovd.hpp"
 #include "../hinv-core/hinv_kmem.hpp"
 #include "../hinv-core/hinv_vmm.hpp"
-#include "../hinv-core/hinv_cleaner.hpp"
+#include "../hinv-core/hinv_maintenance.hpp"
 #include "../hinv-core/hinv_mapper.hpp"
 #include "../hinv-core/headless/hinv_headless.hpp"
 
 static void PrintUsage() {
     std::cout << "Usage:\n"
               << "  hinv.exe load <driver.sys> [more modules...] --byovd <vulnerable.sys> [--null-drvobj]\n"
-              << "  hinv.exe clean <drivername> --byovd <vulnerable.sys>\n"
+              << "  hinv.exe process-traces <drivername> --byovd <vulnerable.sys>\n"
               << "  hinv.exe headless --byovd <vulnerable.sys> [--script <script.txt>]\n"
               << "  hinv.exe status\n"
               << "\n"
@@ -99,7 +99,7 @@ static int RunWideMain(int argc, wchar_t* argv[]) {
     // Commands below require an active BYOVD backend. Unknown commands must
     // bail BEFORE we install/start the vulnerable driver (and with a non-zero
     // exit code, so scripts notice).
-    if (command != L"load" && command != L"clean") {
+    if (command != L"load" && command != L"process-traces") {
         PrintUsage();
         return 1;
     }
@@ -127,7 +127,7 @@ static int RunWideMain(int argc, wchar_t* argv[]) {
         } else if (driverName.empty()) {
             driverName = arg;
         } else {
-            std::cerr << "[-] Too many positional arguments for clean\n";
+            std::cerr << "[-] Too many positional arguments for process-traces\n";
             return 1;
         }
     }
@@ -135,7 +135,7 @@ static int RunWideMain(int argc, wchar_t* argv[]) {
         std::cerr << "[-] No input files given\n";
         return 1;
     }
-    if (command == L"clean" && driverName.empty()) {
+    if (command == L"process-traces" && driverName.empty()) {
         std::cerr << "[-] No driver name given\n";
         return 1;
     }
@@ -156,10 +156,10 @@ static int RunWideMain(int argc, wchar_t* argv[]) {
         }
     }
 
-    uint32_t cleanTimestamp = 0;
-    if (command == L"clean") {
-        cleanTimestamp = hinv::cleaner::GetDriverFileTimestamp(byovdPath);
-        if (cleanTimestamp == 0) {
+    uint32_t driverTimestamp = 0;
+    if (command == L"process-traces") {
+        driverTimestamp = hinv::maintenance::GetDriverFileTimestamp(byovdPath);
+        if (driverTimestamp == 0) {
             std::wcerr << L"[-] BYOVD preflight failed: invalid or unreadable PE file\n";
             return 1;
         }
@@ -220,17 +220,17 @@ static int RunWideMain(int argc, wchar_t* argv[]) {
         return 0;
     }
 
-    if (command == L"clean") {
+    if (command == L"process-traces") {
         // First positional (non-flag) argument is the driver name — same
-        // convention as load, so `clean --byovd x.sys name` works too.
-        auto result = hinv::cleaner::CleanDriverTraces(backend.get(), driverName, cleanTimestamp);
+        // convention as load, so `process-traces --byovd x.sys name` works too.
+        auto result = hinv::maintenance::ProcessDriverTraces(backend.get(), driverName, driverTimestamp);
         if (!result.piDdbCache && !result.hashBucketList && !result.wdFilter) {
-            std::wcerr << L"[-] Trace cleaning did not find matching entries: " << result.error << L"\n";
+            std::wcerr << L"[-] Trace processing did not find matching entries: " << result.error << L"\n";
             shutdownBackend();
             return 1;
         }
         if (!result.complete) {
-            std::wcerr << L"[-] Trace cleaning was partial: " << result.error << L"\n";
+            std::wcerr << L"[-] Trace processing was partial: " << result.error << L"\n";
             shutdownBackend();
             return 1;
         }

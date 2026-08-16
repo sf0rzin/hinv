@@ -1,7 +1,7 @@
 #include "hinv_headless.hpp"
 #include "../hinv_iat.hpp"
 #include "../hinv_vmm.hpp"
-#include "../hinv_cleaner.hpp"
+#include "../hinv_maintenance.hpp"
 #include "../hinv_mapper.hpp"
 #include "../hinv_kmem.hpp"
 #include "../hinv_util.hpp"
@@ -35,7 +35,7 @@ static std::atomic<bool> g_running{ false };
 static std::atomic<bool> g_acceptingCommands{ false };
 static std::mutex g_stopEventMutex;
 static HANDLE g_stopEvent = nullptr;
-static std::wstring g_byovdPath; // used by 'clean' for the driver file timestamp
+static std::wstring g_byovdPath; // used by 'process-traces' for the driver file timestamp
 static constexpr std::size_t MAX_CLIENTS = 32;
 struct ClientSlot {
     std::atomic<bool> done{ false };
@@ -151,7 +151,7 @@ static std::vector<std::string> Tokenize(const std::string& line) {
 }
 
 // Everything after "<cmd> " is the literal argument — driver paths may contain
-// spaces, so load/clean must NOT go through whitespace tokenization (a split
+// spaces, so load/process-traces must NOT go through whitespace tokenization (a split
 // path could map the WRONG file into the kernel, silently).
 static std::string RestAfterCommand(const std::string& line) {
     size_t sp = line.find_first_of(" \t");
@@ -223,20 +223,20 @@ static std::string ProcessCommandInternal(
         return ss.str();
     }
 
-    if (cmd == "clean") {
+    if (cmd == "process-traces") {
         if (!BeginCommand()) return "ERR shutting down";
         std::string arg = RestAfterCommand(command);
-        if (arg.empty()) return "ERR usage: clean <utf8-drivername>";
+        if (arg.empty()) return "ERR usage: process-traces <utf8-drivername>";
         if (arg.find('\0') != std::string::npos) return "ERR invalid UTF-8 driver name";
         std::wstring name;
         if (!util::Utf8ToWide(arg, &name)) return "ERR invalid UTF-8 driver name";
         std::lock_guard<std::mutex> lock(g_backendMutex);
         if (!g_backend) return "ERR no BYOVD backend loaded";
-        uint32_t timestamp = cleaner::GetDriverFileTimestamp(g_byovdPath);
-        auto result = cleaner::CleanDriverTraces(g_backend.get(), name, timestamp);
+        uint32_t timestamp = maintenance::GetDriverFileTimestamp(g_byovdPath);
+        auto result = maintenance::ProcessDriverTraces(g_backend.get(), name, timestamp);
         if ((!result.piDdbCache && !result.hashBucketList && !result.wdFilter) || !result.complete) {
             std::string error;
-            if (!util::WideToUtf8(result.error, &error)) error = "trace cleanup failed";
+            if (!util::WideToUtf8(result.error, &error)) error = "trace processing failed";
             return "ERR " + error;
         }
         return "OK";
@@ -384,7 +384,7 @@ static bool ValidateScriptLines(const std::vector<std::string>& lines) {
             g_scriptModuleBytes[LoadPathKey(path)] = std::move(bytes);
             continue;
         }
-        if (command == "clean") {
+        if (command == "process-traces") {
             const std::string arg = RestAfterCommand(line);
             std::wstring name;
             if (arg.empty() || !util::Utf8ToWide(arg, &name)) return false;
@@ -734,7 +734,7 @@ bool RunHeadlessSession(const HeadlessConfig& config) {
     if (!config.byovdDriverPath.empty()) {
         std::vector<uint8_t> byovdBytes;
         if (!mapper::ReadDriverFileBytes(config.byovdDriverPath, byovdBytes) ||
-            cleaner::GetDriverFileTimestamp(config.byovdDriverPath) == 0) {
+            maintenance::GetDriverFileTimestamp(config.byovdDriverPath) == 0) {
             std::cerr << "[hinv::headless] BYOVD preflight failed\n";
             return false;
         }
@@ -766,7 +766,7 @@ bool RunHeadlessSession(const HeadlessConfig& config) {
     }
     g_acceptingCommands.store(true);
 
-    auto cleanup = [stopEvent] {
+    auto finalizeSession = [stopEvent] {
         SignalStop();
         CloseStopEvent(stopEvent);
         bool backendOk = true;
@@ -797,8 +797,8 @@ bool RunHeadlessSession(const HeadlessConfig& config) {
         }
         if (!loaded) {
             std::cerr << "[hinv::headless] Failed to load BYOVD driver\n";
-            const bool cleanupOk = cleanup();
-            if (!cleanupOk) std::cerr << "[hinv::headless] Cleanup also failed\n";
+            const bool finalizeOk = finalizeSession();
+            if (!finalizeOk) std::cerr << "[hinv::headless] Session finalization also failed\n";
             return false;
         }
         std::wcout << L"[hinv::headless] BYOVD backend loaded: " << config.byovdDriverPath << L"\n";
@@ -806,8 +806,8 @@ bool RunHeadlessSession(const HeadlessConfig& config) {
 
     if (g_running.load() && !scriptLines.empty() && !ExecuteScriptLines(scriptLines)) {
         std::cerr << "[hinv::headless] Script failed, aborting session\n";
-        const bool cleanupOk = cleanup();
-        if (!cleanupOk) std::cerr << "[hinv::headless] Cleanup also failed\n";
+        const bool finalizeOk = finalizeSession();
+        if (!finalizeOk) std::cerr << "[hinv::headless] Session finalization also failed\n";
         return false;
     }
 
@@ -826,8 +826,8 @@ bool RunHeadlessSession(const HeadlessConfig& config) {
         } catch (...) {
             SignalStop();
             JoinAllClients();
-            const bool cleanupOk = cleanup();
-            if (!cleanupOk) std::cerr << "[hinv::headless] Cleanup also failed\n";
+            const bool finalizeOk = finalizeSession();
+            if (!finalizeOk) std::cerr << "[hinv::headless] Session finalization also failed\n";
             return false;
         }
         ipcThread.join(); // blocks until exit, StopHeadlessSession, or IPC failure
@@ -839,13 +839,13 @@ bool RunHeadlessSession(const HeadlessConfig& config) {
     SignalStop();
     JoinAllClients();
 
-    const bool cleanupOk = cleanup();
+    const bool finalizeOk = finalizeSession();
     if (ipcFailed) {
         std::cerr << "[hinv::headless] IPC server failed\n";
         return false;
     }
-    if (!cleanupOk) {
-        std::cerr << "[hinv::headless] Session cleanup failed\n";
+    if (!finalizeOk) {
+        std::cerr << "[hinv::headless] Session finalization failed\n";
         return false;
     }
 

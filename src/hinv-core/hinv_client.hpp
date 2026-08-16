@@ -147,12 +147,12 @@ public:
         return SendCommandInternal(command, NextRequestId(), outResponse);
     }
 
-    ClientCommandResult CleanKernelTraces(const std::string& driverName) {
-        return SendUtf8Argument("clean ", driverName);
+    ClientCommandResult ProcessKernelTraces(const std::string& driverName) {
+        return SendUtf8Argument("process-traces ", driverName);
     }
 
-    ClientCommandResult CleanKernelTraces(const std::wstring& driverName) {
-        return SendWideArgument("clean ", driverName);
+    ClientCommandResult ProcessKernelTraces(const std::wstring& driverName) {
+        return SendWideArgument("process-traces ", driverName);
     }
 
     // Narrow path arguments are strict UTF-8. The explicit command used for a

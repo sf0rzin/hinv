@@ -15,7 +15,7 @@
 #include "../src/hinv-core/hinv_mapper.hpp"
 #include "../src/hinv-core/hinv_kmem.hpp"
 #include "../src/hinv-core/hinv_byovd.hpp"
-#include "../src/hinv-core/hinv_cleaner.hpp"
+#include "../src/hinv-core/hinv_maintenance.hpp"
 
 // A mock backend that does nothing; used to test PE parsing logic without kernel access.
 class MockBackend : public hinv::byovd::IByovdBackend {
@@ -835,10 +835,10 @@ int main() {
             std::fwrite(pe.data(), 1, pe.size(), f);
             std::fclose(f);
         }
-        uint32_t ts = hinv::cleaner::GetDriverFileTimestamp(L"hinv_test_timestamp.sys");
+        uint32_t ts = hinv::maintenance::GetDriverFileTimestamp(L"hinv_test_timestamp.sys");
         Check(ts == 0xDEADBEEF, "driver timestamp read from disk");
         std::remove(tmpA);
-        Check(hinv::cleaner::GetDriverFileTimestamp(L"no_such_file.sys") == 0,
+        Check(hinv::maintenance::GetDriverFileTimestamp(L"no_such_file.sys") == 0,
               "missing file timestamp is 0");
     }
 

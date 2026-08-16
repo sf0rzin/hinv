@@ -1,6 +1,6 @@
 #include "hinv_byovd.hpp"
 #include "hinv_kmem.hpp"
-#include "hinv_cleaner.hpp"
+#include "hinv_maintenance.hpp"
 #include <iostream>
 #include <cwctype>
 #include <algorithm>
@@ -242,7 +242,7 @@ bool InstallDriverService(const std::wstring& serviceName, const std::wstring& d
             // Never adopt or repoint a service that another process may own.
             // The Intel backend has an explicit, path-checked recovery path for
             // its own leftovers; all other existing services require manual
-            // cleanup instead of destructive takeover.
+            // recovery instead of destructive takeover.
             std::wcerr << L"[hinv::byovd] Service already exists: " << serviceName << L"\n";
         } else {
             std::wcerr << L"[hinv::byovd] CreateServiceW failed: " << err << L"\n";
@@ -547,7 +547,7 @@ public:
     std::wstring  serviceName_;
     std::wstring  driverPath_;
     bool          ownsService_ = false; // only stop/remove what WE installed
-    cleaner::UnloadPreventionState unloadPrevention_{};
+    maintenance::DriverUnloadState unloadPrevention_{};
     bool          serviceStopConfirmed_ = false;
     bool          teardownBlocked_ = false;
 
@@ -617,22 +617,22 @@ public:
         }
         if (hDevice_ != INVALID_HANDLE_VALUE) {
             if (ownsService_ && !unloadPrevention_.armed &&
-                !cleaner::PreventUnloadedDriverTrace(this, hDevice_, &unloadPrevention_)) {
+                !maintenance::PrepareDriverUnload(this, hDevice_, &unloadPrevention_)) {
                 std::wcerr << L"[hinv::byovd] Refusing teardown: unload-trace prevention was not confirmed\n";
                 return false;
             }
             if (ownsService_ && !StopDriverService(serviceName_)) {
                 kmem::Trace("byovd: service stop FAILED");
                 if (unloadPrevention_.armed &&
-                    !cleaner::RestoreUnloadedDriverTrace(this, unloadPrevention_)) {
+                    !maintenance::RestoreDriverUnload(this, unloadPrevention_)) {
                     std::wcerr << L"[hinv::byovd] Could not restore driver name after failed stop\n";
                     teardownBlocked_ = true;
                 }
                 return false;
             }
             if (ownsService_) serviceStopConfirmed_ = true;
-            if (!ownsService_ && unloadPrevention_.armed &&
-                !cleaner::RestoreUnloadedDriverTrace(this, unloadPrevention_)) {
+        if (!ownsService_ && unloadPrevention_.armed &&
+                !maintenance::RestoreDriverUnload(this, unloadPrevention_)) {
                 teardownBlocked_ = true;
                 return false;
             }
@@ -785,7 +785,7 @@ public:
     std::wstring  serviceName_;
     std::wstring  driverPath_;
     bool          ownsService_ = false; // only stop/remove what WE installed
-    cleaner::UnloadPreventionState unloadPrevention_{};
+    maintenance::DriverUnloadState unloadPrevention_{};
     bool          serviceStopConfirmed_ = false;
     bool          teardownBlocked_ = false;
 
@@ -875,14 +875,14 @@ public:
         }
         if (hDevice_ != INVALID_HANDLE_VALUE) {
             if (ownsService_ && !unloadPrevention_.armed &&
-                !cleaner::PreventUnloadedDriverTrace(this, hDevice_, &unloadPrevention_)) {
+                !maintenance::PrepareDriverUnload(this, hDevice_, &unloadPrevention_)) {
                 std::wcerr << L"[hinv::byovd] Refusing teardown: unload-trace prevention was not confirmed\n";
                 return false;
             }
             if (ownsService_ && !StopDriverService(serviceName_)) {
                 kmem::Trace("byovd: service stop FAILED");
                 if (unloadPrevention_.armed &&
-                    !cleaner::RestoreUnloadedDriverTrace(this, unloadPrevention_)) {
+                    !maintenance::RestoreDriverUnload(this, unloadPrevention_)) {
                     std::wcerr << L"[hinv::byovd] Could not restore driver name after failed stop\n";
                     teardownBlocked_ = true;
                 }
@@ -890,7 +890,7 @@ public:
             }
             if (ownsService_) serviceStopConfirmed_ = true;
             if (!ownsService_ && unloadPrevention_.armed &&
-                !cleaner::RestoreUnloadedDriverTrace(this, unloadPrevention_)) {
+                !maintenance::RestoreDriverUnload(this, unloadPrevention_)) {
                 teardownBlocked_ = true;
                 return false;
             }

@@ -993,7 +993,7 @@ MappingResult MapDriverBytes(byovd::IByovdBackend* backend, const std::vector<ui
                 uint32_t flags = 0;
                 if (kmem::ReadU32(backend, dev + 0x30, flags) && (flags & 0x80)) {
                     if (kmem::WriteU32(backend, dev + 0x30, flags & ~0x80u)) {
-                        std::cout << "[hinv::mapper] Cleared DO_DEVICE_INITIALIZING on device 0x"
+                        std::cout << "[hinv::mapper] Updated DO_DEVICE_INITIALIZING on device 0x"
                                   << std::hex << dev << std::dec << "\n";
                     } else {
                         // Without this clear the device rejects every open with

@@ -21,7 +21,7 @@ set(HINV_CORE_SOURCES
     src/hinv-core/hinv_kmem.cpp
     src/hinv-core/hinv_iat.cpp
     src/hinv-core/hinv_vmm.cpp
-    src/hinv-core/hinv_cleaner.cpp
+    src/hinv-core/hinv_maintenance.cpp
     src/hinv-core/hinv_mapper.cpp
     src/hinv-core/headless/hinv_headless.cpp
 )
