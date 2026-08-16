@@ -27,7 +27,7 @@ Think of it as a lab toolkit: read the code, run it in a VM, break it, fix it, a
 | `hinv_byovd` | Loads an explicitly supported vulnerable signed driver as a service and exposes kernel read/write primitives. Supports `dbutil_2_3.sys` and the reference `iqvw64e.sys` binary (Intel, kdmapper-compatible `CopyMemory` IOCTL); unknown names and unverified reference binaries are rejected. |
 | `hinv_kmem` | Kernel export resolution, arbitrary kernel function calls via a temporary `ntoskrnl!NtAddAtom` prologue hook (kdmapper-style), pool allocation (`ExAllocatePoolWithTag`), and page protection changes (`MmSetPageProtection`). |
 | `hinv_mapper` | Manual PE mapper: parses a `.sys` file, allocates kernel memory, copies sections, fixes relocations, resolves imports, and calls `DriverEntry`. |
-| `hinv_cleaner` | Kernel trace sanitizer: `PiDDBCacheTable` (AVL), `g_KernelHashBucketList` (ci.dll), `WdFilter` runtime driver list, and `MmUnloadedDrivers` prevention at unload time. Patterns ported from kdmapper, validated on Windows 11 26200. |
+| `hinv_maintenance` | Kernel trace maintenance: `PiDDBCacheTable` (AVL), `g_KernelHashBucketList` (ci.dll), `WdFilter` runtime driver list, and `MmUnloadedDrivers` prevention at unload time. Patterns ported from kdmapper, validated on Windows 11 26200. |
 | `hinv_vmm` | HyperDbg device integration via structured IOCTL packets (read/edit memory, VA→PA, VMM init). |
 | `hinv_headless` | Named-pipe IPC server and script executor for automated workflows. |
 | `hinv_client` | Header-only C++ SDK for controlling a running headless instance. |
@@ -47,7 +47,7 @@ hinv-cli / hinv-client
          ▼
 ┌─────────────────┐
 │  hinv_mapper    │  ← PE parse, reloc, imports, DriverEntry
-│  hinv_cleaner   │  ← MmUnloadedDrivers, PiDDBCacheTable
+│  hinv_maintenance│ ← MmUnloadedDrivers, PiDDBCacheTable
 │  hinv_vmm       │  ← HyperDbg IOCTLs
 └────────┬────────┘
          │
@@ -62,7 +62,7 @@ hinv-cli / hinv-client
 └─────────────────┘
 ```
 
-The design follows a clear layering: the BYOVD backend provides the primitive, `hinv_kmem` builds kernel services on top, and the mapper/cleaner/VMM layers use those services to perform higher-level operations.
+The design follows a clear layering: the BYOVD backend provides the primitive, `hinv_kmem` builds kernel services on top, and the mapper/maintenance/VMM layers use those services to perform higher-level operations.
 
 ---
 
@@ -90,7 +90,7 @@ cl /std:c++20 /EHsc /DUNICODE /D_UNICODE /Fe:hinv.exe ^
   src/hinv-core/hinv_kmem.cpp ^
   src/hinv-core/hinv_iat.cpp ^
   src/hinv-core/hinv_vmm.cpp ^
-  src/hinv-core/hinv_cleaner.cpp ^
+  src/hinv-core/hinv_maintenance.cpp ^
   src/hinv-core/hinv_mapper.cpp ^
   src/hinv-core/headless/hinv_headless.cpp ^
   psapi.lib advapi32.lib ntdll.lib
@@ -102,7 +102,7 @@ cl /std:c++20 /EHsc /DUNICODE /D_UNICODE /Fe:hinv.exe ^
 
 ### Load an unsigned driver into a lab VM
 
-Manual mapping, kernel allocation, protection changes, and trace cleaning require the Intel backend because they use its read-only physical-mapping primitive. The DbUtil backend is limited to plain kernel read/write operations.
+Manual mapping, kernel allocation, protection changes, and trace processing require the Intel backend because they use its read-only physical-mapping primitive. The DbUtil backend is limited to plain kernel read/write operations.
 
 ```cmd
 hinv.exe load C:\lab\test_driver.sys --byovd C:\lab\iqvw64e.sys
@@ -114,10 +114,10 @@ The Intel `iqvw64e.sys` backend is selected by its exact file name and the refer
 hinv.exe load C:\lab\test_driver.sys --byovd C:\lab\iqvw64e.sys
 ```
 
-### Clean traces left by the vulnerable driver
+### Process traces left by the vulnerable driver
 
 ```cmd
-hinv.exe clean iqvw64e.sys --byovd C:\lab\iqvw64e.sys
+hinv.exe process-traces iqvw64e.sys --byovd C:\lab\iqvw64e.sys
 ```
 
 ### Run a headless automation script
@@ -126,7 +126,7 @@ hinv.exe clean iqvw64e.sys --byovd C:\lab\iqvw64e.sys
 hinv.exe headless --byovd C:\lab\iqvw64e.sys --script script.txt
 ```
 
-Scripts stop on the first `ERR` response; `exit` ends the script and session. Trace cleaning returns a failure when any applicable structure was not confirmed.
+Scripts stop on the first `ERR` response; `exit` ends the script and session. Trace processing returns a failure when any applicable structure was not confirmed.
 
 Example `script.txt`:
 
@@ -134,8 +134,8 @@ Example `script.txt`:
 # Load a driver into kernel memory
 load C:\lab\test_driver.sys
 
-# Remove traces of the vulnerable driver from kernel logs
-clean iqvw64e.sys
+# Process traces of the vulnerable driver in kernel logs
+process-traces iqvw64e.sys
 
 # Shut down the engine
 exit
@@ -150,7 +150,7 @@ int main() {
     hinv::Client client;
     if (client.Connect()) {
         client.LoadDriver("C:\\lab\\test_driver.sys");
-        client.CleanKernelTraces("iqvw64e.sys");
+        client.ProcessKernelTraces("iqvw64e.sys");
     }
     return 0;
 }
@@ -225,12 +225,12 @@ The full pipeline must be exercised only inside a disposable VM with snapshots. 
 
 ```cmd
 hinv.exe load C:\lab\test_driver.sys --byovd C:\lab\iqvw64e.sys
-hinv.exe clean iqvw64e.sys --byovd C:\lab\iqvw64e.sys
+hinv.exe process-traces iqvw64e.sys --byovd C:\lab\iqvw64e.sys
 hinv.exe headless --byovd C:\lab\iqvw64e.sys --script script.txt
 ```
 
 - Set `HINV_TRACE=C:\lab\trace.log` for per-stage telemetry that survives a bugcheck (every line is flushed by close). When a run fails, the trace shows the last completed stage; when the machine bugchecks, Event ID 1001 in the `System` log carries the bugcheck code and the faulting address.
-- Success looks like `DriverEntry returned 0x0` / `[+] Mapped at 0x...`. A clean pass logs `PiDDBCacheTable cleaned`, `g_KernelHashBucketList cleaned`, and `WdFilterDriverList cleaned` (skipped when WdFilter is not loaded).
+- Success looks like `DriverEntry returned 0x0` / `[+] Mapped at 0x...`. A completed pass logs `PiDDBCacheTable processed`, `g_KernelHashBucketList processed`, and `WdFilterDriverList processed` (skipped when WdFilter is not loaded).
 
 Hard-won rules, baked in after live-fire debugging on Windows 11 26200:
 
@@ -247,8 +247,8 @@ This is an **experimental prototype**. The following areas are incomplete or uns
 - **Kernel execution primitive** no longer uses shellcode, `HalDispatchTable`, or the (randomized-per-boot) PTE self-reference index. Kernel functions are called through a temporary `ntoskrnl!NtAddAtom` hook written via the Intel backend's physical-mapping IOCTLs (`0x25`/`0x19`/`0x1A`), kdmapper-style. The entry patch is one aligned atomic 8-byte jump to an executable gate that rejects unrelated `KTHREAD`s. This requires a backend with atomic read-only writes — currently only `iqvw64e.sys`; the DbUtil backend can only read/write plain kernel memory.
 - A kernel call has three outcomes: not executed, executed and restored, or restoration uncertain. The last outcome retains all reachable allocations and aborts further kernel calls; it is never reported as success.
 - **PsInvertedFunctionTable** is read-only to hinv. On builds without the supported `RtlAddFunctionTable` export, mapping an image with `.pdata` is rejected and its allocation is released. An epoch counter is not a substitute for the private kernel writer lock.
-- **MmUnloadedDrivers** is not cleaned post-hoc (the array layout is build-dependent and only written at unload). Instead, the backend arms prevention at unload: the vulnerable driver's own `KLDR_DATA_TABLE_ENTRY` name is zeroed so `MiRememberUnloadedDriver` skips recording it (kdmapper approach).
-- **PiDDBCacheTable / g_KernelHashBucketList / WdFilter** cleaners are implemented with kdmapper's patterns and kdmapper's locking discipline (`PiDDBLock` / `g_HashCacheLock` acquired via `ExAcquireResourceExclusiveLite`), resolved per build by pattern scan. If a pattern matches nothing on a future build, the cleaner fails closed with a log line.
+- **MmUnloadedDrivers** is not processed post-hoc (the array layout is build-dependent and only written at unload). Instead, the backend arms prevention at unload: the vulnerable driver's own `KLDR_DATA_TABLE_ENTRY` name is zeroed so `MiRememberUnloadedDriver` skips recording it (kdmapper approach).
+- **PiDDBCacheTable / g_KernelHashBucketList / WdFilter** maintenance operations use kdmapper's patterns and locking discipline (`PiDDBLock` / `g_HashCacheLock` acquired via `ExAcquireResourceExclusiveLite`), resolved per build by pattern scan. If a pattern matches nothing on a future build, the maintenance path fails closed with a log line.
 - **Driver object** is a minimal synthetic `DRIVER_OBJECT` allocated in kernel pool by default. With the legacy `--null-drvobj` flag, hinv calls `IoCreateDriver` so the mapped entry receives a real Object-Manager-owned object; it no longer hijacks `\Driver\Null`.
 - **Vulnerable driver compatibility** varies by build. Two backends are implemented: `dbutil_2_3.sys` (plain kernel read/write only) and the reference `iqvw64e.sys` (kdmapper-compatible, `\\.\Nal` device, single `CopyMemory` IOCTL `0x80862007`; the public LOLDrivers sample with SHA256 `4429f32db1cc70567919d7d47b844a91cf1329a6cd116f582305f3b7b60cd60b`). Unknown names are rejected, and the Intel profile verifies this SHA256 before loading. The Intel backend supplies read/write plus the kdmapper physical-mapping helpers (`GetPhysicalAddress`/`MapIoSpace`/`UnmapIoSpace`), which power read-only memory writes for the `NtAddAtom` hook.
 - **HyperDbg integration** uses structured packets for read/edit/VA2PA, honoring HyperDbg's `DEBUGGER_OPERATION_WAS_SUCCESSFUL` (`0xFFFFFFFF`) status convention and per-value 8-byte-slot edit layout. Arbitrary script commands (`!syscall`, `!monitor`, etc.) require the full `libhyperdbg` script engine and are not supported.
