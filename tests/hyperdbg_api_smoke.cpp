@@ -1,9 +1,11 @@
 #include <windows.h>
 #include <winternl.h>
+#include <intrin.h>
 
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -195,7 +197,12 @@ int RunTarget() {
     std::memset(page, 0x5A, kPageSize);
     std::cout << "target-ready pid=" << GetCurrentProcessId() << "\n";
     std::cout.flush();
-    Sleep(120000);
+    volatile LONG64 heartbeat = 0;
+    const ULONGLONG deadline = GetTickCount64() + 120000;
+    while (GetTickCount64() < deadline) {
+        InterlockedIncrement64(&heartbeat);
+        YieldProcessor();
+    }
     VirtualFree(page, 0, MEM_RELEASE);
     return 0;
 }
@@ -208,14 +215,45 @@ uint64_t FindKernelBase() {
     return 0;
 }
 
+uint64_t FindKernelExportAddress(uint64_t kernelBase, const char* name) {
+    if (kernelBase == 0 || !name) return 0;
+
+    wchar_t systemDirectory[MAX_PATH]{};
+    const UINT length = GetSystemDirectoryW(
+        systemDirectory, static_cast<UINT>(std::size(systemDirectory)));
+    if (length == 0 || length >= std::size(systemDirectory)) return 0;
+
+    std::wstring path(systemDirectory, length);
+    path += L"\\ntoskrnl.exe";
+    HMODULE image = LoadLibraryExW(path.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
+    if (!image) return 0;
+
+    const FARPROC exportAddress = GetProcAddress(image, name);
+    const uint64_t imageBase = reinterpret_cast<uint64_t>(image);
+    const uint64_t localAddress = reinterpret_cast<uint64_t>(exportAddress);
+    const uint64_t rva = exportAddress && localAddress >= imageBase
+        ? localAddress - imageBase : 0;
+    FreeLibrary(image);
+    return rva == 0 ? 0 : kernelBase + rva;
+}
+
+bool UnsafeHyperDbgTriggersEnabled() {
+    const char* value = std::getenv("HINV_ENABLE_UNSAFE_HYPERDBG_TRIGGERS");
+    return value && std::strcmp(value, "1") == 0;
+}
+
 void PrintUsage() {
-    std::cout << "Usage: hinv_hyperdbg_api_smoke.exe [--skip-init] [--close-session] [--ept-smoke] [--script-smoke]\n"
+    std::cout << "Usage: hinv_hyperdbg_api_smoke.exe [--skip-init] [--close-session] [--ept-smoke] [--ept-trigger-smoke] [--script-smoke] [--custom-trigger-smoke] [--msr-write-smoke]\n"
               << "       hinv_hyperdbg_api_smoke.exe --target\n"
               << "\n"
               << "--skip-init reuses an already initialized VMM session.\n"
               << "--close-session explicitly closes the caller's VMM handle.\n"
               << "--ept-smoke enables the opt-in EPT monitor/inline-hook lifecycle tests.\n"
-              << "--script-smoke enables the optional v0.23 script-engine compile/execute test.\n";
+              << "--ept-trigger-smoke performs a real EPT read trigger; execute is unsafe-gated.\n"
+              << "--script-smoke enables the optional v0.23 script-engine compile/execute test.\n"
+              << "--custom-trigger-smoke registers a custom action; execution is unsafe-gated.\n"
+              << "--msr-write-smoke enables the gated same-value MSR write/restore test.\n"
+              << "HINV_ENABLE_UNSAFE_HYPERDBG_TRIGGERS=1 is required for real execute/custom triggers.\n";
 }
 
 } // namespace
@@ -224,7 +262,11 @@ int main(int argc, char** argv) {
     bool skipInit = false;
     bool closeSession = false;
     bool eptSmoke = false;
+    bool eptTriggerSmoke = false;
     bool scriptSmoke = false;
+    bool customTriggerSmoke = false;
+    bool msrWriteSmoke = false;
+    std::cout.setf(std::ios::unitbuf);
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--target") == 0) return RunTarget();
         if (std::strcmp(argv[i], "--skip-init") == 0) {
@@ -239,13 +281,29 @@ int main(int argc, char** argv) {
             eptSmoke = true;
             continue;
         }
+        if (std::strcmp(argv[i], "--ept-trigger-smoke") == 0) {
+            eptSmoke = true;
+            eptTriggerSmoke = true;
+            scriptSmoke = true;
+            continue;
+        }
         if (std::strcmp(argv[i], "--script-smoke") == 0) {
             scriptSmoke = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--custom-trigger-smoke") == 0) {
+            scriptSmoke = true;
+            customTriggerSmoke = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--msr-write-smoke") == 0) {
+            msrWriteSmoke = true;
             continue;
         }
         PrintUsage();
         return 2;
     }
+    const bool unsafeTriggersEnabled = UnsafeHyperDbgTriggersEnabled();
 
     TestState state;
     const auto os = hinv::kmem::GetOsVersion();
@@ -283,6 +341,16 @@ int main(int argc, char** argv) {
                 hinv::vmm::ReadMsrHyperDbg(
                     0x10, hinv::vmm::sdk::kAllCores, tscValues) &&
                 !tscValues.empty());
+
+    if (msrWriteSmoke) {
+        std::vector<uint64_t> restoredTsc;
+        const bool wroteSameValue = !tscValues.empty() &&
+            hinv::vmm::WriteMsrHyperDbg(0x10, tscValues[0], 0);
+        const bool restored = wroteSameValue &&
+            hinv::vmm::ReadMsrHyperDbg(0x10, 0, restoredTsc);
+        state.Check("Write and restore IA32_TSC on core 0",
+                    restored && restoredTsc.size() == 1);
+    }
 
     constexpr uint64_t kSmokeEventTag = 0x48494E565F455654ULL;
     hinv::vmm::sdk::GeneralEventDetail event{};
@@ -332,11 +400,160 @@ int main(int argc, char** argv) {
             actionEventEnabled);
     state.Check("Query enabled action event", actionEventQueried && actionEventEnabled);
 
+    bool ignoredDisabledState = false;
+    const bool actionEventDisabled = actionEventRegistered &&
+        hinv::vmm::ModifyEventHyperDbg(
+            kSmokeActionEventTag, hinv::vmm::sdk::ModifyEventsType::Disable,
+            ignoredDisabledState);
+    bool actionEventDisabledQueried = true;
+    const bool actionEventDisableQuery = actionEventDisabled &&
+        hinv::vmm::ModifyEventHyperDbg(
+            kSmokeActionEventTag, hinv::vmm::sdk::ModifyEventsType::QueryState,
+            actionEventDisabledQueried);
+    state.Check("Disable and query action event",
+                actionEventDisableQuery && !actionEventDisabledQueried);
+
+    bool ignoredEnabledState = false;
+    const bool actionEventEnabledAgain = actionEventDisabled &&
+        hinv::vmm::ModifyEventHyperDbg(
+            kSmokeActionEventTag, hinv::vmm::sdk::ModifyEventsType::Enable,
+            ignoredEnabledState);
+    bool actionEventReenabledQueried = false;
+    const bool actionEventEnableQuery = actionEventEnabledAgain &&
+        hinv::vmm::ModifyEventHyperDbg(
+            kSmokeActionEventTag, hinv::vmm::sdk::ModifyEventsType::QueryState,
+            actionEventReenabledQueried);
+    state.Check("Enable and query action event",
+                actionEventEnableQuery && actionEventReenabledQueried);
+
     bool ignoredActionEventState = false;
-    state.Check("Clear action event", actionAdded &&
+    state.Check("Clear action event", actionEventRegistered &&
                 hinv::vmm::ModifyEventHyperDbg(
                     kSmokeActionEventTag, hinv::vmm::sdk::ModifyEventsType::Clear,
                     ignoredActionEventState));
+
+    if (scriptSmoke) {
+        std::vector<uint8_t> condition;
+        uint32_t conditionPointer = 0;
+        const bool conditionCompiled = hinv::vmm::CompileUserScriptHyperDbg(
+            "1 == 1", condition, conditionPointer);
+        state.Check("Compile event condition", conditionCompiled &&
+                    conditionPointer != 0);
+
+        constexpr uint64_t kSmokeConditionEventTag = 0x48494E565F434E44ULL;
+        event = {};
+        event.CoreId = hinv::vmm::sdk::kAllCores;
+        event.ProcessId = hinv::vmm::sdk::kAllProcesses;
+        event.EventStage = hinv::vmm::sdk::EventStage::Pre;
+        event.HasCustomOutput = 1;
+        event.OutputSourceTags[0] = kSmokeConditionEventTag;
+        event.Tag = kSmokeConditionEventTag;
+        event.EventType = hinv::vmm::sdk::EventType::CpuidInstructionExecution;
+        const bool conditionEventRegistered = conditionCompiled &&
+            hinv::vmm::RegisterEventHyperDbg(event, condition);
+        state.Check("Register conditional custom-output event",
+                    conditionEventRegistered);
+        hinv::vmm::sdk::GeneralAction conditionAction{};
+        conditionAction.EventTag = kSmokeConditionEventTag;
+        conditionAction.ActionType = hinv::vmm::sdk::EventActionType::BreakToDebugger;
+        const bool conditionActionAdded = conditionEventRegistered &&
+            hinv::vmm::AddActionToEventHyperDbg(conditionAction, {});
+        bool conditionEventEnabled = false;
+        const bool conditionEventQueried = conditionActionAdded &&
+            hinv::vmm::ModifyEventHyperDbg(
+                kSmokeConditionEventTag,
+                hinv::vmm::sdk::ModifyEventsType::QueryState,
+                conditionEventEnabled);
+        state.Check("Enable conditional custom-output event",
+                    conditionEventQueried && conditionEventEnabled);
+        bool ignoredConditionState = false;
+        state.Check("Clear conditional custom-output event",
+                    conditionEventRegistered &&
+                    hinv::vmm::ModifyEventHyperDbg(
+                        kSmokeConditionEventTag,
+                        hinv::vmm::sdk::ModifyEventsType::Clear,
+                        ignoredConditionState));
+
+        std::vector<uint8_t> actionScript;
+        uint32_t actionScriptPointer = 0;
+        const bool actionScriptCompiled = hinv::vmm::CompileUserScriptHyperDbg(
+            "1 + 2;", actionScript, actionScriptPointer);
+        state.Check("Compile event action script",
+                    actionScriptCompiled && actionScriptPointer != 0);
+
+        constexpr uint64_t kSmokeScriptActionEventTag = 0x48494E565F534352ULL;
+        event = {};
+        event.CoreId = hinv::vmm::sdk::kAllCores;
+        event.ProcessId = GetCurrentProcessId();
+        event.EventStage = hinv::vmm::sdk::EventStage::Pre;
+        event.Tag = kSmokeScriptActionEventTag;
+        event.EventType = hinv::vmm::sdk::EventType::CpuidInstructionExecution;
+        const bool scriptActionEventRegistered = actionScriptCompiled &&
+            hinv::vmm::RegisterEventHyperDbg(event, {});
+        hinv::vmm::sdk::GeneralAction scriptAction{};
+        scriptAction.EventTag = kSmokeScriptActionEventTag;
+        scriptAction.ActionType = hinv::vmm::sdk::EventActionType::RunScript;
+        scriptAction.ScriptBufferPointer = actionScriptPointer;
+        const bool scriptActionAdded = scriptActionEventRegistered &&
+            hinv::vmm::AddActionToEventHyperDbg(scriptAction, actionScript);
+        bool scriptActionEnabled = false;
+        const bool scriptActionQueried = scriptActionAdded &&
+            hinv::vmm::ModifyEventHyperDbg(
+                kSmokeScriptActionEventTag,
+                hinv::vmm::sdk::ModifyEventsType::QueryState,
+                scriptActionEnabled);
+        state.Check("Register and enable RunScript action",
+                    scriptActionQueried && scriptActionEnabled);
+        bool ignoredScriptActionState = false;
+        state.Check("Clear RunScript action", scriptActionEventRegistered &&
+                    hinv::vmm::ModifyEventHyperDbg(
+                        kSmokeScriptActionEventTag,
+                        hinv::vmm::sdk::ModifyEventsType::Clear,
+                        ignoredScriptActionState));
+
+        constexpr uint64_t kSmokeCustomActionEventTag = 0x48494E565F435354ULL;
+        event = {};
+        event.CoreId = hinv::vmm::sdk::kAllCores;
+        event.ProcessId = GetCurrentProcessId();
+        event.EventStage = hinv::vmm::sdk::EventStage::Pre;
+        event.Tag = kSmokeCustomActionEventTag;
+        event.EventType = hinv::vmm::sdk::EventType::CpuidInstructionExecution;
+        const bool customActionEventRegistered =
+            hinv::vmm::RegisterEventHyperDbg(event, {});
+        hinv::vmm::sdk::GeneralAction customAction{};
+        customAction.EventTag = kSmokeCustomActionEventTag;
+        customAction.ActionType = hinv::vmm::sdk::EventActionType::RunCustomCode;
+        const std::vector<uint8_t> returnCode{ 0xC3 };
+        const bool customActionAdded = customActionEventRegistered &&
+            hinv::vmm::AddActionToEventHyperDbg(customAction, returnCode);
+        bool customActionEnabled = false;
+        const bool customActionQueried = customActionAdded &&
+            hinv::vmm::ModifyEventHyperDbg(
+                kSmokeCustomActionEventTag,
+                hinv::vmm::sdk::ModifyEventsType::QueryState,
+                customActionEnabled);
+        state.Check("Register and enable RunCustomCode action",
+                    customActionQueried && customActionEnabled);
+        int cpuidResult[4]{};
+        if (customTriggerSmoke && !unsafeTriggersEnabled) {
+            std::cout << "[SKIP] RunCustomCode trigger requires "
+                         "HINV_ENABLE_UNSAFE_HYPERDBG_TRIGGERS=1\n";
+        } else if (customTriggerSmoke && customActionQueried && customActionEnabled) {
+            __cpuid(cpuidResult, 0);
+        }
+        if (customTriggerSmoke && unsafeTriggersEnabled) {
+            state.Check("Trigger RunCustomCode action",
+                        customActionQueried && customActionEnabled &&
+                        cpuidResult[0] != 0);
+        }
+        bool ignoredCustomActionState = false;
+        state.Check("Clear RunCustomCode action",
+                    customActionEventRegistered &&
+                    hinv::vmm::ModifyEventHyperDbg(
+                        kSmokeCustomActionEventTag,
+                        hinv::vmm::sdk::ModifyEventsType::Clear,
+                        ignoredCustomActionState));
+    }
 
     const uint64_t kernelBase = FindKernelBase();
     std::array<uint8_t, 16> kernelHeader{};
@@ -417,6 +634,51 @@ int main(int argc, char** argv) {
     }
     state.Check("Search current-process virtual scratch", searchOk && foundLocalScratch);
 
+    std::vector<uint64_t> byteSearchResults;
+    const bool byteSearchOk = hinv::vmm::SearchMemoryHyperDbg(
+        reinterpret_cast<uint64_t>(localPage), kPageSize, GetCurrentProcessId(),
+        hinv::vmm::sdk::SearchMemoryType::Virtual,
+        hinv::vmm::sdk::SearchMemoryByteSize::Byte,
+        { 0x88 }, byteSearchResults);
+    bool foundByte = false;
+    for (const uint64_t result : byteSearchResults) {
+        if (result == reinterpret_cast<uint64_t>(localPage)) {
+            foundByte = true;
+            break;
+        }
+    }
+    state.Check("Search current-process virtual byte", byteSearchOk && foundByte);
+
+    std::vector<uint64_t> dwordSearchResults;
+    const bool dwordSearchOk = hinv::vmm::SearchMemoryHyperDbg(
+        reinterpret_cast<uint64_t>(localPage), kPageSize, GetCurrentProcessId(),
+        hinv::vmm::sdk::SearchMemoryType::Virtual,
+        hinv::vmm::sdk::SearchMemoryByteSize::Dword,
+        { 0x55667788 }, dwordSearchResults);
+    bool foundDword = false;
+    for (const uint64_t result : dwordSearchResults) {
+        if (result == reinterpret_cast<uint64_t>(localPage)) {
+            foundDword = true;
+            break;
+        }
+    }
+    state.Check("Search current-process virtual dword", dwordSearchOk && foundDword);
+
+    std::vector<uint64_t> physicalSearchResults;
+    const bool physicalSearchOk = translated && hinv::vmm::SearchMemoryHyperDbg(
+        physical, sizeof(kLocalInitial), GetCurrentProcessId(),
+        hinv::vmm::sdk::SearchMemoryType::Physical,
+        hinv::vmm::sdk::SearchMemoryByteSize::Qword,
+        { kLocalInitial }, physicalSearchResults);
+    bool foundPhysical = false;
+    for (const uint64_t result : physicalSearchResults) {
+        if (result == physical) {
+            foundPhysical = true;
+            break;
+        }
+    }
+    state.Check("Search physical scratch", physicalSearchOk && foundPhysical);
+
     if (eptSmoke) {
         constexpr uint64_t kSmokeEptEventTag = 0x48494E565F455054ULL;
         hinv::vmm::sdk::GeneralEventDetail eptEvent{};
@@ -452,15 +714,10 @@ int main(int argc, char** argv) {
                         kSmokeEptEventTag, hinv::vmm::sdk::ModifyEventsType::Clear,
                         ignoredEptState));
 
-        auto* detourPage = static_cast<uint8_t*>(VirtualAlloc(
-            nullptr, kPageSize, MEM_RESERVE | MEM_COMMIT,
-            PAGE_EXECUTE_READWRITE));
-        state.Check("VirtualAlloc executable detour page", detourPage != nullptr);
-        bool detourCleared = false;
-        if (detourPage) {
-            std::memset(detourPage, 0x90, kPageSize);
-            detourPage[0] = 0xC3; // ret; the page is never executed by the smoke.
-
+        const uint64_t detourTarget = FindKernelExportAddress(
+            kernelBase, "NtAddAtom");
+        state.Check("Resolve kernel EPT execute target", detourTarget != 0);
+        if (detourTarget != 0) {
             constexpr uint64_t kSmokeDetourEventTag = 0x48494E565F445452ULL;
             hinv::vmm::sdk::GeneralEventDetail detourEvent{};
             detourEvent.CoreId = hinv::vmm::sdk::kAllCores;
@@ -469,8 +726,7 @@ int main(int argc, char** argv) {
             detourEvent.Tag = kSmokeDetourEventTag;
             detourEvent.EventType =
                 hinv::vmm::sdk::EventType::HiddenHookExecuteDetours;
-            detourEvent.Options.OptionalParam1 =
-                reinterpret_cast<uint64_t>(detourPage);
+            detourEvent.Options.OptionalParam1 = detourTarget;
             const bool detourRegistered =
                 hinv::vmm::RegisterEventHyperDbg(detourEvent, {});
             state.Check("Register opt-in EPT execute detour", detourRegistered);
@@ -494,16 +750,119 @@ int main(int argc, char** argv) {
                         detourQueried && detourEnabled);
 
             bool ignoredDetourState = false;
-            detourCleared = detourRegistered &&
+            state.Check("Clear opt-in EPT execute detour",
+                        detourRegistered &&
+                        hinv::vmm::ModifyEventHyperDbg(
+                            kSmokeDetourEventTag,
+                            hinv::vmm::sdk::ModifyEventsType::Clear,
+                            ignoredDetourState));
+        }
+
+        if (scriptSmoke && eptTriggerSmoke) {
+            std::vector<uint8_t> triggerScript;
+            uint32_t triggerScriptPointer = 0;
+            const bool triggerScriptCompiled = hinv::vmm::CompileUserScriptHyperDbg(
+                "1 + 2;", triggerScript, triggerScriptPointer);
+            state.Check("Compile EPT trigger action script",
+                        triggerScriptCompiled && triggerScriptPointer != 0);
+
+            constexpr uint64_t kSmokeEptReadTriggerTag = 0x48494E565F455452ULL;
+            hinv::vmm::sdk::GeneralEventDetail readTrigger{};
+            readTrigger.CoreId = hinv::vmm::sdk::kAllCores;
+            readTrigger.ProcessId = GetCurrentProcessId();
+            readTrigger.EventStage = hinv::vmm::sdk::EventStage::Pre;
+            readTrigger.Tag = kSmokeEptReadTriggerTag;
+            readTrigger.EventType = hinv::vmm::sdk::EventType::HiddenHookRead;
+            readTrigger.Options.OptionalParam1 =
+                reinterpret_cast<uint64_t>(localPage);
+            readTrigger.Options.OptionalParam2 =
+                reinterpret_cast<uint64_t>(localPage) + kPageSize - 1;
+            const bool readTriggerRegistered = triggerScriptCompiled &&
+                hinv::vmm::RegisterEventHyperDbg(readTrigger, {});
+            hinv::vmm::sdk::GeneralAction readTriggerAction{};
+            readTriggerAction.EventTag = kSmokeEptReadTriggerTag;
+            readTriggerAction.ActionType = hinv::vmm::sdk::EventActionType::RunScript;
+            readTriggerAction.ScriptBufferPointer = triggerScriptPointer;
+            const bool readTriggerActionAdded = readTriggerRegistered &&
+                hinv::vmm::AddActionToEventHyperDbg(
+                    readTriggerAction, triggerScript);
+            bool readTriggerEnabled = false;
+            const bool readTriggerQueried = readTriggerActionAdded &&
                 hinv::vmm::ModifyEventHyperDbg(
-                    kSmokeDetourEventTag,
-                    hinv::vmm::sdk::ModifyEventsType::Clear,
-                    ignoredDetourState);
-            state.Check("Clear opt-in EPT execute detour", detourCleared);
-            if (detourCleared)
-                VirtualFree(detourPage, 0, MEM_RELEASE);
-            else
-                std::cerr << "[WARN] Detour page retained because event cleanup failed\n";
+                    kSmokeEptReadTriggerTag,
+                    hinv::vmm::sdk::ModifyEventsType::QueryState,
+                    readTriggerEnabled);
+            volatile uint8_t observedRead = 0;
+            if (readTriggerQueried && readTriggerEnabled)
+                observedRead = *reinterpret_cast<volatile uint8_t*>(localPage);
+            state.Check("Trigger EPT read RunScript action",
+                        readTriggerQueried && readTriggerEnabled &&
+                        observedRead == 0x88);
+            bool ignoredReadTriggerState = false;
+            state.Check("Clear EPT read trigger", readTriggerRegistered &&
+                        hinv::vmm::ModifyEventHyperDbg(
+                            kSmokeEptReadTriggerTag,
+                            hinv::vmm::sdk::ModifyEventsType::Clear,
+                            ignoredReadTriggerState));
+
+            if (!unsafeTriggersEnabled) {
+                std::cout << "[SKIP] EPT execute RunScript trigger requires "
+                             "HINV_ENABLE_UNSAFE_HYPERDBG_TRIGGERS=1\n";
+            } else {
+                const uint64_t executeTarget = FindKernelExportAddress(
+                    kernelBase, "NtAddAtom");
+                state.Check("Resolve kernel EPT trigger target", executeTarget != 0);
+                constexpr uint64_t kSmokeEptExecuteTriggerTag =
+                    0x48494E565F455458ULL;
+                hinv::vmm::sdk::GeneralEventDetail executeTrigger{};
+                executeTrigger.CoreId = hinv::vmm::sdk::kAllCores;
+                executeTrigger.ProcessId = GetCurrentProcessId();
+                executeTrigger.EventStage = hinv::vmm::sdk::EventStage::Pre;
+                executeTrigger.Tag = kSmokeEptExecuteTriggerTag;
+                executeTrigger.EventType =
+                    hinv::vmm::sdk::EventType::HiddenHookExecuteDetours;
+                executeTrigger.Options.OptionalParam1 = executeTarget;
+                const bool executeTriggerRegistered = triggerScriptCompiled &&
+                    executeTarget != 0 &&
+                    hinv::vmm::RegisterEventHyperDbg(executeTrigger, {});
+                hinv::vmm::sdk::GeneralAction executeTriggerAction{};
+                executeTriggerAction.EventTag = kSmokeEptExecuteTriggerTag;
+                executeTriggerAction.ActionType =
+                    hinv::vmm::sdk::EventActionType::RunScript;
+                executeTriggerAction.ScriptBufferPointer = triggerScriptPointer;
+                const bool executeTriggerActionAdded = executeTriggerRegistered &&
+                    hinv::vmm::AddActionToEventHyperDbg(
+                        executeTriggerAction, triggerScript);
+                bool executeTriggerEnabled = false;
+                const bool executeTriggerQueried = executeTriggerActionAdded &&
+                    hinv::vmm::ModifyEventHyperDbg(
+                        kSmokeEptExecuteTriggerTag,
+                        hinv::vmm::sdk::ModifyEventsType::QueryState,
+                        executeTriggerEnabled);
+                using NtAddAtomFunction = NTSTATUS(NTAPI*)(PWSTR, ULONG, PUSHORT);
+                NtAddAtomFunction ntAddAtom = nullptr;
+                if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll")) {
+                    const FARPROC raw = GetProcAddress(ntdll, "NtAddAtom");
+                    static_assert(sizeof(ntAddAtom) == sizeof(raw));
+                    std::memcpy(&ntAddAtom, &raw, sizeof(raw));
+                }
+                bool executeTriggered = false;
+                if (executeTriggerQueried && executeTriggerEnabled && ntAddAtom) {
+                    wchar_t atomName[] = L"hinv";
+                    USHORT atom = 0;
+                    (void)ntAddAtom(atomName, sizeof(atomName) - sizeof(wchar_t), &atom);
+                    executeTriggered = true;
+                }
+                state.Check("Trigger EPT execute RunScript action",
+                            executeTriggerQueried && executeTriggerEnabled &&
+                            executeTriggered);
+                bool ignoredExecuteTriggerState = false;
+                state.Check("Clear EPT execute trigger", executeTriggerRegistered &&
+                            hinv::vmm::ModifyEventHyperDbg(
+                                kSmokeEptExecuteTriggerTag,
+                                hinv::vmm::sdk::ModifyEventsType::Clear,
+                                ignoredExecuteTriggerState));
+            }
         }
     }
 
@@ -575,24 +934,47 @@ int main(int argc, char** argv) {
         const bool attached = hinv::vmm::AttachProcessHyperDbg(
             targetPid, processToken);
         state.Check("Attach to target process", attached && processToken != 0);
+        uint32_t targetThreadId = 0;
+        uint64_t selectedToken = 0;
+        bool targetPaused = false;
         bool commandPaused = false;
         bool commandContinued = false;
         bool scriptExecuted = false;
+        bool registerRead = false;
+        bool regularStep = false;
         uint64_t scriptValue = 0;
+        uint64_t registerValue = 0;
         if (attached) {
-            std::vector<uint8_t> commandResponse;
-            commandPaused = hinv::vmm::SendUserDebuggerCommandHyperDbg(
-                processToken, 0,
-                hinv::vmm::sdk::UserDebuggerCommandAction::Pause,
-                {}, false, false, 0, 0, 0, 0, commandResponse);
+            for (int attempt = 0; attempt < 200; ++attempt) {
+                if (hinv::vmm::SwitchProcessHyperDbg(
+                        targetPid, selectedToken, targetThreadId, targetPaused) &&
+                    selectedToken == processToken && targetThreadId != 0 && targetPaused)
+                    break;
+                Sleep(50);
+            }
+            commandPaused = selectedToken == processToken &&
+                targetThreadId != 0 && targetPaused;
+            std::cout << "[INFO] attached token=0x" << std::hex << processToken
+                      << " selected=0x" << selectedToken << std::dec
+                      << " thread=" << targetThreadId
+                      << " paused=" << (targetPaused ? 1 : 0) << "\n";
             if (commandPaused && scriptSmoke) {
                 scriptExecuted = hinv::vmm::ExecuteTextUserScriptHyperDbg(
-                    processToken, 0, "formats(1 + 2);", true, &scriptValue);
+                    processToken, targetThreadId, "formats(1 + 2);", true, &scriptValue);
+            }
+            if (commandPaused) {
+                registerRead = hinv::vmm::ReadUserRegisterHyperDbg(
+                    processToken, targetThreadId, 0, registerValue);
+                regularStep = hinv::vmm::StepUserProcessHyperDbg(
+                    processToken, targetThreadId);
+                if (regularStep) Sleep(100);
             }
             commandContinued = commandPaused &&
                 hinv::vmm::ContinueProcessHyperDbg(processToken);
         }
-        state.Check("User debugger pause command", attached && commandPaused);
+        state.Check("Pause attached user process", attached && commandPaused);
+        state.Check("Read paused user register", attached && registerRead);
+        state.Check("Regular-step paused user thread", attached && regularStep);
         if (scriptSmoke) {
             state.Check("Execute compiled user script",
                         attached && scriptExecuted && scriptValue == 3);

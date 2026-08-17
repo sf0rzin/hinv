@@ -52,6 +52,7 @@ static_assert(offsetof(ReadPageTableEntriesDetails, KernelStatus) == 80);
 enum class SearchMemoryType : uint32_t {
     Physical = 0,
     Virtual = 1,
+    // Internal type used only after HyperDbg rewrites a physical request.
     PhysicalFromVirtual = 2,
 };
 
@@ -154,6 +155,25 @@ static_assert(sizeof(UserDebuggerCommandActionPacket) == 40);
 static_assert(sizeof(UserDebuggerCommandPacket) == 64);
 static_assert(offsetof(UserDebuggerCommandPacket, ProcessDebuggingDetailToken) == 40);
 static_assert(offsetof(UserDebuggerCommandPacket, Result) == 56);
+
+struct DebuggeeRegisterReadDescription {
+    uint32_t RegisterId;
+    uint64_t Value;
+    uint32_t KernelStatus;
+};
+
+static_assert(sizeof(DebuggeeRegisterReadDescription) == 24);
+static_assert(offsetof(DebuggeeRegisterReadDescription, Value) == 8);
+static_assert(offsetof(DebuggeeRegisterReadDescription, KernelStatus) == 16);
+
+enum class RemoteSteppingRequest : uint32_t {
+    StepIn = 0,
+    InstrumentationStepIn = 1,
+    InstrumentationStepInForTracking = 2,
+    StepOver = 3,
+    StepOverForGu = 4,
+    StepOverForGuLastInstruction = 5,
+};
 
 struct DebuggeeScriptPacket {
     uint32_t ScriptBufferSize;

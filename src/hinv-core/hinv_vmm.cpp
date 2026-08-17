@@ -571,8 +571,8 @@ bool SearchMemoryHyperDbg(uint64_t address, uint64_t length, uint32_t processId,
     if (length == 0 || patterns.empty() ||
         patterns.size() > sdk::kMaximumSearchResults ||
         length > std::numeric_limits<uint64_t>::max() - address ||
-        static_cast<uint32_t>(memoryType) >
-            static_cast<uint32_t>(sdk::SearchMemoryType::PhysicalFromVirtual) ||
+        (memoryType != sdk::SearchMemoryType::Physical &&
+         memoryType != sdk::SearchMemoryType::Virtual) ||
         static_cast<uint32_t>(byteSize) >
             static_cast<uint32_t>(sdk::SearchMemoryByteSize::Qword))
         return false;
@@ -585,7 +585,7 @@ bool SearchMemoryHyperDbg(uint64_t address, uint64_t length, uint32_t processId,
     auto* request = reinterpret_cast<sdk::SearchMemoryRequest*>(packet.data());
     request->Address = address;
     request->Length = length;
-    request->ProcessId = memoryType == sdk::SearchMemoryType::Physical ? 0 : processId;
+    request->ProcessId = processId == 0 ? GetCurrentProcessId() : processId;
     request->MemoryType = memoryType;
     request->ByteSize = byteSize;
     request->CountOf64Chunks = static_cast<uint32_t>(patterns.size());
@@ -726,6 +726,24 @@ bool AttachProcessHyperDbg(uint32_t processId, uint64_t& token) {
     return token != 0;
 }
 
+bool SwitchProcessHyperDbg(uint32_t processId, uint64_t& token,
+                           uint32_t& threadId, bool& isPaused) {
+    token = 0;
+    threadId = 0;
+    isPaused = false;
+    if (processId == 0) return false;
+
+    sdk::AttachDetachProcessRequest request{};
+    request.ProcessId = processId;
+    request.Action = sdk::AttachDetachAction::SwitchByProcessOrThread;
+    if (!SendProcessAction(request)) return false;
+
+    token = request.Token;
+    threadId = request.ThreadId;
+    isPaused = request.IsPaused != 0;
+    return token != 0 && threadId != 0;
+}
+
 bool DetachProcessHyperDbg(uint32_t processId, uint64_t token) {
     if (processId == 0 || token == 0) return false;
 
@@ -801,6 +819,37 @@ bool SendUserDebuggerCommandHyperDbg(
 
     response.assign(packet.begin() + sizeof(*request), packet.end());
     return true;
+}
+
+bool ReadUserRegisterHyperDbg(
+    uint64_t token, uint32_t threadId, uint32_t registerId,
+    uint64_t& value) {
+    value = 0;
+    sdk::DebuggeeRegisterReadDescription request{};
+    request.RegisterId = registerId;
+    std::vector<uint8_t> payload(sizeof(request));
+    std::memcpy(payload.data(), &request, sizeof(request));
+
+    std::vector<uint8_t> response;
+    if (!SendUserDebuggerCommandHyperDbg(
+            token, threadId, sdk::UserDebuggerCommandAction::ReadRegisters,
+            payload, false, true, 0, 0, 0, 0, response) ||
+        response.size() != sizeof(request))
+        return false;
+
+    std::memcpy(&request, response.data(), sizeof(request));
+    if (request.KernelStatus != DEBUGGER_OPERATION_WAS_SUCCESSFUL)
+        return false;
+    value = request.Value;
+    return true;
+}
+
+bool StepUserProcessHyperDbg(
+    uint64_t token, uint32_t threadId, sdk::RemoteSteppingRequest request) {
+    std::vector<uint8_t> response;
+    return SendUserDebuggerCommandHyperDbg(
+        token, threadId, sdk::UserDebuggerCommandAction::RegularStep,
+        {}, false, false, static_cast<uint64_t>(request), 0, 0, 0, response);
 }
 
 bool ExecuteCompiledUserScriptHyperDbg(

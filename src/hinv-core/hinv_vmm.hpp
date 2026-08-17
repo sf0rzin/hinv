@@ -109,6 +109,8 @@ bool AddActionToEventHyperDbg(sdk::GeneralAction action,
 bool ModifyEventHyperDbg(uint64_t tag, sdk::ModifyEventsType action,
                          bool& isEnabled);
 bool AttachProcessHyperDbg(uint32_t processId, uint64_t& token);
+bool SwitchProcessHyperDbg(uint32_t processId, uint64_t& token,
+                           uint32_t& threadId, bool& isPaused);
 bool DetachProcessHyperDbg(uint32_t processId, uint64_t token);
 bool PauseProcessHyperDbg(uint64_t token);
 bool ContinueProcessHyperDbg(uint64_t token);
@@ -120,6 +122,12 @@ bool SendUserDebuggerCommandHyperDbg(
     uint64_t optionalParam1, uint64_t optionalParam2,
     uint64_t optionalParam3, uint64_t optionalParam4,
     std::vector<uint8_t>& response);
+bool ReadUserRegisterHyperDbg(
+    uint64_t token, uint32_t threadId, uint32_t registerId,
+    uint64_t& value);
+bool StepUserProcessHyperDbg(uint64_t token, uint32_t threadId,
+                             sdk::RemoteSteppingRequest request =
+                                 sdk::RemoteSteppingRequest::StepIn);
 bool ExecuteCompiledUserScriptHyperDbg(
     uint64_t token, uint32_t threadId,
     const std::vector<uint8_t>& compiledScript,

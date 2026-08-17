@@ -408,7 +408,9 @@ static bool ValidateScriptLines(const std::vector<std::string>& lines) {
     return true;
 }
 
-static bool ExecuteScriptLines(const std::vector<std::string>& lines) {
+static bool ExecuteScriptLines(const std::vector<std::string>& lines,
+                               bool deferVmmInit = false,
+                               bool* vmmInitDeferred = nullptr) {
     const bool stopAware = g_running.load();
     bool firstLine = true;
     for (const auto& originalLine : lines) {
@@ -416,7 +418,14 @@ static bool ExecuteScriptLines(const std::vector<std::string>& lines) {
         if (firstLine) firstLine = false;
         if (line.empty() || line[0] == '#') continue;
         bool exitRequested = false;
-        std::string resp = ProcessCommandInternal(line, false, &exitRequested);
+        const auto tokens = Tokenize(line);
+        std::string resp;
+        if (deferVmmInit && tokens.size() == 1 && tokens[0] == "initvmm") {
+            if (vmmInitDeferred) *vmmInitDeferred = true;
+            resp = "OK deferred";
+        } else {
+            resp = ProcessCommandInternal(line, false, &exitRequested);
+        }
         std::cout << "[hinv::headless] [CMD] " << line << " -> " << resp << "\n";
         if (resp.rfind("ERR", 0) == 0) {
             std::cerr << "[hinv::headless] Command failed: " << line << "\n";
@@ -808,11 +817,31 @@ bool RunHeadlessSession(const HeadlessConfig& config) {
         std::wcout << L"[hinv::headless] BYOVD backend loaded: " << config.byovdDriverPath << L"\n";
     }
 
-    if (g_running.load() && !scriptLines.empty() && !ExecuteScriptLines(scriptLines)) {
+    bool vmmInitDeferred = false;
+    if (g_running.load() && !scriptLines.empty() &&
+        !ExecuteScriptLines(scriptLines, true, &vmmInitDeferred)) {
         std::cerr << "[hinv::headless] Script failed, aborting session\n";
         const bool finalizeOk = finalizeSession();
         if (!finalizeOk) std::cerr << "[hinv::headless] Session finalization also failed\n";
         return false;
+    }
+
+    if (g_running.load() && vmmInitDeferred) {
+        bool initialized = false;
+        try {
+            std::thread initThread([&] {
+                initialized = vmm::InitializeVmm();
+            });
+            initThread.join();
+        } catch (...) {
+            std::cerr << "[hinv::headless] Could not start deferred VMM initialization\n";
+        }
+        if (!initialized) {
+            std::cerr << "[hinv::headless] Deferred VMM initialization failed\n";
+            const bool finalizeOk = finalizeSession();
+            if (!finalizeOk) std::cerr << "[hinv::headless] Session finalization also failed\n";
+            return false;
+        }
     }
 
     bool ipcFailed = false;

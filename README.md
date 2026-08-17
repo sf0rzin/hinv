@@ -259,6 +259,25 @@ set HINV_LIBHYPERDBG_DIR=C:\lab\hinv-hyperdbg-full\hyperdbg-v0.23
 build\lab\hinv_hyperdbg_api_smoke.exe --skip-init --script-smoke
 ```
 
+For the complete disposable-VM matrix, combine the opt-in probes. The MSR
+write probe writes the value read from core 0 back to IA32_TSC and is disabled
+unless `HINV_ENABLE_MSR_WRITE=1` is also set:
+
+```cmd
+set HINV_ENABLE_MSR_WRITE=1
+build\lab\hinv_hyperdbg_api_smoke.exe --skip-init --ept-smoke --script-smoke --msr-write-smoke
+```
+
+For trigger coverage without unsafe execution, use:
+
+```cmd
+build\lab\hinv_hyperdbg_api_smoke.exe --skip-init --ept-trigger-smoke --custom-trigger-smoke
+```
+
+The EPT read trigger is exercised. Execute-detour and custom-code execution
+remain skipped unless `HINV_ENABLE_UNSAFE_HYPERDBG_TRIGGERS=1` is explicitly
+set in the disposable VM.
+
 Use `--close-session` only when the smoke process owns the VMM session; the
 default `--skip-init` path leaves a shared headless session open.
 
@@ -299,10 +318,10 @@ This is an **experimental prototype**. The following areas are incomplete or uns
 - **PiDDBCacheTable / g_KernelHashBucketList / WdFilter** maintenance operations use kdmapper's patterns and locking discipline (`PiDDBLock` / `g_HashCacheLock` acquired via `ExAcquireResourceExclusiveLite`), resolved per build by pattern scan. If a pattern matches nothing on a future build, the maintenance path fails closed with a log line.
 - **Driver object** is a minimal synthetic `DRIVER_OBJECT` allocated in kernel pool by default. With the legacy `--null-drvobj` flag, hinv calls `IoCreateDriver` so the mapped entry receives a real Object-Manager-owned object; it no longer hijacks `\Driver\Null`.
 - **Vulnerable driver compatibility** varies by build. Two backends are implemented: `dbutil_2_3.sys` (plain kernel read/write only) and the reference `iqvw64e.sys` (kdmapper-compatible, `\\.\Nal` device, single `CopyMemory` IOCTL `0x80862007`; the public LOLDrivers sample with SHA256 `4429f32db1cc70567919d7d47b844a91cf1329a6cd116f582305f3b7b60cd60b`). Unknown names are rejected, and the Intel profile verifies this SHA256 before loading. The Intel backend supplies read/write plus the kdmapper physical-mapping helpers (`GetPhysicalAddress`/`MapIoSpace`/`UnmapIoSpace`), which power read-only memory writes for the `NtAddAtom` hook.
-- **HyperDbg integration** targets the v0.23 SDK wire layouts for read/edit/VA2PA, page-table, MSR, search, event lifecycle, structured EPT monitor/execute-detour registration, process attach/detach and user-debugger command transport, including compiled script buffers, honoring HyperDbg's `DEBUGGER_OPERATION_WAS_SUCCESSFUL` (`0xFFFFFFFF`) status convention and per-value 8-byte-slot edit layout. Text-to-bytecode script compilation and arbitrary script commands (`!syscall`, `!monitor`, etc.) still require the full `libhyperdbg` script engine and are not bundled.
+- **HyperDbg integration** targets the v0.23 SDK wire layouts for read/edit/VA2PA, page-table, MSR, search, event lifecycle, structured EPT monitor/execute-detour registration, process attach/detach and user-debugger command transport, including compiled script buffers, honoring HyperDbg's `DEBUGGER_OPERATION_WAS_SUCCESSFUL` (`0xFFFFFFFF`) status convention and per-value 8-byte-slot edit layout. The optional script smoke compiles and executes a v0.23 script against a paused user target.
 - **HyperDbg script integration** optionally loads the v0.23 package's `script-engine.dll` and its exported `ScriptEngineParse`/`RemoveSymbolBuffer` functions. The companion `libhyperdbg.dll` is installed for the isolated HyperDbg runtime, but is not loaded into the raw-IOCTL process because its session manager would contend with hinv's shared VMM handle. Set `HINV_LIBHYPERDBG_DIR` before using `CompileUserScriptHyperDbg` or `ExecuteTextUserScriptHyperDbg`; the normal structured API path does not require these DLLs.
-- **VMM initialization** is one-shot per VM boot on this HyperDbg build. Keep the initialized headless session alive for structured reads; a second process must reuse the active session and must not call `InitializeVmm` again.
-- **EPT monitoring** has a lab-only structured lifecycle probe (`--ept-smoke`) covering registration, break action, state query and cleanup. Event output/condition handling and text commands such as `!epthook2`/`!monitor` still require the full script engine and are not exposed yet.
+- **VMM initialization** is one-shot per VM boot on this HyperDbg build. Keep the initialized headless session alive for structured reads; a second process must reuse the active session and must not call `InitializeVmm` again. Headless scripts defer `initvmm` to a worker thread before publishing the IPC server because the HyperDbg v0.23 init path can block on the headless main thread.
+- **EPT monitoring** has a lab-only structured probe (`--ept-smoke`) covering registration, break action, state query, execute-detour lifecycle against a kernel target, and cleanup. `--ept-trigger-smoke` additionally runs the real read `RunScript` trigger; execute-detour and `RunCustomCode` execution are explicitly gated by `HINV_ENABLE_UNSAFE_HYPERDBG_TRIGGERS=1` after reproducing kernel faults in the disposable VM. Event output/condition handling is covered at the packet/lifecycle level; text commands such as `!epthook2`/`!monitor` still require an isolated full interpreter session and are not dispatched through the raw-IOCTL process.
 - **Named pipe security** restricts access to local SYSTEM/Administrators and rejects remote clients. A client with local administrator rights can still control the session.
 - **Automated tests** cover PE parser safety (section/import/relocation/unwind bounds, fixed-base images, and malformed inputs are rejected fail-closed), refusal of unsynchronized IFT writes, and the SDK's timeout/result contract; kernel-mode behavior is not automatically tested.
 
