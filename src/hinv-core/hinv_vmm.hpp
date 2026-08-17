@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "hyperdbg_sdk.hpp"
 
 namespace hinv {
 namespace vmm {
@@ -13,12 +14,14 @@ constexpr const wchar_t* HYPERDBG_DEVICE_NAME = L"\\\\.\\HyperDbgDebuggerDevice"
 // (NOT zero). See DEBUGGER_OPERATION_WAS_SUCCESSFUL in HyperDbg's SDK.
 constexpr uint32_t DEBUGGER_OPERATION_WAS_SUCCESSFUL = 0xFFFFFFFF;
 
-// HyperDbg SDK IOCTL codes (computed from HyperDbg include/SDK/headers/Ioctls.h)
+// HyperDbg v0.23 SDK IOCTL codes (computed from
+// HyperDbg/include/SDK/headers/Ioctls.h).
 // IOCTL_START_CODE = 0x800, IOCTL_VMM_IOCTL = 0x800 + 0x200 = 0xA00
 // CTL_CODE(0x22, function, METHOD_BUFFERED, FILE_ANY_ACCESS) = 0x220000 | (function << 2)
 constexpr DWORD IOCTL_HYPERDBG_INIT_VMM                = 0x222004; // 0x801
 constexpr DWORD IOCTL_HYPERDBG_READ_MEMORY             = 0x222808; // 0xA02
 constexpr DWORD IOCTL_HYPERDBG_READ_OR_WRITE_MSR       = 0x22280C; // 0xA03
+constexpr DWORD IOCTL_HYPERDBG_READ_PAGE_TABLE         = 0x222810; // 0xA04
 constexpr DWORD IOCTL_HYPERDBG_REGISTER_EVENT          = 0x222814; // 0xA05
 constexpr DWORD IOCTL_HYPERDBG_ADD_ACTION_TO_EVENT     = 0x222818; // 0xA06
 constexpr DWORD IOCTL_HYPERDBG_VA2PA_AND_PA2VA         = 0x222820; // 0xA08
@@ -89,10 +92,50 @@ bool InitializeVmm();
 bool ReadKernelMemoryHyperDbg(uint64_t address, void* out, size_t size);
 bool EditKernelMemoryHyperDbg(uint64_t address, const void* in, size_t size);
 bool VirtualToPhysicalHyperDbg(uint64_t virtualAddress, uint64_t& outPhysical);
+bool ReadMsrHyperDbg(uint32_t msr, uint32_t core, std::vector<uint64_t>& values);
+bool WriteMsrHyperDbg(uint32_t msr, uint64_t value, uint32_t core);
+bool ReadPageTableEntriesHyperDbg(
+    uint64_t virtualAddress, uint32_t processId,
+    sdk::ReadPageTableEntriesDetails& details);
+bool SearchMemoryHyperDbg(uint64_t address, uint64_t length, uint32_t processId,
+                          sdk::SearchMemoryType memoryType,
+                          sdk::SearchMemoryByteSize byteSize,
+                          const std::vector<uint64_t>& patterns,
+                          std::vector<uint64_t>& results);
+bool RegisterEventHyperDbg(sdk::GeneralEventDetail event,
+                           const std::vector<uint8_t>& condition);
+bool AddActionToEventHyperDbg(sdk::GeneralAction action,
+                              const std::vector<uint8_t>& payload);
+bool ModifyEventHyperDbg(uint64_t tag, sdk::ModifyEventsType action,
+                         bool& isEnabled);
+bool AttachProcessHyperDbg(uint32_t processId, uint64_t& token);
+bool DetachProcessHyperDbg(uint32_t processId, uint64_t token);
+bool PauseProcessHyperDbg(uint64_t token);
+bool ContinueProcessHyperDbg(uint64_t token);
+bool SendUserDebuggerCommandHyperDbg(
+    uint64_t token, uint32_t threadId,
+    sdk::UserDebuggerCommandAction action,
+    const std::vector<uint8_t>& payload,
+    bool applyToAllPausedThreads, bool waitForEventCompletion,
+    uint64_t optionalParam1, uint64_t optionalParam2,
+    uint64_t optionalParam3, uint64_t optionalParam4,
+    std::vector<uint8_t>& response);
+bool ExecuteCompiledUserScriptHyperDbg(
+    uint64_t token, uint32_t threadId,
+    const std::vector<uint8_t>& compiledScript,
+    uint32_t scriptPointer, bool isFormat,
+    uint64_t* formatValue = nullptr);
+bool CompileUserScriptHyperDbg(const std::string& script,
+                               std::vector<uint8_t>& compiledScript,
+                               uint32_t& scriptPointer);
+bool ExecuteTextUserScriptHyperDbg(
+    uint64_t token, uint32_t threadId, const std::string& script,
+    bool isFormat, uint64_t* formatValue = nullptr);
 
-// EPT cloaking and arbitrary text commands (!epthook2, !monitor, !syscall)
-// require HyperDbg's full DEBUGGER_EVENT machinery / script engine and are
-// intentionally out of scope for this project.
+// Structured EPT monitor/execute-detour registration is available to the
+// lab smoke path. Text-to-bytecode scripts use the optional v0.23 script-engine
+// runtime; interpreter commands (!epthook2, !monitor, !syscall) are separate
+// from this API and are intentionally not dispatched through libhyperdbg.
 
 } // namespace vmm
 } // namespace hinv
